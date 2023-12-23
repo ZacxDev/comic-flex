@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"math"
 	"os"
@@ -162,7 +161,7 @@ func main() {
 	// Function to update the image and reset timer
 	var updateImage func()
 	updateImage = func() {
-		if currentIndex >= len(images) {
+		if currentIndex < 0 || currentIndex >= len(images) {
 			currentIndex = 0
 		}
 
@@ -196,7 +195,6 @@ func main() {
 
 		for _, entry := range manifest.Entries {
 			if entry.ImagePath == imagePath {
-				fmt.Printf("%+v\n", entry)
 				titleLabel.SetMarkup("<span foreground=\"black\" font=\"24\">" + entry.Title + "</span>")
 				descLabel.SetMarkup("<span foreground=\"black\" font=\"20\">" + entry.Description + "</span>")
 				overlay.AddOverlay(drawingArea)
@@ -205,7 +203,6 @@ func main() {
 			}
 		}
 
-		currentIndex++
 		win.ShowAll()
 
 		// Remove existing timeout and add a new one
@@ -228,7 +225,6 @@ func main() {
 		switch keyEvent.KeyVal() {
 		case gdk.KEY_space, gdk.KEY_Right:
 			currentIndex = (currentIndex + 1) % len(images)
-			updateImage()
 		case gdk.KEY_Left:
 			// Ensuring currentIndex doesn't go below 0
 			if currentIndex == 0 {
@@ -236,8 +232,9 @@ func main() {
 			} else {
 				currentIndex--
 			}
-			updateImage()
 		}
+
+		updateImage()
 	})
 
 	// Mouse click event handler
