@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"math"
 	"os"
@@ -24,6 +25,14 @@ type Manifest struct {
 	Entries []Entry `yaml:"entries"`
 }
 
+type Config struct {
+	ContentDirectory string `yaml:"content_directory"`
+	ManifestPath     string `yaml:"manifest_path"`
+	SlideInterval    uint   `yaml:"slide_interval"`
+	FillColor        string `yaml:"fill_color"`
+	TextColor        string `yaml:"text_color"`
+}
+
 func loadManifest(path string) (*Manifest, error) {
 	var manifest Manifest
 
@@ -38,6 +47,22 @@ func loadManifest(path string) (*Manifest, error) {
 	}
 
 	return &manifest, nil
+}
+
+func loadConfig(path string) (*Config, error) {
+	var config Config
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	err = yaml.Unmarshal(data, &config)
+	if err != nil {
+		return nil, err
+	}
+
+	return &config, nil
 }
 
 func listImages(root string) ([]string, error) {
@@ -57,13 +82,57 @@ func listImages(root string) ([]string, error) {
 	return images, err
 }
 
-func main() {
-	gtk.Init(nil)
+func hexToRGB(hexColor string) (float64, float64, float64, error) {
+	var r, g, b uint8
+	_, err := fmt.Sscanf(hexColor, "#%02x%02x%02x", &r, &g, &b)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return float64(r) / 255.0, float64(g) / 255.0, float64(b) / 255.0, nil
+}
 
-	manifest, err := loadManifest("./manifest.yaml")
+func main() {
+	config, err := loadConfig("config.yaml")
+	if err != nil {
+		log.Fatalf("Failed to load config: %v", err)
+	}
+
+	contentDirectory := config.ContentDirectory
+	if contentDirectory == "" {
+		contentDirectory = "./content"
+	}
+
+	slideInterval := config.SlideInterval * 1000
+	if slideInterval == 0 {
+		slideInterval = 30000
+	}
+
+	fillColor := config.FillColor
+	if fillColor == "" {
+		fillColor = "#ADD8E6"
+	}
+
+	textColor := config.TextColor
+	if textColor == "" {
+		textColor = "#000000"
+	}
+
+	fillColorR, fillColorG, fillColorB, err := hexToRGB(fillColor)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	manifestPath := config.ManifestPath
+	if manifestPath == "" {
+		manifestPath = "./manifest.yaml"
+	}
+
+	manifest, err := loadManifest(manifestPath)
 	if err != nil {
 		log.Fatalf("Failed to load manifest: %v", err)
 	}
+
+	gtk.Init(nil)
 
 	win, err := gtk.WindowNew(gtk.WINDOW_TOPLEVEL)
 	if err != nil {
@@ -131,7 +200,7 @@ func main() {
 	// Draw event for drawing background
 	drawingArea.Connect("draw", func(da *gtk.DrawingArea, cr *cairo.Context) {
 		// Set the color for your background
-		cr.SetSourceRGB(0.6, 0.8, 0.9) // Example: light blue background
+		cr.SetSourceRGB(fillColorR, fillColorG, fillColorB)
 		cr.Rectangle(0, float64(da.GetAllocatedHeight())-125, float64(da.GetAllocatedWidth()), 125)
 		cr.Fill()
 	})
@@ -150,7 +219,7 @@ func main() {
 
 	win.Add(overlay)
 
-	images, err := listImages("./content")
+	images, err := listImages(contentDirectory)
 	if err != nil {
 		log.Fatalf("Failed to list images: %v", err)
 	}
@@ -195,8 +264,8 @@ func main() {
 
 		for _, entry := range manifest.Entries {
 			if entry.ImagePath == imagePath {
-				titleLabel.SetMarkup("<span foreground=\"black\" font=\"24\">" + entry.Title + "</span>")
-				descLabel.SetMarkup("<span foreground=\"black\" font=\"20\">" + entry.Description + "</span>")
+				titleLabel.SetMarkup("<span foreground=\"" + textColor + "\" font=\"24\">" + entry.Title + "</span>")
+				descLabel.SetMarkup("<span foreground=\"" + textColor + "\" font=\"20\">" + entry.Description + "</span>")
 				overlay.AddOverlay(drawingArea)
 				overlay.AddOverlay(textContainer)
 				break
@@ -209,7 +278,7 @@ func main() {
 		if timeoutID != 0 {
 			glib.SourceRemove(timeoutID)
 		}
-		timeoutID = glib.TimeoutAdd(30000, func() bool {
+		timeoutID = glib.TimeoutAdd(slideInterval, func() bool {
 			currentIndex = (currentIndex + 1) % len(images)
 			updateImage()
 			return false // Stop the current timeout

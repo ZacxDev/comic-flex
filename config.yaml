@@ -1,0 +1,6 @@
+content_directory: "./content"
+slide_interval: 30
+fill_color: "#000000"
+text_color: "#FFFFFF"
+manifest_path: "./manifest.yaml"
+
