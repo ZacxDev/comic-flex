@@ -11,6 +11,7 @@ import (
 	"github.com/gotk3/gotk3/gdk"
 	"github.com/gotk3/gotk3/glib"
 	"github.com/gotk3/gotk3/gtk"
+	"github.com/gotk3/gotk3/pango"
 	"gopkg.in/yaml.v2"
 )
 
@@ -31,6 +32,7 @@ type Config struct {
 	SlideInterval    uint   `yaml:"slide_interval"`
 	FillColor        string `yaml:"fill_color"`
 	TextColor        string `yaml:"text_color"`
+	EnableText       bool   `yaml:"enable_text"`
 }
 
 func loadManifest(path string) (*Manifest, error) {
@@ -112,6 +114,8 @@ func main() {
 		fillColor = "#ADD8E6"
 	}
 
+	enableText := config.EnableText
+
 	textColor := config.TextColor
 	if textColor == "" {
 		textColor = "#000000"
@@ -142,18 +146,7 @@ func main() {
 	win.SetDefaultSize(1920, 1080)
 
 	css := `
-  image {
-    width: 100%;
-    height: 100%;
-  }
-
-  span {
-    font-size: 48px;
-    color: blue;
-    background-color: rgba(0, 0, 0, 0.7);
-    padding: 10px;
-    border-radius: 5px;
-  }
+  window { background-color: black; }
 `
 
 	cssProvider, err := gtk.CssProviderNew()
@@ -162,8 +155,12 @@ func main() {
 	}
 	cssProvider.LoadFromData(css)
 
-	screen := win.GetScreen()
-	gtk.AddProviderForScreen(screen, cssProvider, uint(gtk.STYLE_PROVIDER_PRIORITY_APPLICATION))
+	screen, err := gdk.ScreenGetDefault()
+	if err != nil {
+		log.Fatal("Unable to get screen:", err)
+	}
+
+	gtk.AddProviderForScreen(screen, cssProvider, gtk.STYLE_PROVIDER_PRIORITY_USER)
 
 	win.Connect("destroy", func() {
 		gtk.MainQuit()
@@ -175,10 +172,17 @@ func main() {
 		log.Fatal("Unable to create label:", err)
 	}
 
+	titleLabel.SetHAlign(gtk.ALIGN_CENTER)
+	titleLabel.SetHExpand(true)
+
 	descLabel, err := gtk.LabelNew("")
 	if err != nil {
 		log.Fatal("Unable to create label:", err)
 	}
+
+	descLabel.SetLineWrap(true)
+	descLabel.SetLineWrapMode(pango.WRAP_WORD) // Wrap at word boundaries
+	descLabel.SetJustify(gtk.JUSTIFY_FILL)
 
 	overlay, err := gtk.OverlayNew()
 	if err != nil {
@@ -189,7 +193,7 @@ func main() {
 	if err != nil {
 		log.Fatal("Unable to create image:", err)
 	}
-	overlay.AddOverlay(img)
+	overlay.Add(img)
 
 	drawingArea, err := gtk.DrawingAreaNew()
 	if err != nil {
@@ -197,11 +201,13 @@ func main() {
 	}
 	drawingArea.SetSizeRequest(800, 100) // Set the size as per your requirement
 
+	textCardHeight := 150.0
+
 	// Draw event for drawing background
 	drawingArea.Connect("draw", func(da *gtk.DrawingArea, cr *cairo.Context) {
 		// Set the color for your background
 		cr.SetSourceRGB(fillColorR, fillColorG, fillColorB)
-		cr.Rectangle(0, float64(da.GetAllocatedHeight())-125, float64(da.GetAllocatedWidth()), 125)
+		cr.Rectangle(0, float64(da.GetAllocatedHeight())-textCardHeight, float64(da.GetAllocatedWidth()), textCardHeight)
 		cr.Fill()
 	})
 	overlay.AddOverlay(drawingArea)
@@ -243,6 +249,7 @@ func main() {
 
 		// Get window size
 		width, height := win.GetSize()
+		height = height - int(textCardHeight)
 
 		// Calculate the scale preserving aspect ratio
 		origWidth := pixbuf.GetWidth()
@@ -256,19 +263,22 @@ func main() {
 		}
 
 		img.SetFromPixbuf(scaledPixbuf)
+		img.SetVAlign(gtk.ALIGN_START)
 
 		titleLabel.SetMarkup("")
 		descLabel.SetMarkup("")
 		overlay.Remove(drawingArea)
 		overlay.Remove(textContainer)
 
-		for _, entry := range manifest.Entries {
-			if entry.ImagePath == imagePath {
-				titleLabel.SetMarkup("<span foreground=\"" + textColor + "\" font=\"24\">" + entry.Title + "</span>")
-				descLabel.SetMarkup("<span foreground=\"" + textColor + "\" font=\"20\">" + entry.Description + "</span>")
-				overlay.AddOverlay(drawingArea)
-				overlay.AddOverlay(textContainer)
-				break
+		if enableText {
+			for _, entry := range manifest.Entries {
+				if entry.ImagePath == imagePath {
+					titleLabel.SetMarkup("<span foreground=\"" + textColor + "\" font=\"24\">" + entry.Title + "</span>")
+					descLabel.SetMarkup("<span foreground=\"" + textColor + "\" font=\"20\">" + entry.Description + "</span>")
+					overlay.AddOverlay(drawingArea)
+					overlay.AddOverlay(textContainer)
+					break
+				}
 			}
 		}
 
