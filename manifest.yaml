@@ -1,0 +1,21 @@
+entries:
+  - id: "image1"
+    title: "Sunset"
+    image_path: "content/sunset.png"
+    short_description: "A beautiful sunset over the mountains."
+
+  - id: "image2"
+    title: "Cityscape"
+    image_path: "content/city.png"
+    short_description: "Night view of a vibrant cityscape."
+
+  - id: "image3"
+    title: "Forest Path"
+    image_path: "content/forest.png"
+    short_description: "A serene path through an autumn forest."
+
+  - id: "image4"
+    title: "Ocean View"
+    image_path: "content/ocean.png"
+    short_description: "The vast ocean under a clear blue sky."
+
