@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"math/rand"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/gotk3/gotk3/cairo"
 	"github.com/gotk3/gotk3/gdk"
@@ -121,6 +123,11 @@ func listImages(path string) ([]string, error) {
 			break
 		}
 	}
+
+	rdm := rand.New(rand.NewSource(time.Now().UnixNano()))
+	rdm.Shuffle(len(images), func(i, j int) {
+		images[i], images[j] = images[j], images[i]
+	})
 
 	return images, nil
 }
