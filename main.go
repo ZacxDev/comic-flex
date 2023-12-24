@@ -67,21 +67,62 @@ func loadConfig(path string) (*Config, error) {
 	return &config, nil
 }
 
-func listImages(root string) ([]string, error) {
-	var images []string
-	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+func listImagesAsync(root string) (<-chan string, <-chan error) {
+	imagesChan := make(chan string)
+	errChan := make(chan error, 1) // Buffer of 1 to prevent blocking
+
+	go func() {
+		defer close(imagesChan)
+		defer close(errChan)
+
+		err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if !info.IsDir() {
+				switch filepath.Ext(path) {
+				case ".jpg", ".jpeg", ".png", ".gif", ".bmp":
+					imagesChan <- path
+				}
+			}
+			return nil
+		})
+
 		if err != nil {
-			return err
+			errChan <- err
 		}
-		if !info.IsDir() {
-			switch filepath.Ext(path) {
-			case ".jpg", ".jpeg", ".png", ".gif", ".bmp":
+	}()
+
+	return imagesChan, errChan
+}
+
+func listImages(path string) ([]string, error) {
+	imagesChan, errChan := listImagesAsync(path)
+	var images []string
+
+	for {
+		select {
+		case path, ok := <-imagesChan:
+			if !ok {
+				imagesChan = nil
+			} else {
+				// Append each image path to the slice
 				images = append(images, path)
 			}
+		case err := <-errChan:
+			if err != nil {
+				log.Fatalf("Error listing images: %v", err)
+			}
+			errChan = nil
 		}
-		return nil
-	})
-	return images, err
+
+		// Break out of the loop when both channels are closed
+		if imagesChan == nil && errChan == nil {
+			break
+		}
+	}
+
+	return images, nil
 }
 
 func hexToRGB(hexColor string) (float64, float64, float64, error) {
@@ -160,7 +201,7 @@ func main() {
 		log.Fatal("Unable to get screen:", err)
 	}
 
-	gtk.AddProviderForScreen(screen, cssProvider, gtk.STYLE_PROVIDER_PRIORITY_USER)
+	gtk.AddProviderForScreen(screen, cssProvider, uint(gtk.STYLE_PROVIDER_PRIORITY_USER))
 
 	win.Connect("destroy", func() {
 		gtk.MainQuit()
