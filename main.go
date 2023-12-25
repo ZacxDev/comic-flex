@@ -293,7 +293,6 @@ func main() {
 	currentIndex := 0
 
 	var timeoutID glib.SourceHandle
-	var pixbuf *gdk.Pixbuf
 
 	// Function to update the image and reset timer
 	var updateImage func()
@@ -307,6 +306,7 @@ func main() {
 		done := make(chan *gdk.Pixbuf, 1)
 		errChan := make(chan error, 1)
 
+		var pixbuf *gdk.Pixbuf
 		go loadPixbuf(imagePath, done, errChan)
 
 		select {
@@ -350,8 +350,8 @@ func main() {
 		img.Clear()
 		img.SetFromPixbuf(scaledPixbuf)
 
-		gdk.Pixbuf.Unref(*pixbuf)
-		gdk.Pixbuf.Unref(*scaledPixbuf)
+		pixbuf.Unref()
+		scaledPixbuf.Unref()
 
 		img.SetVAlign(gtk.ALIGN_START)
 
