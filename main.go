@@ -301,7 +301,6 @@ func main() {
 		}
 
 		imagePath := images[currentIndex]
-		fmt.Printf("imagePath %s\n", imagePath)
 
 		done := make(chan *gdk.Pixbuf, 1)
 		errChan := make(chan error, 1)
@@ -316,8 +315,6 @@ func main() {
 			updateImage()
 			return
 		case pixbuf = <-done:
-			// Use pixbuf
-			fmt.Printf("log1\n")
 			break
 		case err := <-errChan:
 			fmt.Printf("Error loading image: %v\n", err)
@@ -339,14 +336,16 @@ func main() {
 		}
 
 		img.SetFromPixbuf(scaledPixbuf)
+		pixbuf.Unref()
+		scaledPixbuf.Unref()
 		img.SetVAlign(gtk.ALIGN_START)
 
-		titleLabel.SetMarkup("")
-		descLabel.SetMarkup("")
-		overlay.Remove(drawingArea)
-		overlay.Remove(textContainer)
-
 		if enableText {
+			titleLabel.SetMarkup("")
+			descLabel.SetMarkup("")
+			overlay.Remove(drawingArea)
+			overlay.Remove(textContainer)
+
 			for _, entry := range manifest.Entries {
 				if entry.ImagePath == imagePath {
 					titleLabel.SetMarkup("<span foreground=\"" + textColor + "\" font=\"24\">" + entry.Title + "</span>")
