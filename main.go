@@ -310,20 +310,19 @@ func main() {
 
 		var pixbuf *gdk.Pixbuf
 		select {
+		case <-time.After(10 * time.Second):
+			fmt.Printf("Timed out loading image: %s\n", imagePath)
+			currentIndex++
+			updateImage()
+			return
 		case pixbuf = <-done:
 			// Use pixbuf
 			fmt.Printf("log1\n")
 			break
 		case err := <-errChan:
-			log.Printf("Error loading image: %v", err)
-		case <-time.After(10 * time.Second):
-			log.Printf("Timed out loading image: %s", imagePath)
-			currentIndex++
-			updateImage()
-			return
+			fmt.Printf("Error loading image: %v\n", err)
 		}
 
-		fmt.Printf("log1\n")
 		// Get window size
 		width, height := win.GetSize()
 		height = height - int(textCardHeight)
@@ -333,7 +332,6 @@ func main() {
 		origHeight := pixbuf.GetHeight()
 		scale := math.Min(float64(width)/float64(origWidth), float64(height)/float64(origHeight))
 
-		fmt.Printf("log2\n")
 		// Scale the image
 		scaledPixbuf, err := pixbuf.ScaleSimple(int(float64(origWidth)*scale), int(float64(origHeight)*scale), gdk.INTERP_BILINEAR)
 		if err != nil {
@@ -343,7 +341,6 @@ func main() {
 		img.SetFromPixbuf(scaledPixbuf)
 		img.SetVAlign(gtk.ALIGN_START)
 
-		fmt.Printf("log3\n")
 		titleLabel.SetMarkup("")
 		descLabel.SetMarkup("")
 		overlay.Remove(drawingArea)
@@ -361,9 +358,6 @@ func main() {
 			}
 		}
 
-		//win.ShowAll()
-
-		fmt.Printf("log4\n")
 		// Remove existing timeout and add a new one
 		if timeoutID != 0 {
 			glib.SourceRemove(timeoutID)
@@ -371,7 +365,6 @@ func main() {
 		timeoutID = glib.TimeoutAdd(slideInterval, func() bool {
 			currentIndex = (currentIndex + 1) % len(images)
 			updateImage()
-			fmt.Printf("log timeout\n")
 			return false // Stop the current timeout
 		})
 	}
