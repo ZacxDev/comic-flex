@@ -350,8 +350,8 @@ func main() {
 		img.Clear()
 		img.SetFromPixbuf(scaledPixbuf)
 
-		pixbuf.Unref()
-		scaledPixbuf.Unref()
+		defer pixbuf.Unref()
+		defer scaledPixbuf.Unref()
 
 		img.SetVAlign(gtk.ALIGN_START)
 
