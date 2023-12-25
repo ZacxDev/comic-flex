@@ -35,6 +35,7 @@ type Config struct {
 	FillColor        string `yaml:"fill_color"`
 	TextColor        string `yaml:"text_color"`
 	EnableText       bool   `yaml:"enable_text"`
+	IsRandomOrder    bool   `yaml:"is_random_order"`
 }
 
 func loadManifest(path string) (*Manifest, error) {
@@ -98,7 +99,7 @@ func listImagesAsync(root string) (<-chan string, <-chan error) {
 	return imagesChan, errChan
 }
 
-func listImages(path string) ([]string, error) {
+func listImages(path string, isRandomOrder bool) ([]string, error) {
 	imagesChan, errChan := listImagesAsync(path)
 	var images []string
 
@@ -124,10 +125,12 @@ func listImages(path string) ([]string, error) {
 		}
 	}
 
-	rdm := rand.New(rand.NewSource(time.Now().UnixNano()))
-	rdm.Shuffle(len(images), func(i, j int) {
-		images[i], images[j] = images[j], images[i]
-	})
+	if isRandomOrder {
+		rdm := rand.New(rand.NewSource(time.Now().UnixNano()))
+		rdm.Shuffle(len(images), func(i, j int) {
+			images[i], images[j] = images[j], images[i]
+		})
+	}
 
 	return images, nil
 }
@@ -273,7 +276,7 @@ func main() {
 
 	win.Add(overlay)
 
-	images, err := listImages(contentDirectory)
+	images, err := listImages(contentDirectory, config.IsRandomOrder)
 	if err != nil {
 		log.Fatalf("Failed to list images: %v", err)
 	}
@@ -289,12 +292,14 @@ func main() {
 		}
 
 		imagePath := images[currentIndex]
+		fmt.Printf("imagePath %s\n", imagePath)
 
 		pixbuf, err := gdk.PixbufNewFromFile(imagePath)
 		if err != nil {
 			log.Fatal("Unable to create pixbuf:", err)
 		}
 
+		fmt.Printf("log1\n")
 		// Get window size
 		width, height := win.GetSize()
 		height = height - int(textCardHeight)
@@ -304,6 +309,7 @@ func main() {
 		origHeight := pixbuf.GetHeight()
 		scale := math.Min(float64(width)/float64(origWidth), float64(height)/float64(origHeight))
 
+		fmt.Printf("log2\n")
 		// Scale the image
 		scaledPixbuf, err := pixbuf.ScaleSimple(int(float64(origWidth)*scale), int(float64(origHeight)*scale), gdk.INTERP_BILINEAR)
 		if err != nil {
@@ -313,6 +319,7 @@ func main() {
 		img.SetFromPixbuf(scaledPixbuf)
 		img.SetVAlign(gtk.ALIGN_START)
 
+		fmt.Printf("log3\n")
 		titleLabel.SetMarkup("")
 		descLabel.SetMarkup("")
 		overlay.Remove(drawingArea)
@@ -330,8 +337,9 @@ func main() {
 			}
 		}
 
-		win.ShowAll()
+		//win.ShowAll()
 
+		fmt.Printf("log4\n")
 		// Remove existing timeout and add a new one
 		if timeoutID != 0 {
 			glib.SourceRemove(timeoutID)
@@ -339,6 +347,7 @@ func main() {
 		timeoutID = glib.TimeoutAdd(slideInterval, func() bool {
 			currentIndex = (currentIndex + 1) % len(images)
 			updateImage()
+			fmt.Printf("log timeout\n")
 			return false // Stop the current timeout
 		})
 	}

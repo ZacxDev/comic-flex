@@ -4,4 +4,5 @@ fill_color: "#000000"
 text_color: "#FFFFFF"
 manifest_path: "./manifest.yaml"
 enable_text: true
+is_random_order: true
 

@@ -21,6 +21,11 @@ entries:
 
   - id: "krull"
     title: "Krull #1"
-    image_path: "content/img799.jpg"
+    image_path: "Krull/img799.jpg"
     short_description: "The first appearence of some guThe first appearence of some guThe first appearence of some guThe first appearence of some guThe first appearence of some guThe first appearence of some guThe first appearence of some guThe first appearence of some guThe first appearence of some guThe first appearence of some guThe first appearence of some guThe first appearence of some guThe first appearence of some guyyyyyyyyyyyyyThe first appearence of some guy"
+
+  - id: "actioncomics"
+    title: "Action Comics #1"
+    image_path: "CGC Comics 2022/Action Comics/img078.jpg"
+    short_description: "The first appearence of superman"
 
