@@ -314,12 +314,8 @@ func main() {
 			fmt.Printf("Timed out loading image: %s\n", imagePath)
 			currentIndex++
 			updateImage()
-			close(done)
-			close(errChan)
 			return
 		case pixbuf = <-done:
-			close(done)
-			close(errChan)
 			break
 		case err := <-errChan:
 			fmt.Printf("Error loading image: %v\n", err)
