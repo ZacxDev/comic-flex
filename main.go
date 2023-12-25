@@ -144,15 +144,6 @@ func hexToRGB(hexColor string) (float64, float64, float64, error) {
 	return float64(r) / 255.0, float64(g) / 255.0, float64(b) / 255.0, nil
 }
 
-func loadPixbuf(imagePath string, done chan<- *gdk.Pixbuf, errChan chan<- error) {
-	pixbuf, err := gdk.PixbufNewFromFile(imagePath)
-	if err != nil {
-		errChan <- err
-		return
-	}
-	done <- pixbuf
-}
-
 func main() {
 	config, err := loadConfig("config.yaml")
 	if err != nil {
@@ -303,22 +294,10 @@ func main() {
 
 		imagePath := images[currentIndex]
 
-		done := make(chan *gdk.Pixbuf, 1)
-		errChan := make(chan error, 1)
-
-		var pixbuf *gdk.Pixbuf
-		go loadPixbuf(imagePath, done, errChan)
-
-		select {
-		case <-time.After(10 * time.Second):
-			fmt.Printf("Timed out loading image: %s\n", imagePath)
-			currentIndex++
-			updateImage()
+		pixbuf, err := gdk.PixbufNewFromFile(imagePath)
+		if err != nil {
+			log.Fatal("Unable to create pixbuf:", err)
 			return
-		case pixbuf = <-done:
-			break
-		case err := <-errChan:
-			fmt.Printf("Error loading image: %v\n", err)
 		}
 
 		if pixbuf == nil {
