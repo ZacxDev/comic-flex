@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"github.com/gotk3/gotk3/cairo"
@@ -291,7 +292,13 @@ func main() {
 	}
 
 	currentIndex := 0
+
+	// Get window size
+	width, height := win.GetSize()
+	height = height - int(textCardHeight)
+
 	var timeoutID glib.SourceHandle
+	var pixbuf *gdk.Pixbuf
 
 	// Function to update the image and reset timer
 	var updateImage func()
@@ -307,7 +314,6 @@ func main() {
 
 		go loadPixbuf(imagePath, done, errChan)
 
-		var pixbuf *gdk.Pixbuf
 		select {
 		case <-time.After(10 * time.Second):
 			fmt.Printf("Timed out loading image: %s\n", imagePath)
@@ -319,10 +325,6 @@ func main() {
 		case err := <-errChan:
 			fmt.Printf("Error loading image: %v\n", err)
 		}
-
-		// Get window size
-		width, height := win.GetSize()
-		height = height - int(textCardHeight)
 
 		// Calculate the scale preserving aspect ratio
 		origWidth := pixbuf.GetWidth()
@@ -336,8 +338,7 @@ func main() {
 		}
 
 		img.SetFromPixbuf(scaledPixbuf)
-		pixbuf.Unref()
-		scaledPixbuf.Unref()
+
 		img.SetVAlign(gtk.ALIGN_START)
 
 		if enableText {
@@ -366,6 +367,11 @@ func main() {
 			updateImage()
 			return false // Stop the current timeout
 		})
+
+		// Cleanup
+		pixbuf = nil
+		scaledPixbuf = nil
+		runtime.GC()
 	}
 
 	// Initial image update
