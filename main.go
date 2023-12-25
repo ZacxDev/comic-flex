@@ -323,9 +323,19 @@ func main() {
 			fmt.Printf("Error loading image: %v\n", err)
 		}
 
+		if pixbuf == nil {
+			fmt.Println("Pixbuf is nil")
+			return
+		}
+
 		// Calculate the scale preserving aspect ratio
 		origWidth := pixbuf.GetWidth()
 		origHeight := pixbuf.GetHeight()
+
+		if origWidth == 0 || origHeight == 0 {
+			fmt.Println("Pixbuf width or height is 0")
+			return
+		}
 
 		// Get window size
 		width, height := win.GetSize()
