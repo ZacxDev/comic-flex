@@ -7,7 +7,6 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
-	"runtime"
 	"time"
 
 	"github.com/gotk3/gotk3/cairo"
@@ -309,6 +308,8 @@ func main() {
 		errChan := make(chan error, 1)
 
 		go loadPixbuf(imagePath, done, errChan)
+		defer close(done)
+		defer close(errChan)
 
 		select {
 		case <-time.After(10 * time.Second):
@@ -338,7 +339,11 @@ func main() {
 			log.Fatal("Unable to scale pixbuf:", err)
 		}
 
+		img.Clear()
 		img.SetFromPixbuf(scaledPixbuf)
+
+		gdk.Pixbuf.Unref(*pixbuf)
+		gdk.Pixbuf.Unref(*scaledPixbuf)
 
 		img.SetVAlign(gtk.ALIGN_START)
 
@@ -368,11 +373,6 @@ func main() {
 			updateImage()
 			return false // Stop the current timeout
 		})
-
-		// Cleanup
-		pixbuf = nil
-		scaledPixbuf = nil
-		runtime.GC()
 	}
 
 	// Initial image update
