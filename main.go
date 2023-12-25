@@ -293,10 +293,6 @@ func main() {
 
 	currentIndex := 0
 
-	// Get window size
-	width, height := win.GetSize()
-	height = height - int(textCardHeight)
-
 	var timeoutID glib.SourceHandle
 	var pixbuf *gdk.Pixbuf
 
@@ -329,6 +325,11 @@ func main() {
 		// Calculate the scale preserving aspect ratio
 		origWidth := pixbuf.GetWidth()
 		origHeight := pixbuf.GetHeight()
+
+		// Get window size
+		width, height := win.GetSize()
+		height = height - int(textCardHeight)
+
 		scale := math.Min(float64(width)/float64(origWidth), float64(height)/float64(origHeight))
 
 		// Scale the image
