@@ -308,8 +308,6 @@ func main() {
 		errChan := make(chan error, 1)
 
 		go loadPixbuf(imagePath, done, errChan)
-		defer close(done)
-		defer close(errChan)
 
 		select {
 		case <-time.After(10 * time.Second):
@@ -322,6 +320,8 @@ func main() {
 		case err := <-errChan:
 			fmt.Printf("Error loading image: %v\n", err)
 		}
+		defer close(done)
+		defer close(errChan)
 
 		if pixbuf == nil {
 			fmt.Println("Pixbuf is nil")
