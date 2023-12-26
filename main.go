@@ -303,10 +303,6 @@ func main() {
 		if err != nil {
 			fmt.Printf("Unable to create pixbuf: %+v", err)
 			return func() {
-				glib.IdleAdd(func() {
-					gdk.Pixbuf.Unref(*pixbuf)
-					pixbuf = nil
-				})
 			}
 		}
 
@@ -323,10 +319,6 @@ func main() {
 		if origWidth == 0 || origHeight == 0 {
 			fmt.Println("Pixbuf width or height is 0")
 			return func() {
-				glib.IdleAdd(func() {
-					gdk.Pixbuf.Unref(*pixbuf)
-					pixbuf = nil
-				})
 			}
 		}
 
@@ -341,15 +333,18 @@ func main() {
 		destHeight := int(float64(origHeight) * scale)
 		fmt.Printf("%+v %v %v\n", pixbuf, destWidth, destHeight)
 		glib.IdleAdd(func() {
-			/*
-				scaledPixbuf, err := pixbuf.ScaleSimple(destWidth, destHeight, gdk.INTERP_BILINEAR)
-				if err != nil {
-					fmt.Printf("Unable to scale pixbuf: %+v", err)
-				}
-			*/
+			gdk.Pixbuf.Unref(*pixbuf)
+			pixbuf = nil
+
+			scaledPixbuf, err := pixbuf.ScaleSimple(destWidth, destHeight, gdk.INTERP_BILINEAR)
+			if err != nil {
+				fmt.Printf("Unable to scale pixbuf: %+v", err)
+			}
 
 			//img.Clear()
-			img.SetFromPixbuf(pixbuf)
+			img.SetFromPixbuf(scaledPixbuf)
+			gdk.Pixbuf.Unref(*scaledPixbuf)
+			scaledPixbuf = nil
 		})
 
 		img.SetVAlign(gtk.ALIGN_START)
@@ -372,10 +367,6 @@ func main() {
 		}
 
 		return func() {
-			glib.IdleAdd(func() {
-				gdk.Pixbuf.Unref(*pixbuf)
-				pixbuf = nil
-			})
 		}
 	}
 
