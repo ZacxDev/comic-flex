@@ -292,9 +292,10 @@ func main() {
 
 		imagePath := images[currentIndex]
 
+		fmt.Printf("%+v\n", imagePath)
 		pixbuf, err := gdk.PixbufNewFromFile(imagePath)
 		if err != nil {
-			log.Fatal("Unable to create pixbuf:", err)
+			fmt.Printf("Unable to create pixbuf: %+v", err)
 			return func() {
 				gdk.Pixbuf.Unref(*pixbuf)
 			}
