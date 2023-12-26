@@ -335,12 +335,11 @@ func main() {
 				fmt.Printf("Unable to scale pixbuf: %+v", err)
 			}
 
-			gdk.Pixbuf.Unref(*pixbuf)
-			pixbuf = nil
-
-			//img.Clear()
 			img.SetFromPixbuf(scaledPixbuf)
-			gdk.Pixbuf.Unref(*scaledPixbuf)
+
+			//gdk.Pixbuf.Unref(*pixbuf)
+			pixbuf = nil
+			//gdk.Pixbuf.Unref(*scaledPixbuf)
 			scaledPixbuf = nil
 		})
 
