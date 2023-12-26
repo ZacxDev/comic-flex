@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"github.com/gotk3/gotk3/cairo"
@@ -341,6 +342,7 @@ func main() {
 			pixbuf = nil
 			//gdk.Pixbuf.Unref(*scaledPixbuf)
 			scaledPixbuf = nil
+			runtime.GC()
 		})
 
 		img.SetVAlign(gtk.ALIGN_START)
