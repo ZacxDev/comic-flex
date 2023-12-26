@@ -286,8 +286,8 @@ func main() {
 	var timeoutID glib.SourceHandle
 
 	// Function to update the image and reset timer
-	var updateImage func()
-	updateImage = func() {
+	var updateImage func() *gdk.Pixbuf
+	updateImage = func() *gdk.Pixbuf {
 		if currentIndex < 0 || currentIndex >= len(images) {
 			currentIndex = 0
 		}
@@ -297,12 +297,12 @@ func main() {
 		pixbuf, err := gdk.PixbufNewFromFile(imagePath)
 		if err != nil {
 			log.Fatal("Unable to create pixbuf:", err)
-			return
+			return pixbuf
 		}
 
 		if pixbuf == nil {
 			fmt.Println("Pixbuf is nil")
-			return
+			return pixbuf
 		}
 
 		// Calculate the scale preserving aspect ratio
@@ -311,7 +311,7 @@ func main() {
 
 		if origWidth == 0 || origHeight == 0 {
 			fmt.Println("Pixbuf width or height is 0")
-			return
+			return pixbuf
 		}
 
 		// Get window size
@@ -329,7 +329,7 @@ func main() {
 		img.Clear()
 		img.SetFromPixbuf(scaledPixbuf)
 
-		gdk.Pixbuf.Unref(*pixbuf)
+		//gdk.Pixbuf.Unref(*pixbuf)
 		gdk.Pixbuf.Unref(*scaledPixbuf)
 
 		img.SetVAlign(gtk.ALIGN_START)
@@ -351,19 +351,19 @@ func main() {
 			}
 		}
 
-		// Remove existing timeout and add a new one
-		if timeoutID != 0 {
-			glib.SourceRemove(timeoutID)
-		}
-		timeoutID = glib.TimeoutAdd(slideInterval, func() bool {
-			currentIndex = (currentIndex + 1) % len(images)
-			updateImage()
-			return false // Stop the current timeout
-		})
+		return pixbuf
 	}
 
-	// Initial image update
-	updateImage()
+	// Remove existing timeout and add a new one
+	if timeoutID != 0 {
+		glib.SourceRemove(timeoutID)
+	}
+	timeoutID = glib.TimeoutAdd(slideInterval, func() bool {
+		currentIndex = (currentIndex + 1) % len(images)
+		pb := updateImage()
+		defer gdk.Pixbuf.Unref(*pb)
+		return false // Stop the current timeout
+	})
 
 	// Key press event handler
 	win.Connect("key-press-event", func(win *gtk.Window, event *gdk.Event) {
@@ -380,16 +380,20 @@ func main() {
 			}
 		}
 
-		updateImage()
+		pb := updateImage()
+		gdk.Pixbuf.Unref(*pb)
 	})
 
 	// Mouse click event handler
 	win.Connect("button-press-event", func(win *gtk.Window, event *gdk.Event) {
 		currentIndex = (currentIndex + 1) % len(images)
-		updateImage()
+		pb := updateImage()
+		gdk.Pixbuf.Unref(*pb)
 	})
 
-	updateImage() // initial image update
+	// Initial image update
+	pb := updateImage()
+	defer gdk.Pixbuf.Unref(*pb)
 
 	win.ShowAll()
 	gtk.Main()
