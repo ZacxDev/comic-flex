@@ -341,13 +341,15 @@ func main() {
 		destHeight := int(float64(origHeight) * scale)
 		fmt.Printf("%+v %v %v\n", pixbuf, destWidth, destHeight)
 		glib.IdleAdd(func() {
-			scaledPixbuf, err := pixbuf.ScaleSimple(destWidth, destHeight, gdk.INTERP_BILINEAR)
-			if err != nil {
-				fmt.Printf("Unable to scale pixbuf: %+v", err)
-			}
+			/*
+				scaledPixbuf, err := pixbuf.ScaleSimple(destWidth, destHeight, gdk.INTERP_BILINEAR)
+				if err != nil {
+					fmt.Printf("Unable to scale pixbuf: %+v", err)
+				}
+			*/
 
 			//img.Clear()
-			img.SetFromPixbuf(scaledPixbuf)
+			img.SetFromPixbuf(pixbuf)
 		})
 
 		img.SetVAlign(gtk.ALIGN_START)
