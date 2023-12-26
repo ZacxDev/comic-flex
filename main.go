@@ -293,6 +293,12 @@ func main() {
 		imagePath := images[currentIndex]
 
 		fmt.Printf("%+v\n", imagePath)
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Println("Panic'd on image: %sRecovered from error:", imagePath, r)
+			}
+		}()
+
 		pixbuf, err := gdk.PixbufNewFromFile(imagePath)
 		if err != nil {
 			fmt.Printf("Unable to create pixbuf: %+v", err)
