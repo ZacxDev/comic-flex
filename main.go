@@ -283,11 +283,9 @@ func main() {
 
 	currentIndex := 0
 
-	var timeoutID glib.SourceHandle
-
 	// Function to update the image and reset timer
-	var updateImage func() *gdk.Pixbuf
-	updateImage = func() *gdk.Pixbuf {
+	var updateImage func() func()
+	updateImage = func() func() {
 		if currentIndex < 0 || currentIndex >= len(images) {
 			currentIndex = 0
 		}
@@ -297,12 +295,15 @@ func main() {
 		pixbuf, err := gdk.PixbufNewFromFile(imagePath)
 		if err != nil {
 			log.Fatal("Unable to create pixbuf:", err)
-			return pixbuf
+			return func() {
+				gdk.Pixbuf.Unref(*pixbuf)
+			}
 		}
 
 		if pixbuf == nil {
 			fmt.Println("Pixbuf is nil")
-			return pixbuf
+			return func() {
+			}
 		}
 
 		// Calculate the scale preserving aspect ratio
@@ -311,7 +312,9 @@ func main() {
 
 		if origWidth == 0 || origHeight == 0 {
 			fmt.Println("Pixbuf width or height is 0")
-			return pixbuf
+			return func() {
+				gdk.Pixbuf.Unref(*pixbuf)
+			}
 		}
 
 		// Get window size
@@ -324,13 +327,14 @@ func main() {
 		scaledPixbuf, err := pixbuf.ScaleSimple(int(float64(origWidth)*scale), int(float64(origHeight)*scale), gdk.INTERP_BILINEAR)
 		if err != nil {
 			log.Fatal("Unable to scale pixbuf:", err)
+			return func() {
+				gdk.Pixbuf.Unref(*pixbuf)
+				gdk.Pixbuf.Unref(*scaledPixbuf)
+			}
 		}
 
 		img.Clear()
 		img.SetFromPixbuf(scaledPixbuf)
-
-		//gdk.Pixbuf.Unref(*pixbuf)
-		gdk.Pixbuf.Unref(*scaledPixbuf)
 
 		img.SetVAlign(gtk.ALIGN_START)
 
@@ -351,8 +355,13 @@ func main() {
 			}
 		}
 
-		return pixbuf
+		return func() {
+			gdk.Pixbuf.Unref(*pixbuf)
+			gdk.Pixbuf.Unref(*scaledPixbuf)
+		}
 	}
+
+	var timeoutID glib.SourceHandle
 
 	// Remove existing timeout and add a new one
 	if timeoutID != 0 {
@@ -360,8 +369,8 @@ func main() {
 	}
 	timeoutID = glib.TimeoutAdd(slideInterval, func() bool {
 		currentIndex = (currentIndex + 1) % len(images)
-		pb := updateImage()
-		defer gdk.Pixbuf.Unref(*pb)
+		cleanup := updateImage()
+		cleanup()
 		return false // Stop the current timeout
 	})
 
@@ -380,20 +389,20 @@ func main() {
 			}
 		}
 
-		pb := updateImage()
-		gdk.Pixbuf.Unref(*pb)
+		cleanup := updateImage()
+		cleanup()
 	})
 
 	// Mouse click event handler
 	win.Connect("button-press-event", func(win *gtk.Window, event *gdk.Event) {
 		currentIndex = (currentIndex + 1) % len(images)
-		pb := updateImage()
-		gdk.Pixbuf.Unref(*pb)
+		cleanup := updateImage()
+		cleanup()
 	})
 
 	// Initial image update
-	pb := updateImage()
-	defer gdk.Pixbuf.Unref(*pb)
+	cleanup := updateImage()
+	cleanup()
 
 	win.ShowAll()
 	gtk.Main()
