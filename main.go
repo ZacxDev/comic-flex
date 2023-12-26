@@ -333,13 +333,13 @@ func main() {
 		destHeight := int(float64(origHeight) * scale)
 		fmt.Printf("%+v %v %v\n", pixbuf, destWidth, destHeight)
 		glib.IdleAdd(func() {
-			gdk.Pixbuf.Unref(*pixbuf)
-			pixbuf = nil
-
 			scaledPixbuf, err := pixbuf.ScaleSimple(destWidth, destHeight, gdk.INTERP_BILINEAR)
 			if err != nil {
 				fmt.Printf("Unable to scale pixbuf: %+v", err)
 			}
+
+			gdk.Pixbuf.Unref(*pixbuf)
+			pixbuf = nil
 
 			//img.Clear()
 			img.SetFromPixbuf(scaledPixbuf)
