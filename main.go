@@ -367,16 +367,23 @@ func main() {
 
 	var timeoutID glib.SourceHandle
 
-	// Remove existing timeout and add a new one
-	if timeoutID != 0 {
-		glib.SourceRemove(timeoutID)
+	var startTimer func()
+	startTimer = func() {
+		// Remove existing timeout and add a new one
+		if timeoutID != 0 {
+			glib.SourceRemove(timeoutID)
+		}
+
+		timeoutID = glib.TimeoutAdd(slideInterval, func() bool {
+			currentIndex = (currentIndex + 1) % len(images)
+			cleanup := updateImage()
+			cleanup()
+			startTimer()
+
+			return false // Stop the current timeout
+		})
 	}
-	timeoutID = glib.TimeoutAdd(slideInterval, func() bool {
-		currentIndex = (currentIndex + 1) % len(images)
-		cleanup := updateImage()
-		cleanup()
-		return false // Stop the current timeout
-	})
+	startTimer()
 
 	// Key press event handler
 	win.Connect("key-press-event", func(win *gtk.Window, event *gdk.Event) {
