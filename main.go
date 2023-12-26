@@ -324,7 +324,10 @@ func main() {
 		scale := math.Min(float64(width)/float64(origWidth), float64(height)/float64(origHeight))
 
 		// Scale the image
-		scaledPixbuf, err := pixbuf.ScaleSimple(int(float64(origWidth)*scale), int(float64(origHeight)*scale), gdk.INTERP_BILINEAR)
+		destWidth := int(float64(origWidth) * scale)
+		destHeight := int(float64(origHeight) * scale)
+		fmt.Printf("%+v %v %v\n", pixbuf, destWidth, destHeight)
+		scaledPixbuf, err := pixbuf.ScaleSimple(destWidth, destHeight, gdk.INTERP_BILINEAR)
 		if err != nil {
 			log.Fatal("Unable to scale pixbuf:", err)
 			return func() {
