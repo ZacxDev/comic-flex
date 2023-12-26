@@ -373,8 +373,6 @@ func main() {
 			glib.IdleAdd(func() {
 				gdk.Pixbuf.Unref(*pixbuf)
 				pixbuf = nil
-				gdk.Pixbuf.Unref(*scaledPixbuf)
-				scaledPixbuf = nil
 			})
 		}
 	}
