@@ -333,7 +333,9 @@ func main() {
 			log.Fatal("Unable to scale pixbuf:", err)
 			return func() {
 				gdk.Pixbuf.Unref(*pixbuf)
+				pixbuf = nil
 				gdk.Pixbuf.Unref(*scaledPixbuf)
+				scaledPixbuf = nil
 			}
 		}
 
