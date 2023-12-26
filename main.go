@@ -299,40 +299,37 @@ func main() {
 			}
 		}()
 
-		pixbuf, err := gdk.PixbufNewFromFile(imagePath)
-		if err != nil {
-			fmt.Printf("Unable to create pixbuf: %+v", err)
-			return func() {
-			}
-		}
-
-		if pixbuf == nil {
-			fmt.Println("Pixbuf is nil")
-			return func() {
-			}
-		}
-
-		// Calculate the scale preserving aspect ratio
-		origWidth := pixbuf.GetWidth()
-		origHeight := pixbuf.GetHeight()
-
-		if origWidth == 0 || origHeight == 0 {
-			fmt.Println("Pixbuf width or height is 0")
-			return func() {
-			}
-		}
-
-		// Get window size
-		width, height := win.GetSize()
-		height = height - int(textCardHeight)
-
-		scale := math.Min(float64(width)/float64(origWidth), float64(height)/float64(origHeight))
-
-		// Scale the image
-		destWidth := int(float64(origWidth) * scale)
-		destHeight := int(float64(origHeight) * scale)
-		fmt.Printf("%+v %v %v\n", pixbuf, destWidth, destHeight)
 		glib.IdleAdd(func() {
+			pixbuf, err := gdk.PixbufNewFromFile(imagePath)
+			if err != nil {
+				fmt.Printf("Unable to create pixbuf: %+v", err)
+				return
+			}
+
+			if pixbuf == nil {
+				fmt.Println("Pixbuf is nil")
+				return
+			}
+
+			// Calculate the scale preserving aspect ratio
+			origWidth := pixbuf.GetWidth()
+			origHeight := pixbuf.GetHeight()
+
+			if origWidth == 0 || origHeight == 0 {
+				fmt.Println("Pixbuf width or height is 0")
+				return
+			}
+
+			// Get window size
+			width, height := win.GetSize()
+			height = height - int(textCardHeight)
+
+			scale := math.Min(float64(width)/float64(origWidth), float64(height)/float64(origHeight))
+
+			// Scale the image
+			destWidth := int(float64(origWidth) * scale)
+			destHeight := int(float64(origHeight) * scale)
+			fmt.Printf("%+v %v %v\n", pixbuf, destWidth, destHeight)
 			scaledPixbuf, err := pixbuf.ScaleSimple(destWidth, destHeight, gdk.INTERP_BILINEAR)
 			if err != nil {
 				fmt.Printf("Unable to scale pixbuf: %+v", err)
