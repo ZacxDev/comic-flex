@@ -4,136 +4,28 @@ import (
 	"fmt"
 	"log"
 	"math"
-	"math/rand"
 	"os"
-	"path/filepath"
-	"runtime"
-	"time"
+	"strconv"
+	"sync"
 
-	"github.com/gotk3/gotk3/cairo"
+	gocollect "github.com/ZacxDev/go-gocollect-sdk"
 	"github.com/gotk3/gotk3/gdk"
 	"github.com/gotk3/gotk3/glib"
 	"github.com/gotk3/gotk3/gtk"
 	"github.com/gotk3/gotk3/pango"
-	"gopkg.in/yaml.v2"
 )
 
-type Entry struct {
-	ID          string `yaml:"id"`
-	Title       string `yaml:"title"`
-	ImagePath   string `yaml:"image_path"`
-	Description string `yaml:"short_description"`
-}
-
-type Manifest struct {
-	Entries []Entry `yaml:"entries"`
-}
-
-type Config struct {
-	ContentDirectory string `yaml:"content_directory"`
-	ManifestPath     string `yaml:"manifest_path"`
-	SlideInterval    uint   `yaml:"slide_interval"`
-	FillColor        string `yaml:"fill_color"`
-	TextColor        string `yaml:"text_color"`
-	EnableText       bool   `yaml:"enable_text"`
-	IsRandomOrder    bool   `yaml:"is_random_order"`
-}
-
-func loadManifest(path string) (*Manifest, error) {
-	var manifest Manifest
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-
-	err = yaml.Unmarshal(data, &manifest)
-	if err != nil {
-		return nil, err
-	}
-
-	return &manifest, nil
-}
-
-func loadConfig(path string) (*Config, error) {
-	var config Config
-
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-
-	err = yaml.Unmarshal(data, &config)
-	if err != nil {
-		return nil, err
-	}
-
-	return &config, nil
-}
-
-func listImagesAsync(root string) (<-chan string, <-chan error) {
-	imagesChan := make(chan string)
-	errChan := make(chan error, 1) // Buffer of 1 to prevent blocking
-
-	go func() {
-		defer close(imagesChan)
-		defer close(errChan)
-
-		err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return err
-			}
-			if !info.IsDir() {
-				switch filepath.Ext(path) {
-				case ".jpg", ".jpeg", ".png", ".gif", ".bmp":
-					imagesChan <- path
-				}
-			}
-			return nil
-		})
-
-		if err != nil {
-			errChan <- err
-		}
-	}()
-
-	return imagesChan, errChan
-}
-
-func listImages(path string, isRandomOrder bool) ([]string, error) {
-	imagesChan, errChan := listImagesAsync(path)
-	var images []string
-
-	for {
-		select {
-		case path, ok := <-imagesChan:
-			if !ok {
-				imagesChan = nil
-			} else {
-				// Append each image path to the slice
-				images = append(images, path)
-			}
-		case err := <-errChan:
-			if err != nil {
-				log.Fatalf("Error listing images: %v", err)
-			}
-			errChan = nil
-		}
-
-		// Break out of the loop when both channels are closed
-		if imagesChan == nil && errChan == nil {
-			break
-		}
-	}
-
-	if isRandomOrder {
-		rdm := rand.New(rand.NewSource(time.Now().UnixNano()))
-		rdm.Shuffle(len(images), func(i, j int) {
-			images[i], images[j] = images[j], images[i]
-		})
-	}
-
-	return images, nil
+type ImageViewer struct {
+	mutex           *sync.RWMutex
+	window          *gtk.Window
+	image           *gtk.Image
+	titleLabel      *gtk.Label
+	descLabel       *gtk.Label
+	statsLabel      *gtk.Label
+	comicService    *ComicService
+	timeoutID       glib.SourceHandle
+	currentComic    *Comic
+	currentInsights *gocollect.ItemInsights
 }
 
 func hexToRGB(hexColor string) (float64, float64, float64, error) {
@@ -145,279 +37,272 @@ func hexToRGB(hexColor string) (float64, float64, float64, error) {
 	return float64(r) / 255.0, float64(g) / 255.0, float64(b) / 255.0, nil
 }
 
-func main() {
-	config, err := loadConfig("config.yaml")
-	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
-	}
-
-	contentDirectory := config.ContentDirectory
-	if contentDirectory == "" {
-		contentDirectory = "./content"
-	}
-
-	slideInterval := config.SlideInterval * 1000
-	if slideInterval == 0 {
-		slideInterval = 30000
-	}
-
-	fillColor := config.FillColor
-	if fillColor == "" {
-		fillColor = "#ADD8E6"
-	}
-
-	enableText := config.EnableText
-
-	textColor := config.TextColor
-	if textColor == "" {
-		textColor = "#000000"
-	}
-
-	fillColorR, fillColorG, fillColorB, err := hexToRGB(fillColor)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	manifestPath := config.ManifestPath
-	if manifestPath == "" {
-		manifestPath = "./manifest.yaml"
-	}
-
-	manifest, err := loadManifest(manifestPath)
-	if err != nil {
-		log.Fatalf("Failed to load manifest: %v", err)
-	}
-
-	gtk.Init(nil)
-
+func NewImageViewer(comicService *ComicService) (*ImageViewer, error) {
 	win, err := gtk.WindowNew(gtk.WINDOW_TOPLEVEL)
 	if err != nil {
-		log.Fatal("Unable to create window:", err)
+		return nil, err
 	}
-	win.SetTitle("CAM COMIC FLEX")
-	win.SetDefaultSize(1920, 1080)
+
+	img, err := gtk.ImageNew()
+	if err != nil {
+		return nil, err
+	}
+
+	titleLabel, err := gtk.LabelNew("")
+	if err != nil {
+		return nil, err
+	}
+
+	descLabel, err := gtk.LabelNew("")
+	if err != nil {
+		return nil, err
+	}
+
+	statsLabel, err := gtk.LabelNew("")
+	if err != nil {
+		return nil, err
+	}
+
+	return &ImageViewer{
+		mutex:        &sync.RWMutex{},
+		window:       win,
+		image:        img,
+		titleLabel:   titleLabel,
+		descLabel:    descLabel,
+		statsLabel:   statsLabel,
+		comicService: comicService,
+	}, nil
+}
+
+func (iv *ImageViewer) updateImage() (error, func()) {
+	comic, insights, err := iv.comicService.GetRandomComic()
+	if err != nil {
+		return fmt.Errorf("failed to get random comic: %v", err), func() {}
+	}
+
+	iv.mutex.Lock()
+	iv.currentComic = comic
+	iv.currentInsights = insights
+	iv.mutex.Unlock()
+
+	pixbuf, err := gdk.PixbufNewFromFile(comic.FilePath)
+	if err != nil {
+		return fmt.Errorf("unable to create pixbuf: %v", err), func() {}
+	}
+
+	width, height := iv.window.GetSize()
+
+	if insights != nil && insights.FMV != nil && *insights.FMV > 0 {
+		height = height - 200 // Adjust for text area height if we are showing insights data
+	}
+
+	origWidth := pixbuf.GetWidth()
+	origHeight := pixbuf.GetHeight()
+	scale := math.Min(float64(width)/float64(origWidth), float64(height)/float64(origHeight))
+
+	destWidth := int(float64(origWidth) * scale)
+	destHeight := int(float64(origHeight) * scale)
+
+	scaledPixbuf, err := pixbuf.ScaleSimple(destWidth, destHeight, gdk.INTERP_BILINEAR)
+	if err != nil {
+		return fmt.Errorf("unable to scale pixbuf: %v", err), func() {}
+	}
+
+	iv.image.SetFromPixbuf(scaledPixbuf)
+
+	// Update sales insights
+	if insights != nil {
+		titleText := ""
+		statsText := "<span font=\"18\" foreground=\"white\">"
+		if insights.FMV != nil {
+			titleText = "<span font=\"18\" foreground=\"white\">"
+			titleText += comic.Series + " #" + strconv.Itoa(comic.IssueNumber)
+			titleText += "</span>"
+
+			statsText += fmt.Sprintf("FMV (Grade of %v): $%.2f\n", insights.Grade, *insights.FMV)
+		}
+
+		// We'll check metrics in order: last_30_days, then last_60_days, then last_90_days
+		var metrics *gocollect.Metrics
+		var period string
+
+		// Check last_30_days
+		if m, ok := insights.Metrics["30"]; ok && m.AveragePrice != 0 {
+			metrics = &m
+			period = "Last 30 Days"
+		} else if m, ok := insights.Metrics["60"]; ok && m.AveragePrice != 0 {
+			// Otherwise, check last_60_days
+			metrics = &m
+			period = "Last 60 Days"
+		} else if m, ok := insights.Metrics["365"]; ok && m.AveragePrice != 0 {
+			// Otherwise, check last year
+			metrics = &m
+			period = "Last Year"
+		}
+
+		// If we found any metrics data for those periods
+		if metrics != nil {
+			statsText += fmt.Sprintf("%s:\n", period)
+			statsText += fmt.Sprintf("Sales: %d\n", metrics.SoldCount)
+			statsText += fmt.Sprintf("Average: $%.2f\n", metrics.AveragePrice)
+			statsText += fmt.Sprintf("Range: $%.2f - $%.2f", metrics.LowPrice, metrics.HighPrice)
+		}
+
+		statsText += "</span>"
+		iv.statsLabel.SetMarkup(statsText)
+		iv.titleLabel.SetMarkup(titleText)
+	}
+
+	return nil, func() {
+		pixbuf.Unref()
+		scaledPixbuf.Unref()
+		//runtime.GC()
+	}
+}
+
+func (iv *ImageViewer) setupUI() error {
+	iv.window.SetTitle("Comic Viewer")
+	iv.window.SetDefaultSize(1920, 1080)
 
 	css := `
-  window { background-color: black; }
-`
+                window { background-color: black; }
+                span { color: white; }
+        `
 
 	cssProvider, err := gtk.CssProviderNew()
 	if err != nil {
-		log.Fatal("Unable to create CSS provider:", err)
+		return fmt.Errorf("unable to create CSS provider: %v", err)
 	}
 	cssProvider.LoadFromData(css)
 
 	screen, err := gdk.ScreenGetDefault()
 	if err != nil {
-		log.Fatal("Unable to get screen:", err)
+		return fmt.Errorf("unable to get screen: %v", err)
 	}
 
 	gtk.AddProviderForScreen(screen, cssProvider, uint(gtk.STYLE_PROVIDER_PRIORITY_USER))
 
-	win.Connect("destroy", func() {
-		gtk.MainQuit()
-	})
-	win.Fullscreen()
+	iv.window.Fullscreen()
 
-	titleLabel, err := gtk.LabelNew("")
-	if err != nil {
-		log.Fatal("Unable to create label:", err)
-	}
+	// Configure labels
+	iv.titleLabel.SetHAlign(gtk.ALIGN_CENTER)
+	iv.titleLabel.SetHExpand(true)
 
-	titleLabel.SetHAlign(gtk.ALIGN_CENTER)
-	titleLabel.SetHExpand(true)
+	iv.descLabel.SetLineWrap(true)
+	iv.descLabel.SetLineWrapMode(pango.WRAP_WORD)
+	iv.descLabel.SetJustify(gtk.JUSTIFY_CENTER)
 
-	descLabel, err := gtk.LabelNew("")
-	if err != nil {
-		log.Fatal("Unable to create label:", err)
-	}
+	iv.statsLabel.SetLineWrap(true)
+	iv.statsLabel.SetLineWrapMode(pango.WRAP_WORD)
+	iv.statsLabel.SetJustify(gtk.JUSTIFY_CENTER)
 
-	descLabel.SetLineWrap(true)
-	descLabel.SetLineWrapMode(pango.WRAP_WORD) // Wrap at word boundaries
-	descLabel.SetJustify(gtk.JUSTIFY_FILL)
-
+	// Create overlay
 	overlay, err := gtk.OverlayNew()
 	if err != nil {
-		log.Fatal("Unable to create overlay:", err)
+		return fmt.Errorf("unable to create overlay: %v", err)
 	}
 
-	img, err := gtk.ImageNew()
-	if err != nil {
-		log.Fatal("Unable to create image:", err)
-	}
-	overlay.Add(img)
-
-	drawingArea, err := gtk.DrawingAreaNew()
-	if err != nil {
-		log.Fatal("Unable to create drawing area:", err)
-	}
-	drawingArea.SetSizeRequest(800, 100) // Set the size as per your requirement
-
-	textCardHeight := 150.0
-
-	// Draw event for drawing background
-	drawingArea.Connect("draw", func(da *gtk.DrawingArea, cr *cairo.Context) {
-		// Set the color for your background
-		cr.SetSourceRGB(fillColorR, fillColorG, fillColorB)
-		cr.Rectangle(0, float64(da.GetAllocatedHeight())-textCardHeight, float64(da.GetAllocatedWidth()), textCardHeight)
-		cr.Fill()
-	})
-	overlay.AddOverlay(drawingArea)
+	// Add image to overlay
+	iv.image.SetVAlign(gtk.ALIGN_START)
+	overlay.Add(iv.image)
 
 	textContainer, err := gtk.BoxNew(gtk.ORIENTATION_VERTICAL, 0)
 	if err != nil {
-		log.Fatal("Unable to create text container:", err)
+		return fmt.Errorf("unable to create text container: %v", err)
 	}
-	textContainer.SetVAlign(gtk.ALIGN_END) // Align at the bottom
+	textContainer.SetVAlign(gtk.ALIGN_END)
+
+	textContainer.PackStart(iv.titleLabel, false, false, 10)
+	textContainer.PackStart(iv.statsLabel, false, false, 10)
 
 	overlay.AddOverlay(textContainer)
 
-	textContainer.PackStart(titleLabel, false, false, 10)
-	textContainer.PackStart(descLabel, false, false, 10)
+	// Setup event handlers
+	iv.window.Connect("destroy", func() {
+		gtk.MainQuit()
+	})
 
-	win.Add(overlay)
-
-	images, err := listImages(contentDirectory, config.IsRandomOrder)
-	if err != nil {
-		log.Fatalf("Failed to list images: %v", err)
-	}
-
-	currentIndex := 0
-
-	// Function to update the image and reset timer
-	var updateImage func() func()
-	updateImage = func() func() {
-		if currentIndex < 0 || currentIndex >= len(images) {
-			currentIndex = 0
-		}
-
-		imagePath := images[currentIndex]
-
-		fmt.Printf("%+v\n", imagePath)
-		defer func() {
-			if r := recover(); r != nil {
-				fmt.Println("Panic'd on image: %sRecovered from error:", imagePath, r)
-			}
-		}()
-
-		glib.IdleAdd(func() {
-			pixbuf, err := gdk.PixbufNewFromFile(imagePath)
-			if err != nil {
-				fmt.Printf("Unable to create pixbuf: %+v", err)
-				return
-			}
-
-			if pixbuf == nil {
-				fmt.Println("Pixbuf is nil")
-				return
-			}
-
-			// Calculate the scale preserving aspect ratio
-			origWidth := pixbuf.GetWidth()
-			origHeight := pixbuf.GetHeight()
-
-			if origWidth == 0 || origHeight == 0 {
-				fmt.Println("Pixbuf width or height is 0")
-				return
-			}
-
-			// Get window size
-			width, height := win.GetSize()
-			height = height - int(textCardHeight)
-
-			scale := math.Min(float64(width)/float64(origWidth), float64(height)/float64(origHeight))
-
-			// Scale the image
-			destWidth := int(float64(origWidth) * scale)
-			destHeight := int(float64(origHeight) * scale)
-			fmt.Printf("%+v %v %v\n", pixbuf, destWidth, destHeight)
-			scaledPixbuf, err := pixbuf.ScaleSimple(destWidth, destHeight, gdk.INTERP_BILINEAR)
-			if err != nil {
-				fmt.Printf("Unable to scale pixbuf: %+v", err)
-			}
-
-			img.SetFromPixbuf(scaledPixbuf)
-
-			//gdk.Pixbuf.Unref(*pixbuf)
-			pixbuf = nil
-			//gdk.Pixbuf.Unref(*scaledPixbuf)
-			scaledPixbuf = nil
-			runtime.GC()
-		})
-
-		img.SetVAlign(gtk.ALIGN_START)
-
-		if enableText {
-			titleLabel.SetMarkup("")
-			descLabel.SetMarkup("")
-			overlay.Remove(drawingArea)
-			overlay.Remove(textContainer)
-
-			for _, entry := range manifest.Entries {
-				if entry.ImagePath == imagePath {
-					titleLabel.SetMarkup("<span foreground=\"" + textColor + "\" font=\"24\">" + entry.Title + "</span>")
-					descLabel.SetMarkup("<span foreground=\"" + textColor + "\" font=\"20\">" + entry.Description + "</span>")
-					overlay.AddOverlay(drawingArea)
-					overlay.AddOverlay(textContainer)
-					break
-				}
-			}
-		}
-
-		return func() {
-		}
-	}
-
-	var timeoutID glib.SourceHandle
-
-	var startTimer func()
-	startTimer = func() {
-		// Remove existing timeout and add a new one
-		if timeoutID != 0 {
-			glib.SourceRemove(timeoutID)
-		}
-
-		timeoutID = glib.TimeoutAdd(slideInterval, func() bool {
-			currentIndex = (currentIndex + 1) % len(images)
-			cleanup := updateImage()
-			cleanup()
-			startTimer()
-
-			return false // Stop the current timeout
-		})
-	}
-	startTimer()
-
-	// Key press event handler
-	win.Connect("key-press-event", func(win *gtk.Window, event *gdk.Event) {
+	iv.window.Connect("key-press-event", func(win *gtk.Window, event *gdk.Event) {
 		keyEvent := &gdk.EventKey{Event: event}
 		switch keyEvent.KeyVal() {
 		case gdk.KEY_space, gdk.KEY_Right:
-			currentIndex = (currentIndex + 1) % len(images)
-		case gdk.KEY_Left:
-			// Ensuring currentIndex doesn't go below 0
-			if currentIndex == 0 {
-				currentIndex = len(images) - 1
-			} else {
-				currentIndex--
+			err, cleanup := iv.updateImage()
+			defer cleanup()
+			if err != nil {
+				log.Fatal(err.Error())
 			}
+
+		}
+	})
+
+	iv.window.Connect("button-press-event", func(win *gtk.Window, event *gdk.Event) {
+		err, cleanup := iv.updateImage()
+		defer cleanup()
+		if err != nil {
+			log.Fatal(err.Error())
 		}
 
-		cleanup := updateImage()
-		cleanup()
 	})
 
-	// Mouse click event handler
-	win.Connect("button-press-event", func(win *gtk.Window, event *gdk.Event) {
-		currentIndex = (currentIndex + 1) % len(images)
-		cleanup := updateImage()
-		cleanup()
-	})
+	iv.window.Add(overlay)
+	iv.window.ShowAll()
 
-	// Initial image update
-	cleanup := updateImage()
-	cleanup()
+	return nil
+}
 
-	win.ShowAll()
+func (iv *ImageViewer) startSlideshow(interval uint) {
+	var startTimer func()
+	startTimer = func() {
+		if iv.timeoutID != 0 {
+			glib.SourceRemove(iv.timeoutID)
+		}
+
+		iv.timeoutID = glib.TimeoutAdd(interval*1000, func() bool {
+			err, cleanup := iv.updateImage()
+			defer cleanup()
+			if err != nil {
+				log.Fatal(err.Error())
+			}
+
+			startTimer()
+			return false
+		})
+	}
+	startTimer()
+}
+
+func main() {
+	apiToken := os.Getenv("GOCOLLECT_API_TOKEN")
+	if apiToken == "" {
+		log.Fatal("GOCOLLECT_API_TOKEN environment variable is required")
+	}
+
+	comicService, err := NewComicService("comics.db", apiToken)
+	if err != nil {
+		log.Fatalf("Failed to create comic service: %v", err)
+	}
+	defer comicService.Close()
+
+	gtk.Init(nil)
+
+	viewer, err := NewImageViewer(comicService)
+	if err != nil {
+		log.Fatalf("Failed to create viewer: %v", err)
+	}
+
+	if err := viewer.setupUI(); err != nil {
+		log.Fatalf("Failed to setup UI: %v", err)
+	}
+
+	// Load initial random comic
+	err, cleanup := viewer.updateImage()
+	defer cleanup()
+	if err != nil {
+		log.Printf("Failed to load initial image: %v", err)
+	}
+
+	// Start the slideshow (30 second intervals)
+	viewer.startSlideshow(30)
+
 	gtk.Main()
 }
