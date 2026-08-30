@@ -126,7 +126,7 @@ func TestSnapshotIsOneConsistentRead(t *testing.T) {
 	iv := newControlTestViewer(37, "a/1.jpg", "b/2.jpg", "c/3.jpg")
 	iv.setViewModeState(ViewLandscapeTwo)
 	iv.setPausedState(true)
-	iv.setScanning(true)
+	iv.beginScan()
 	if !iv.gotoKey("b/2.jpg") {
 		t.Fatal("gotoKey failed")
 	}
@@ -151,13 +151,13 @@ func TestSnapshotIsOneConsistentRead(t *testing.T) {
 func TestSnapshotOfAnUnscannedGalleryIsNotAnEmptyOne(t *testing.T) {
 	iv := newControlTestViewer(30)
 
-	iv.setScanning(true)
+	iv.beginScan()
 	before := iv.snapshot()
 	if before.total != 0 || !before.scanning {
 		t.Fatalf("mid-scan snapshot = %+v, want total 0 and scanning true", before)
 	}
 
-	iv.setScanning(false)
+	iv.endScan()
 	after := iv.snapshot()
 	if after.total != 0 || after.scanning {
 		t.Fatalf("post-scan snapshot = %+v, want total 0 and scanning false", after)
@@ -258,7 +258,7 @@ func TestAdapterSnapshotMapsEveryField(t *testing.T) {
 	iv := newControlTestViewer(37, "a/1.jpg", "b/2.jpg", "c/3.jpg")
 	iv.setViewModeState(ViewPortraitSingle)
 	iv.setPausedState(true)
-	iv.setScanning(true)
+	iv.beginScan()
 	if !iv.gotoKey("c/3.jpg") {
 		t.Fatal("gotoKey failed")
 	}
@@ -307,16 +307,22 @@ func TestAdapterSetIntervalRejectsNegative(t *testing.T) {
 
 // TestControlServerRefusesToStartWithoutAToken pins the fail-closed decision at
 // the seam main() actually uses, not just inside internal/control.
+//
+// 🔴 This is only HALF the property, and on its own it is walkable: inserting
+// `if true { return nil }` at the top of startControlAPI makes the entire
+// control API inert and this test still passes, because "returned nil" is
+// exactly what it asserts. The other half is
+// TestStartControlAPIServesOnItsAddress, which must stay next to it.
 func TestControlServerRefusesToStartWithoutAToken(t *testing.T) {
 	t.Setenv(control.TokenEnvVar, "")
 	iv := newControlTestViewer(30)
-	if srv := startControlAPI(iv); srv != nil {
+	if srv := startControlAPI(iv, "127.0.0.1:0"); srv != nil {
 		t.Fatal("startControlAPI returned a server with no token set — a control port would " +
 			"bind on a host with passwordless sudo")
 	}
 
 	t.Setenv(control.TokenEnvVar, "short")
-	if srv := startControlAPI(iv); srv != nil {
+	if srv := startControlAPI(iv, "127.0.0.1:0"); srv != nil {
 		t.Fatal("startControlAPI returned a server for a 5-byte token")
 	}
 }

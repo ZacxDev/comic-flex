@@ -200,16 +200,108 @@ func (iv *ImageViewer) setPausedState(paused bool) {
 	iv.paused = paused
 }
 
-// setScanning records whether a bucket listing is in flight.
+// beginScan and endScan record that a bucket listing is in flight.
 //
 // This is what lets GET /api/state distinguish "not yet scanned" from "empty".
 // Until the first ListImages returns, total is 0 and a client must render
 // "indexing…" rather than "0 comics"; they are different states and the API
 // must not collapse them.
-func (iv *ImageViewer) setScanning(scanning bool) {
+//
+// 🔴 A COUNTER, NOT A FLAG — and that is a bug fix, not a style choice. Listings
+// overlap the moment the control API exists: POST /api/rescan twice, or once
+// while the startup scan is still running, and two goroutines are in ListImages
+// at the same time. With a boolean, `defer setScanning(false)` in whichever one
+// finished FIRST cleared the flag while the other was still listing, and
+// GET /api/state then answered total 0 / scanning false — the "no comics"
+// answer — mid-scan. That is exactly the collapse the paragraph above says must
+// not happen. The counter makes scanning stay true until the LAST listing ends.
+func (iv *ImageViewer) beginScan() {
 	iv.mutex.Lock()
 	defer iv.mutex.Unlock()
-	iv.scanning = scanning
+	iv.scansInFlight++
+}
+
+func (iv *ImageViewer) endScan() {
+	iv.mutex.Lock()
+	defer iv.mutex.Unlock()
+	if iv.scansInFlight > 0 {
+		iv.scansInFlight--
+	}
+}
+
+// isScanning reports whether any listing is still in flight.
+func (iv *ImageViewer) isScanning() bool {
+	iv.mutex.RLock()
+	defer iv.mutex.RUnlock()
+	return iv.scansInFlight > 0
+}
+
+// scanCount reports how many listings are in flight. It exists so a test can
+// assert the COUNT rather than only the boolean derived from it — a boolean
+// cannot distinguish "one of two finished" from "both finished".
+func (iv *ImageViewer) scanCount() int {
+	iv.mutex.RLock()
+	defer iv.mutex.RUnlock()
+	return iv.scansInFlight
+}
+
+// ---------------------------------------------------------------------------
+// The GTK main loop's work queue (bounded).
+// ---------------------------------------------------------------------------
+
+// maxQueuedMutations caps how many control-API closures may be outstanding on
+// the GTK main loop at once.
+//
+// The loop drains at up to 30 s per image, an authenticated caller can POST as
+// fast as the Pi accepts connections, and every scheduled closure holds a gotk3
+// callback-registry entry until it runs. Unbounded, a client that merely retries
+// grows both without limit. 64 is far more page turns than any operator queues
+// deliberately and still bounded memory.
+const maxQueuedMutations = 64
+
+// reserveQueueSlot takes one of the maxQueuedMutations slots, or reports false.
+func (iv *ImageViewer) reserveQueueSlot() bool {
+	iv.mutex.Lock()
+	defer iv.mutex.Unlock()
+	if iv.queuedMutations >= maxQueuedMutations {
+		return false
+	}
+	iv.queuedMutations++
+	return true
+}
+
+// releaseQueueSlot gives a slot back once the closure has run.
+func (iv *ImageViewer) releaseQueueSlot() {
+	iv.mutex.Lock()
+	defer iv.mutex.Unlock()
+	if iv.queuedMutations > 0 {
+		iv.queuedMutations--
+	}
+}
+
+// queueDepth reports how many closures are outstanding.
+func (iv *ImageViewer) queueDepth() int {
+	iv.mutex.RLock()
+	defer iv.mutex.RUnlock()
+	return iv.queuedMutations
+}
+
+// enqueueBounded reserves a slot, hands fn to schedule, and releases the slot
+// once fn has run. It reports false, having scheduled nothing, when the queue is
+// full.
+//
+// schedule is idleOnce in production. It is a parameter so that BOTH directions
+// — the cap and the release — are exercisable without a GTK main loop: a test
+// passes a stand-in that runs the closure when it chooses.
+func (iv *ImageViewer) enqueueBounded(schedule func(func()), fn func()) bool {
+	if !iv.reserveQueueSlot() {
+		return false
+	}
+	schedule(func() {
+		defer iv.releaseQueueSlot()
+		fn()
+	})
+	return true
 }
 
 // slideInterval reports the configured seconds between slides.
@@ -307,7 +399,7 @@ func (iv *ImageViewer) snapshot() viewerSnapshot {
 		viewMode:      iv.viewMode,
 		paused:        iv.paused,
 		slideInterval: iv.config.SlideInterval,
-		scanning:      iv.scanning,
+		scanning:      iv.scansInFlight > 0,
 	}
 	if s.total > 0 {
 		s.index = wrapIndex(iv.currentIndex, 0, s.total)

@@ -3,6 +3,7 @@ package control
 import (
 	"errors"
 	"net/http"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -73,9 +74,17 @@ func TestRefusalNamesTheEnvVar(t *testing.T) {
 // Real unauthenticated calls through the routed handler
 // ---------------------------------------------------------------------------
 
-// authedRoutes is the asserted ledger of everything behind the token. It fails
-// when the set GROWS (a new endpoint left unauthenticated by accident) or
-// SHRINKS (an endpoint quietly moved out from behind the middleware).
+// authedRoutes is the asserted ledger of everything behind the token.
+//
+// 🔴 It is compared against the routes routes() ACTUALLY registers — scanned out
+// of control.go by scanRoutes — so it fails when the set GROWS as well as when
+// it SHRINKS. Round-1 it was compared against the literal 9 instead, which
+// catches shrink and nothing else: adding `POST /api/shutdown` here, or
+// `GET /debug/state` returning a full unauthenticated Snapshot() to the OUTER
+// mux, was measured to ship at a completely green suite.
+//
+// Adding an endpoint therefore means adding a row here, and that row makes the
+// endpoint get driven unauthenticated by TestEveryAPIEndpointRequiresTheToken.
 var authedRoutes = []struct {
 	method string
 	path   string
@@ -94,9 +103,19 @@ var authedRoutes = []struct {
 }
 
 func TestEveryAPIEndpointRequiresTheToken(t *testing.T) {
-	// The routed set must be exactly the ledger — see routes().
-	if want := 9; len(authedRoutes) != want {
-		t.Fatalf("the ledger lists %d routes, want %d", len(authedRoutes), want)
+	// The ledger must be exactly the set routes() registers behind the token —
+	// derived from control.go, not from a number written next to it.
+	registered := scanControlRoutes(t).inner
+	listed := make([]string, 0, len(authedRoutes))
+	for _, rt := range authedRoutes {
+		listed = append(listed, rt.method+" "+rt.path)
+	}
+	sort.Strings(listed)
+	if !equalStrings(registered, listed) {
+		t.Fatalf("routes() registers %v behind the token but this ledger lists %v.\n"+
+			"Every authenticated endpoint must appear here, because appearing here is what "+
+			"gets it driven WITHOUT credentials below. A route registered and not listed has "+
+			"never been checked to require the token.", registered, listed)
 	}
 
 	for _, rt := range authedRoutes {

@@ -3,7 +3,9 @@ package control
 // This package is the Pi-side control API for comic-flex (clawgate #442 phase 3a).
 //
 // 🔴 It MUST NOT import gotk3 or glib, and there is a test that fails if it ever
-// does (imports_test.go). The reason is not tidiness:
+// does — TestControlPackageDependenciesIncludeNoGTK in structure_test.go, which
+// asks the toolchain for the whole transitive dependency set rather than reading
+// this directory's imports. The reason is not tidiness:
 //
 //   - gotk3 is cgo-bound to GTK3, so anything importing it needs a GTK3 + X11
 //     toolchain to compile at all, and cross-compiling it does not work.
@@ -66,7 +68,7 @@ type Snapshot struct {
 //	             must take the viewer's read lock, release it before returning,
 //	             and touch no widget.
 //	   bridge  — Enqueue schedules fn on the GTK main loop and returns
-//	             IMMEDIATELY. It must never wait for fn.
+//	             IMMEDIATELY. It must never wait for fn, and it may REFUSE.
 //	R1 writes  — every remaining method mutates the viewer and/or renders. They
 //	             are called ONLY from inside an Enqueue closure, i.e. on the GTK
 //	             thread, and each does its own locking.
@@ -87,7 +89,13 @@ type Viewer interface {
 	// Enqueue schedules fn to run once on the GTK main loop and returns
 	// immediately. It must not block on fn: updateSingleImage can sit on an S3
 	// GET for 30s and setViewMode shells out to two blocking xrandr calls.
-	Enqueue(fn func())
+	//
+	// It reports false when the main loop already has as much outstanding work
+	// as it is allowed, in which case fn is NOT scheduled and the handler
+	// answers 503. The bound exists because the loop drains far slower than the
+	// API accepts requests and each accepted closure costs a permanent gotk3
+	// callback-registry entry.
+	Enqueue(fn func()) (scheduled bool)
 
 	// Next advances by one page turn (two images in the two-up view).
 	Next()

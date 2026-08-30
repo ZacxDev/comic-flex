@@ -26,6 +26,12 @@ type fakeViewer struct {
 	// enqueueRunner, when non-nil, replaces the default deferred behaviour.
 	// Used by the blocked-GTK-loop test.
 	enqueueRunner func(func())
+
+	// capacity, when > 0, makes Enqueue refuse once that many closures are
+	// outstanding — standing in for the real adapter's maxQueuedMutations.
+	capacity int
+	// refused counts the Enqueue calls that were turned away.
+	refused int
 }
 
 func newFakeViewer(keys ...string) *fakeViewer {
@@ -65,8 +71,13 @@ func (f *fakeViewer) Resolve(key string) (int, bool) {
 	return i, ok
 }
 
-func (f *fakeViewer) Enqueue(fn func()) {
+func (f *fakeViewer) Enqueue(fn func()) bool {
 	f.mu.Lock()
+	if f.capacity > 0 && len(f.queued) >= f.capacity {
+		f.refused++
+		f.mu.Unlock()
+		return false
+	}
 	runner := f.enqueueRunner
 	if runner == nil {
 		f.queued = append(f.queued, fn)
@@ -75,6 +86,14 @@ func (f *fakeViewer) Enqueue(fn func()) {
 	if runner != nil {
 		runner(fn)
 	}
+	return true
+}
+
+// refusedCount reports how many Enqueue calls the fake turned away.
+func (f *fakeViewer) refusedCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.refused
 }
 
 func (f *fakeViewer) Next()                  { f.record("Next") }

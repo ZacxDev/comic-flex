@@ -13,12 +13,15 @@ import (
 // This file is the GTK side of the control API: the ONLY place that knows both
 // about glib and about internal/control.
 //
-// internal/control deliberately imports neither gotk3 nor glib (there is a test
-// that fails if it ever does), because gotk3 is cgo-bound to GTK3, needs a
+// internal/control deliberately imports neither gotk3 nor glib — that is
+// asserted by TestControlPackageDependenciesIncludeNoGTK in
+// internal/control/structure_test.go, which asks the toolchain for the whole
+// transitive dependency set — because gotk3 is cgo-bound to GTK3, needs a
 // GTK3 + X11 toolchain, and cannot be cross-compiled. Keeping the endpoint
 // surface free of it means every handler is unit-testable with no display.
 
-// idleOnce schedules fn to run once on the GTK main loop.
+// idleOnce schedules fn to run once on the GTK main loop, at the ordinary idle
+// priority.
 //
 // This is the single glib.IdleAdd call site in the program. GTK is not thread
 // safe and an http.Handler runs on a goroutine that is not the main loop, so
@@ -26,6 +29,20 @@ import (
 // the source one-shot.
 func idleOnce(fn func()) {
 	glib.IdleAdd(func() bool {
+		fn()
+		return false
+	})
+}
+
+// idleHigh schedules fn on the GTK main loop AHEAD of everything idleOnce has
+// queued.
+//
+// Shutdown is the only caller and must stay that way: the point of the two
+// priorities is that ordinary mutations sit in a queue and the quit does not.
+// Promoting a mutation to this priority would let a page turn overtake the page
+// turns queued before it.
+func idleHigh(fn func()) {
+	glib.IdleAddPriority(glib.PRIORITY_HIGH, func() bool {
 		fn()
 		return false
 	})
@@ -41,7 +58,9 @@ type gtkViewer struct{ iv *ImageViewer }
 // Compile-time proof that the adapter satisfies the port.
 var _ control.Viewer = gtkViewer{}
 
-func (g gtkViewer) Enqueue(fn func()) { idleOnce(fn) }
+// Enqueue schedules fn on the GTK main loop, or refuses when the loop already
+// has maxQueuedMutations closures outstanding. See enqueueBounded in state.go.
+func (g gtkViewer) Enqueue(fn func()) bool { return g.iv.enqueueBounded(idleOnce, fn) }
 
 func (g gtkViewer) Snapshot() control.Snapshot {
 	s := g.iv.snapshot()
@@ -138,9 +157,15 @@ func fromControlViewMode(m control.ViewMode) ViewMode {
 // a missing environment variable, with the one log line that explains it buried
 // in restart spam. The slideshow is the product; the API is an accessory to it.
 // So: no listener, one loud log line, comics keep playing.
-func startControlAPI(iv *ImageViewer) *control.Server {
+//
+// addr is a parameter rather than control.DefaultAddr read inline so that the
+// LIVENESS direction is testable: TestStartControlAPIServesOnItsAddress binds an
+// ephemeral loopback port and drives the real listener. Pinning only the refusal
+// direction left `if true { return nil }` here — the whole control API inert —
+// passing the entire suite.
+func startControlAPI(iv *ImageViewer, addr string) *control.Server {
 	srv, err := control.New(control.Config{
-		Addr:    control.DefaultAddr,
+		Addr:    addr,
 		Token:   os.Getenv(control.TokenEnvVar),
 		Viewer:  gtkViewer{iv: iv},
 		Version: version,

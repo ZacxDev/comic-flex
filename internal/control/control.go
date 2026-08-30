@@ -11,12 +11,32 @@ import (
 )
 
 // DefaultAddr is the bind address required by the design: the cluster reaches
-// the Pi by LAN IP, so loopback is not an option. The compensating control is
-// the bearer token plus a host firewall rule restricting :8790 to the LAN.
+// the Pi by LAN IP, so loopback is not an option.
+//
+// 🔴 THE BEARER TOKEN IS THE ONLY CONTROL ON THIS PORT TODAY. This comment used
+// to claim the compensating control was "the bearer token plus a host firewall
+// rule restricting :8790 to the LAN". That firewall does not exist. Measured on
+// the Pi (192.168.50.131) on 2026-08-30: `nft list ruleset` empty, no iptables
+// binary, no ufw, and `sudo -n id` returns uid=0 — so anything that reaches
+// this port and holds the token gets a root-adjacent host.
+//
+// What that means for a reader: do NOT treat the network as a second layer, and
+// do not relax the token rules on the strength of one. STILL OWED, by an
+// operator on the Pi and not by this package:
+//
+//   - a host firewall rule restricting :8790 to the LAN (nftables on the Pi),
+//   - and, until it exists, keeping COMIC_FLEX_CONTROL_TOKEN out of anything
+//     that leaves the LAN.
+//
+// When that rule lands, say so here and name where it is defined.
 const DefaultAddr = "0.0.0.0:8790"
 
 // maxBodyBytes caps request bodies. Every body this API accepts is a handful of
-// bytes of JSON.
+// bytes of JSON, so 4 KiB is already two orders of magnitude of headroom.
+//
+// The cap is not decoration: without it an unauthenticated-length body is read
+// into memory by the JSON decoder before any validation runs, on a Pi. It is
+// pinned by TestBodiesLargerThanTheCapAreRefused.
 const maxBodyBytes = 4 << 10
 
 // intervalMin and intervalMax bound POST /api/interval, per proposal §4.2.
@@ -139,6 +159,27 @@ func accepted(w http.ResponseWriter) {
 	writeJSON(w, http.StatusAccepted, acceptedBody{Accepted: true})
 }
 
+// enqueue is the ONE place an R1 mutation endpoint replies, so the 202/503
+// decision cannot drift between the nine handlers that make it.
+//
+// 🔴 Enqueue can REFUSE. The GTK main loop drains at up to 30 s per image
+// (updateSingleImage sits on an S3 GET) while a client can POST as fast as the
+// Pi will accept connections, and every accepted closure costs a permanent
+// gotk3 callback-registry entry. An unbounded queue therefore grows without
+// limit under a caller that is merely impatient. A refusal is a 503 with
+// Retry-After, not a 202 — telling the caller the page turn is queued when it
+// is not would be the same lie the trailing-JSON case in decodeBody avoids.
+func (s *Server) enqueue(w http.ResponseWriter, fn func()) {
+	if !s.viewer.Enqueue(fn) {
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusServiceUnavailable, errorBody{
+			Error: "the display queue is full; retry shortly",
+		})
+		return
+	}
+	accepted(w)
+}
+
 func badRequest(w http.ResponseWriter, msg string) {
 	writeJSON(w, http.StatusBadRequest, errorBody{Error: msg})
 }
@@ -150,6 +191,17 @@ func notFound(w http.ResponseWriter, msg string) {
 // decodeBody reads a small JSON body into dst. An absent body is treated as an
 // empty object so that endpoints with optional fields answer 400 from their own
 // validation rather than from the decoder.
+//
+// Two refusals that a single Decode does NOT give you, and that both endpoints
+// with a body depend on:
+//
+//   - MaxBytesReader caps what the decoder will read at all. Without it a
+//     multi-megabyte body is buffered on a Raspberry Pi before any of our
+//     validation runs.
+//   - The stream must hold EXACTLY ONE value. json.Decoder stops at the end of
+//     the first one and reports success, so `{"seconds":5}{"seconds":9999}`
+//     would be accepted with the second object silently discarded — the caller
+//     would be told 202 for a value it never sent.
 func decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	dec := json.NewDecoder(r.Body)
@@ -157,7 +209,20 @@ func decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
 		if errors.Is(err, io.EOF) {
 			return true
 		}
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, errorBody{
+				Error: "body larger than " + strconv.Itoa(maxBodyBytes) + " bytes",
+			})
+			return false
+		}
 		badRequest(w, "malformed JSON body")
+		return false
+	}
+	// Exactly one value: anything after the first one is a second request the
+	// caller believes was honoured.
+	if err := dec.Decode(new(json.RawMessage)); !errors.Is(err, io.EOF) {
+		badRequest(w, "body must contain exactly one JSON object")
 		return false
 	}
 	return true
@@ -177,23 +242,19 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleNext(w http.ResponseWriter, r *http.Request) {
-	s.viewer.Enqueue(s.viewer.Next)
-	accepted(w)
+	s.enqueue(w, s.viewer.Next)
 }
 
 func (s *Server) handlePrev(w http.ResponseWriter, r *http.Request) {
-	s.viewer.Enqueue(s.viewer.Prev)
-	accepted(w)
+	s.enqueue(w, s.viewer.Prev)
 }
 
 func (s *Server) handlePause(w http.ResponseWriter, r *http.Request) {
-	s.viewer.Enqueue(func() { s.viewer.SetPaused(true) })
-	accepted(w)
+	s.enqueue(w, func() { s.viewer.SetPaused(true) })
 }
 
 func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
-	s.viewer.Enqueue(func() { s.viewer.SetPaused(false) })
-	accepted(w)
+	s.enqueue(w, func() { s.viewer.SetPaused(false) })
 }
 
 func (s *Server) handleViewMode(w http.ResponseWriter, r *http.Request) {
@@ -211,10 +272,29 @@ func (s *Server) handleViewMode(w http.ResponseWriter, r *http.Request) {
 			"; want landscape_single, portrait_single or landscape_two")
 		return
 	}
-	s.viewer.Enqueue(func() { s.viewer.SetViewMode(mode) })
-	accepted(w)
+	s.enqueue(w, func() { s.viewer.SetViewMode(mode) })
 }
 
+// handleGoto selects a page by key or by index.
+//
+// 🔴 The two arms answer 202 identically but behave DIFFERENTLY when the
+// gallery changes between the handler's bounds check and the closure running.
+// This is deliberate, and it is documented here because both arms look
+// interchangeable from the outside:
+//
+//	key   — a key that has left the gallery is a NO-OP. GotoKey re-resolves under
+//	        the lock and finds nothing, so the display stays where it was. The
+//	        202 means "queued", and what got queued turned out to be nothing.
+//	index — an index that is now out of range is CLAMPED TO THE LAST IMAGE.
+//	        gotoIndex must not panic on images[idx], and refusing inside the
+//	        closure has nobody left to tell, so it lands on the nearest page
+//	        instead. `{"index":500}` against a gallery that shrank to 40 lands on
+//	        image 39, NOT on nothing.
+//
+// The asymmetry is the right one — a key names a specific comic, an index names
+// a position, and a position in a shortened list is nearest-neighbour — but a
+// caller that needs "this exact page or nothing" must use the key arm. A caller
+// that polls GET /api/state after a 202 sees where it actually landed.
 func (s *Server) handleGoto(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Key   *string `json:"key"`
@@ -239,8 +319,7 @@ func (s *Server) handleGoto(w http.ResponseWriter, r *http.Request) {
 			notFound(w, "key not in the gallery")
 			return
 		}
-		s.viewer.Enqueue(func() { s.viewer.GotoKey(key) })
-		accepted(w)
+		s.enqueue(w, func() { s.viewer.GotoKey(key) })
 
 	case body.Index != nil:
 		idx := *body.Index
@@ -248,8 +327,7 @@ func (s *Server) handleGoto(w http.ResponseWriter, r *http.Request) {
 			notFound(w, "index out of range")
 			return
 		}
-		s.viewer.Enqueue(func() { s.viewer.GotoIndex(idx) })
-		accepted(w)
+		s.enqueue(w, func() { s.viewer.GotoIndex(idx) })
 
 	default:
 		badRequest(w, `goto requires "key" or "index"`)
@@ -272,11 +350,9 @@ func (s *Server) handleInterval(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "seconds out of range; want "+strconv.Itoa(intervalMin)+"-"+strconv.Itoa(intervalMax))
 		return
 	}
-	s.viewer.Enqueue(func() { s.viewer.SetInterval(n) })
-	accepted(w)
+	s.enqueue(w, func() { s.viewer.SetInterval(n) })
 }
 
 func (s *Server) handleRescan(w http.ResponseWriter, r *http.Request) {
-	s.viewer.Enqueue(s.viewer.Rescan)
-	accepted(w)
+	s.enqueue(w, s.viewer.Rescan)
 }
