@@ -341,23 +341,17 @@ func (iv *ImageViewer) scanImagesAsync() {
 			})
 		}
 
-		iv.mutex.Lock()
-		iv.images = images
-		iv.mutex.Unlock()
+		iv.setImages(images)
 
-		// Update the first image if none is showing
+		// Update the first image if none is showing.
 		glib.IdleAdd(func() {
-			iv.mutex.RLock()
-			if len(iv.images) > 0 && iv.currentIndex == 0 {
-				iv.updateImage()
-			}
-			iv.mutex.RUnlock()
+			iv.onScanComplete(iv.updateImage)
 		})
 	}()
 }
 
 func (iv *ImageViewer) updateImage() {
-	switch iv.viewMode {
+	switch iv.getViewMode() {
 	case ViewLandscapeSingle, ViewPortraitSingle:
 		iv.updateSingleImage()
 	case ViewLandscapeTwo:
@@ -366,14 +360,10 @@ func (iv *ImageViewer) updateImage() {
 }
 
 func (iv *ImageViewer) updateSingleImage() {
-	iv.mutex.RLock()
-	if len(iv.images) == 0 {
-		iv.mutex.RUnlock()
+	idx, imageKey, ok := iv.currentKey()
+	if !ok {
 		return
 	}
-	idx := iv.currentIndex
-	imageKey := iv.images[idx]
-	iv.mutex.RUnlock()
 
 	log.Printf("Loading image %d: %s", idx, imageKey)
 	pixbuf, err := iv.store.LoadImage(imageKey)
@@ -395,16 +385,10 @@ func (iv *ImageViewer) updateSingleImage() {
 }
 
 func (iv *ImageViewer) updateTwoImages() {
-	iv.mutex.RLock()
-	if len(iv.images) == 0 {
-		iv.mutex.RUnlock()
+	idx, leftKey, rightIdx, rightKey, ok := iv.pairKeys()
+	if !ok {
 		return
 	}
-	idx := iv.currentIndex
-	leftKey := iv.images[idx]
-	rightIdx := (idx + 1) % len(iv.images)
-	rightKey := iv.images[rightIdx]
-	iv.mutex.RUnlock()
 
 	log.Printf("Loading two images: %d (%s) and %d (%s)", idx, leftKey, rightIdx, rightKey)
 
@@ -538,7 +522,7 @@ func scaleToFit(pb *gdk.Pixbuf, maxWidth, maxHeight int) (*gdk.Pixbuf, error) {
 }
 
 func (iv *ImageViewer) stepSize() int {
-	if iv.viewMode == ViewLandscapeTwo {
+	if iv.getViewMode() == ViewLandscapeTwo {
 		return 2
 	}
 	return 1
@@ -574,14 +558,12 @@ func setDisplayRotation(portrait bool) {
 }
 
 func (iv *ImageViewer) setViewMode(mode ViewMode) {
-	wasPortrait := iv.viewMode == ViewPortraitSingle
-	isPortrait := mode == ViewPortraitSingle
-
-	iv.viewMode = mode
+	orientationChanged := iv.setViewModeState(mode)
 	log.Printf("View mode set to %d", mode)
 
-	if wasPortrait != isPortrait {
-		setDisplayRotation(isPortrait)
+	// Rotating the screen shells out to xrandr, so it runs with no lock held.
+	if orientationChanged {
+		setDisplayRotation(mode == ViewPortraitSingle)
 	}
 
 	iv.updateImage()
@@ -656,15 +638,16 @@ func (iv *ImageViewer) setupUI() error {
 		}
 
 		step := iv.stepSize()
-		iv.mutex.Lock()
+		moved := false
 		switch keyEvent.KeyVal() {
 		case gdk.KEY_space, gdk.KEY_Right:
-			iv.currentIndex = (iv.currentIndex + step) % len(iv.images)
+			moved = iv.advance(step)
 		case gdk.KEY_Left:
-			iv.currentIndex = (iv.currentIndex - step + len(iv.images)) % len(iv.images)
+			moved = iv.advance(-step)
 		}
-		iv.mutex.Unlock()
-		iv.updateImage()
+		if moved {
+			iv.updateImage()
+		}
 	})
 
 	// Add event overlay last (on top)
@@ -674,11 +657,7 @@ func (iv *ImageViewer) setupUI() error {
 
 	eventOverlay.Connect("button-press-event", func(da *gtk.DrawingArea, event *gdk.Event) bool {
 		log.Println("Button press detected - toggling pause")
-		iv.mutex.Lock()
-		iv.paused = !iv.paused
-		paused := iv.paused
-		iv.mutex.Unlock()
-		log.Printf("Paused: %v", paused)
+		log.Printf("Paused: %v", iv.togglePaused())
 		return true
 	})
 
@@ -688,20 +667,16 @@ func (iv *ImageViewer) setupUI() error {
 		log.Printf("Scroll event detected - direction: %v", direction)
 
 		step := iv.stepSize()
-		iv.mutex.Lock()
 		changed := false
 		if direction == gdk.SCROLL_UP || direction == gdk.SCROLL_LEFT {
-			iv.currentIndex = (iv.currentIndex - step + len(iv.images)) % len(iv.images)
-			changed = true
-			log.Printf("Changed to index: %d", iv.currentIndex)
+			changed = iv.advance(-step)
 		} else if direction == gdk.SCROLL_DOWN || direction == gdk.SCROLL_RIGHT {
-			iv.currentIndex = (iv.currentIndex + step) % len(iv.images)
-			changed = true
-			log.Printf("Changed to index: %d", iv.currentIndex)
+			changed = iv.advance(step)
 		}
-		iv.mutex.Unlock()
-
 		if changed {
+			if idx, _, ok := iv.currentKey(); ok {
+				log.Printf("Changed to index: %d", idx)
+			}
 			iv.updateImage()
 		}
 		return true
@@ -750,24 +725,22 @@ func (iv *ImageViewer) setupUI() error {
 func (iv *ImageViewer) startSlideshow() {
 	var startTimer func()
 	startTimer = func() {
-		if iv.timeoutID != 0 {
-			glib.SourceRemove(iv.timeoutID)
+		// Retire the previous source before arming the next, as before. Taking
+		// the handle out of the struct first means the GLib call that retires
+		// it runs with no lock held.
+		if previous := iv.swapTimeout(0); previous != 0 {
+			glib.SourceRemove(previous)
 		}
 
-		iv.timeoutID = glib.TimeoutAdd(iv.config.SlideInterval*1000, func() bool {
-			step := iv.stepSize()
-			iv.mutex.Lock()
-			paused := iv.paused
-			if !paused && len(iv.images) > 0 {
-				iv.currentIndex = (iv.currentIndex + step) % len(iv.images)
-			}
-			iv.mutex.Unlock()
-			if !paused && len(iv.images) > 0 {
-				iv.updateImage()
+		iv.swapTimeout(glib.TimeoutAdd(iv.config.SlideInterval*1000, func() bool {
+			if !iv.isPaused() {
+				if iv.advance(iv.stepSize()) {
+					iv.updateImage()
+				}
 			}
 			startTimer()
 			return false
-		})
+		}))
 	}
 	startTimer()
 }
@@ -789,7 +762,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to create viewer: %v", err)
 	}
-	viewer.viewMode = parseViewMode(config.ViewMode)
+	// Startup does not rotate the display, matching previous behaviour: the
+	// orientation the X session already has is taken as correct.
+	_ = viewer.setViewModeState(parseViewMode(config.ViewMode))
 
 	if err := viewer.setupUI(); err != nil {
 		log.Fatalf("Failed to setup UI: %v", err)
