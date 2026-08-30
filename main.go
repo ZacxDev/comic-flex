@@ -11,10 +11,12 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gotk3/gotk3/gdk"
@@ -231,7 +233,14 @@ type ImageViewer struct {
 	timeoutID    glib.SourceHandle
 	paused       bool
 	viewMode     ViewMode
+	// scanning is true while a bucket listing is in flight. It is what lets
+	// GET /api/state tell "not yet scanned" (total 0, indexing) apart from
+	// "scanned and empty" (total 0, no comics). Guarded by mutex like the rest.
+	scanning bool
 }
+
+// version is reported by GET /healthz.
+const version = "0.2.0"
 
 func loadManifest(path string) (*Manifest, error) {
 	var manifest Manifest
@@ -327,7 +336,15 @@ func NewImageViewer(config *Config, store ImageStore) (*ImageViewer, error) {
 }
 
 func (iv *ImageViewer) scanImagesAsync() {
+	// Set synchronously, before the goroutine starts. Setting it inside the
+	// goroutine would leave a window in which GET /api/state reports
+	// scanning:false with total 0 — the "no comics" answer — for a gallery that
+	// is about to be listed.
+	iv.setScanning(true)
+
 	go func() {
+		defer iv.setScanning(false)
+
 		images, err := iv.store.ListImages()
 		if err != nil {
 			log.Printf("Error listing images: %v", err)
@@ -343,8 +360,9 @@ func (iv *ImageViewer) scanImagesAsync() {
 
 		iv.setImages(images)
 
-		// Update the first image if none is showing.
-		glib.IdleAdd(func() {
+		// Update the first image if none is showing. idleOnce is the program's
+		// single glib.IdleAdd call site — see control_adapter.go.
+		idleOnce(func() {
 			iv.onScanComplete(iv.updateImage)
 		})
 	}()
@@ -732,7 +750,10 @@ func (iv *ImageViewer) startSlideshow() {
 			glib.SourceRemove(previous)
 		}
 
-		iv.swapTimeout(glib.TimeoutAdd(iv.config.SlideInterval*1000, func() bool {
+		// Read through the accessor: POST /api/interval writes this field from
+		// an enqueued closure, so an unlocked read here would be a data race
+		// against GET /api/state's reader.
+		iv.swapTimeout(glib.TimeoutAdd(iv.slideInterval()*1000, func() bool {
 			if !iv.isPaused() {
 				if iv.advance(iv.stepSize()) {
 					iv.updateImage()
@@ -746,6 +767,9 @@ func (iv *ImageViewer) startSlideshow() {
 }
 
 func main() {
+	// 🔴 The relative literal is load-bearing: the systemd unit's
+	// WorkingDirectory=/home/zach/comic-flex is what makes it resolve. Do not
+	// "clean this up" into an absolute path without changing the unit too.
 	config, err := loadConfig("config.yaml")
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
@@ -776,5 +800,33 @@ func main() {
 	// Start the slideshow
 	viewer.startSlideshow()
 
+	// The control API runs in this same process — it is not a second unit, so
+	// there is no new supervision object and the existing unit restarts both
+	// together. It returns nil, having logged why, if the token precondition
+	// fails; the slideshow then runs with no control surface at all.
+	ctrl := startControlAPI(viewer)
+
+	// There was no signal handling here at all. gtk.MainQuit() is what returns
+	// from gtk.Main(), so a SIGTERM has to be turned into one — and it must be
+	// raised ON the GTK thread, which is what idleOnce is for.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		log.Printf("received %s, shutting down", sig)
+		idleOnce(gtk.MainQuit)
+	}()
+
 	gtk.Main()
+
+	// gtk.Main() has returned, so main() is about to end. This is the whole of
+	// the new plumbing §4.4 calls for: without it the process would exit with
+	// the listener still accepting.
+	if ctrl != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := ctrl.Shutdown(ctx); err != nil {
+			log.Printf("control API shutdown: %v", err)
+		}
+	}
 }

@@ -180,3 +180,138 @@ func (iv *ImageViewer) swapTimeout(next glib.SourceHandle) (previous glib.Source
 	iv.timeoutID = next
 	return previous
 }
+
+// ---------------------------------------------------------------------------
+// Added for the control API (clawgate #442 phase 3a).
+//
+// Everything below obeys the same rule 1 as the accessors above: acquire, do
+// the smallest possible amount of work, release. Nothing here calls back into
+// the viewer, and nothing here shells out or touches a widget.
+// ---------------------------------------------------------------------------
+
+// setPausedState sets the paused flag to an absolute value.
+//
+// togglePaused is the right primitive for a click — the user means "the other
+// one". It is the WRONG primitive for POST /api/pause, which means "be paused"
+// regardless of what it was: a retry of a toggle silently resumes.
+func (iv *ImageViewer) setPausedState(paused bool) {
+	iv.mutex.Lock()
+	defer iv.mutex.Unlock()
+	iv.paused = paused
+}
+
+// setScanning records whether a bucket listing is in flight.
+//
+// This is what lets GET /api/state distinguish "not yet scanned" from "empty".
+// Until the first ListImages returns, total is 0 and a client must render
+// "indexing…" rather than "0 comics"; they are different states and the API
+// must not collapse them.
+func (iv *ImageViewer) setScanning(scanning bool) {
+	iv.mutex.Lock()
+	defer iv.mutex.Unlock()
+	iv.scanning = scanning
+}
+
+// slideInterval reports the configured seconds between slides.
+//
+// The value lives in config, which the slideshow timer re-reads every tick.
+// Once an HTTP handler can read it (GET /api/state) and an enqueued closure can
+// write it (POST /api/interval), that unsynchronised access is a data race, so
+// both sides go through these two accessors.
+func (iv *ImageViewer) slideInterval() uint {
+	iv.mutex.RLock()
+	defer iv.mutex.RUnlock()
+	return iv.config.SlideInterval
+}
+
+// setSlideInterval changes the seconds between slides. It takes effect on the
+// next tick; the timer is not restarted.
+func (iv *ImageViewer) setSlideInterval(seconds uint) {
+	iv.mutex.Lock()
+	defer iv.mutex.Unlock()
+	iv.config.SlideInterval = seconds
+}
+
+// indexOfKey reports the position of key in the gallery.
+//
+// It is a read, made from the HTTP handler goroutine, purely to answer 404 on
+// POST /api/goto. It is NOT the resolution the page turn uses — gotoKey does
+// that again under the write lock, because the gallery can be replaced between
+// the two.
+func (iv *ImageViewer) indexOfKey(key string) (int, bool) {
+	iv.mutex.RLock()
+	defer iv.mutex.RUnlock()
+	for i, k := range iv.images {
+		if k == key {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// gotoKey selects key and reports whether it was found. A key that has since
+// left the gallery is a no-op rather than an error: the caller is an enqueued
+// closure with nobody left to answer.
+func (iv *ImageViewer) gotoKey(key string) bool {
+	iv.mutex.Lock()
+	defer iv.mutex.Unlock()
+	for i, k := range iv.images {
+		if k == key {
+			iv.currentIndex = i
+			return true
+		}
+	}
+	return false
+}
+
+// gotoIndex selects an absolute position, clamped into range, and reports
+// whether there is anything to show.
+//
+// The clamp is not belt-and-braces: the handler bounds-checked against a
+// snapshot taken before this closure was queued, and a rescan in between can
+// have shortened the gallery. That is defect 3's shape exactly.
+func (iv *ImageViewer) gotoIndex(index int) bool {
+	iv.mutex.Lock()
+	defer iv.mutex.Unlock()
+	if len(iv.images) == 0 {
+		iv.currentIndex = 0
+		return false
+	}
+	iv.currentIndex = index
+	iv.clampIndexLocked()
+	return true
+}
+
+// viewerSnapshot is one consistent read of everything GET /api/state reports.
+type viewerSnapshot struct {
+	total         int
+	index         int
+	key           string
+	viewMode      ViewMode
+	paused        bool
+	slideInterval uint
+	scanning      bool
+}
+
+// snapshot reads every exported field under a SINGLE read lock.
+//
+// Composing it from the individual accessors instead would take and release the
+// lock seven times, and the result could describe a state the viewer was never
+// in — a key from before a page turn beside an index from after it.
+func (iv *ImageViewer) snapshot() viewerSnapshot {
+	iv.mutex.RLock()
+	defer iv.mutex.RUnlock()
+
+	s := viewerSnapshot{
+		total:         len(iv.images),
+		viewMode:      iv.viewMode,
+		paused:        iv.paused,
+		slideInterval: iv.config.SlideInterval,
+		scanning:      iv.scanning,
+	}
+	if s.total > 0 {
+		s.index = wrapIndex(iv.currentIndex, 0, s.total)
+		s.key = iv.images[s.index]
+	}
+	return s
+}
