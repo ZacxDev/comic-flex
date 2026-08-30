@@ -5,4 +5,16 @@ text_color: "#FFFFFF"
 manifest_path: "./manifest.yaml"
 enable_text: true
 is_random_order: true
+view_mode: "landscape_single"  # landscape_single, portrait_single, or landscape_two
+
+# Storage backend configuration
+# backend: "filesystem" (default) or "s3"
+storage:
+  backend: "s3"
+  # S3/Minio settings (used when backend: "s3")
+  endpoint: "s3.homelab.lan"
+  bucket: "comic-flex"
+  prefix: ""
+  use_ssl: true
+  skip_verify: true  # Skip TLS verification for self-signed certs
 
