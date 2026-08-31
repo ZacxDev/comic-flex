@@ -200,12 +200,32 @@ func (iv *ImageViewer) setPausedState(paused bool) {
 	iv.paused = paused
 }
 
-// beginScan and endScan record that a bucket listing is in flight.
+// maxConcurrentScans bounds how many bucket listings may be in flight at once.
 //
-// This is what lets GET /api/state distinguish "not yet scanned" from "empty".
-// Until the first ListImages returns, total is 0 and a client must render
-// "indexing…" rather than "0 comics"; they are different states and the API
-// must not collapse them.
+// 🔴 This is the bound that actually protects the Pi, and the GTK queue cap
+// below is NOT it. POST /api/rescan reaches scanImagesAsync, which spawns a
+// goroutine and returns in microseconds — so a rescan routed through
+// enqueueBounded frees its slot immediately and the cap never engages. Measured
+// on the round-1 code, driving the real enqueueBounded + gtkViewer.Rescan 500
+// times: `attempts=500 refused(503)=0 queueDepth=0 scansInFlight=500`, i.e. 500
+// concurrent MinIO ListObjects calls each able to hold for listTimeout (2 min),
+// on a Raspberry Pi.
+//
+// 4 is deliberately small. Every listing enumerates the SAME bucket, so more
+// than a couple in flight buys nothing but sockets and memory; the value has to
+// leave room for the startup scan to overlap an operator's rescan, and no more.
+// It is above the 2 that TestScanningIsACountNotAFlag drives on purpose — a cap
+// chosen to equal a fixture is a cap no fixture can see move.
+const maxConcurrentScans = 4
+
+// tryBeginScan reserves one of the maxConcurrentScans slots and records that a
+// bucket listing is in flight. It reports false, having reserved nothing, when
+// the bound is reached.
+//
+// The counter is what lets GET /api/state distinguish "not yet scanned" from
+// "empty". Until the first ListImages returns, total is 0 and a client must
+// render "indexing…" rather than "0 comics"; they are different states and the
+// API must not collapse them.
 //
 // 🔴 A COUNTER, NOT A FLAG — and that is a bug fix, not a style choice. Listings
 // overlap the moment the control API exists: POST /api/rescan twice, or once
@@ -215,10 +235,18 @@ func (iv *ImageViewer) setPausedState(paused bool) {
 // GET /api/state then answered total 0 / scanning false — the "no comics"
 // answer — mid-scan. That is exactly the collapse the paragraph above says must
 // not happen. The counter makes scanning stay true until the LAST listing ends.
-func (iv *ImageViewer) beginScan() {
+//
+// 🔴 There is deliberately NO unconditional beginScan. One existed and was the
+// only way in; adding a bounded entry point beside it would have left the
+// unbounded one available to the next caller who did not know the difference.
+func (iv *ImageViewer) tryBeginScan() bool {
 	iv.mutex.Lock()
 	defer iv.mutex.Unlock()
+	if iv.scansInFlight >= maxConcurrentScans {
+		return false
+	}
 	iv.scansInFlight++
+	return true
 }
 
 func (iv *ImageViewer) endScan() {
@@ -249,14 +277,29 @@ func (iv *ImageViewer) scanCount() int {
 // The GTK main loop's work queue (bounded).
 // ---------------------------------------------------------------------------
 
-// maxQueuedMutations caps how many control-API closures may be outstanding on
-// the GTK main loop at once.
+// maxQueuedMutations caps how many control-API MUTATION closures may be
+// outstanding on the GTK main loop at once.
 //
 // The loop drains at up to 30 s per image, an authenticated caller can POST as
 // fast as the Pi accepts connections, and every scheduled closure holds a gotk3
 // callback-registry entry until it runs. Unbounded, a client that merely retries
 // grows both without limit. 64 is far more page turns than any operator queues
 // deliberately and still bounded memory.
+//
+// 🔴 SCOPE, stated exactly, because the round-1 version of this comment claimed
+// more than the code delivers. This bounds the closures enqueueBounded
+// schedules — the eight R1 mutation endpoints. It does NOT bound every closure
+// on the main loop. Two others exist and are bounded elsewhere:
+//
+//   - scanImagesAsync schedules its completion callback (the one that reaches
+//     updateSingleImage and a 30 s S3 GET) with idleOnce DIRECTLY, outside this
+//     accounting. At most one per listing, so maxConcurrentScans bounds it.
+//   - scheduleQuit schedules the shutdown at PRIORITY_HIGH, once per process.
+//
+// So the true invariant is: at most maxQueuedMutations + maxConcurrentScans + 1
+// control-originated closures outstanding. Anything new that calls idleOnce
+// without going through enqueueBounded must state its own bound here or it
+// makes this comment false again.
 const maxQueuedMutations = 64
 
 // reserveQueueSlot takes one of the maxQueuedMutations slots, or reports false.

@@ -32,6 +32,16 @@ type fakeViewer struct {
 	capacity int
 	// refused counts the Enqueue calls that were turned away.
 	refused int
+
+	// scanCapacity, when > 0, makes Rescan refuse once that many listings are
+	// in flight — standing in for the real adapter's maxConcurrentScans. It is
+	// a SEPARATE budget from capacity because the two bound different things,
+	// and conflating them is what made the round-1 rescan look bounded.
+	scanCapacity int
+	// scansInFlight counts listings Rescan started and endScan has not ended.
+	scansInFlight int
+	// scansRefused counts the Rescan calls that were turned away.
+	scansRefused int
 }
 
 func newFakeViewer(keys ...string) *fakeViewer {
@@ -107,7 +117,39 @@ func (f *fakeViewer) GotoKey(k string) {
 }
 func (f *fakeViewer) GotoIndex(i int)     { f.record("GotoIndex:" + strconv.Itoa(i)) }
 func (f *fakeViewer) SetInterval(sec int) { f.record("SetInterval:" + strconv.Itoa(sec)) }
-func (f *fakeViewer) Rescan()             { f.record("Rescan") }
+
+// Rescan stands in for the real adapter: it admits a listing or refuses, and it
+// returns SYNCHRONOUSLY without queueing anything. The recorded call goes in
+// calls (not reads) only when it was admitted, so a test can tell "started" from
+// "refused" without reading the counter.
+func (f *fakeViewer) Rescan() bool {
+	f.mu.Lock()
+	if f.scanCapacity > 0 && f.scansInFlight >= f.scanCapacity {
+		f.scansRefused++
+		f.mu.Unlock()
+		return false
+	}
+	f.scansInFlight++
+	f.calls = append(f.calls, "Rescan")
+	f.mu.Unlock()
+	return true
+}
+
+// endScan releases one listing, standing in for a ListImages returning.
+func (f *fakeViewer) endScan() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.scansInFlight > 0 {
+		f.scansInFlight--
+	}
+}
+
+// scansRefusedCount reports how many Rescan calls the fake turned away.
+func (f *fakeViewer) scansRefusedCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.scansRefused
+}
 
 // indexOf resolves a key the way the real GotoKey does — at the moment the
 // closure RUNS, against the gallery as it is then. The tests use this to prove

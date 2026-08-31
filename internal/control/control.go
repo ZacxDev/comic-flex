@@ -171,13 +171,34 @@ func accepted(w http.ResponseWriter) {
 // is not would be the same lie the trailing-JSON case in decodeBody avoids.
 func (s *Server) enqueue(w http.ResponseWriter, fn func()) {
 	if !s.viewer.Enqueue(fn) {
-		w.Header().Set("Retry-After", "1")
-		writeJSON(w, http.StatusServiceUnavailable, errorBody{
-			Error: "the display queue is full; retry shortly",
-		})
+		refuse(w, "the display queue is full; retry shortly")
 		return
 	}
 	accepted(w)
+}
+
+// refuse is the ONE place a 503 is written, so the status, the Retry-After and
+// the JSON shape cannot drift between the two admission points (the GTK queue
+// cap and the concurrent-scan bound).
+//
+// 🔴 503 IS A CONTRACT CHANGE AND CONSUMERS MUST BE UPDATED IN LOCKSTEP.
+// Proposal §4.2 (clawgate #442, in the homelab-infra repo) says a mutation
+// always answers 202. It no longer does. A caller that branches only on
+// `202 vs 4xx` reads this as a dead Pi and will escalate, page, or mark the
+// display down — for what is ordinary backpressure that clears in a second.
+//
+// Before this runs on the Pi, BOTH of these must land in homelab-infra:
+//
+//   - §4.2 amended to document 503 + Retry-After on every mutation endpoint,
+//   - the cluster-side caller taught that 503 means RETRY (honouring
+//     Retry-After), not FAILED.
+//
+// Deliberately not fixed by widening 202: telling a caller its page turn is
+// queued when nothing was queued is the same lie as accepting a body with a
+// discarded second JSON object, which decodeBody refuses two functions down.
+func refuse(w http.ResponseWriter, msg string) {
+	w.Header().Set("Retry-After", "1")
+	writeJSON(w, http.StatusServiceUnavailable, errorBody{Error: msg})
 }
 
 func badRequest(w http.ResponseWriter, msg string) {
@@ -353,6 +374,31 @@ func (s *Server) handleInterval(w http.ResponseWriter, r *http.Request) {
 	s.enqueue(w, func() { s.viewer.SetInterval(n) })
 }
 
+// handleRescan starts a bucket listing. It is the ONE mutation endpoint that
+// does not go through Server.enqueue, and that is the fix for a hole rather than
+// an inconsistency.
+//
+// 🔴 Round-1 this read `s.enqueue(w, s.viewer.Rescan)`, which looked like the
+// most bounded endpoint of the nine and was in fact the only unbounded one.
+// Rescan spawns the listing onto its own goroutine and returns in microseconds,
+// so the queue slot it reserved was released before the next request arrived and
+// the cap never engaged. Measured against the round-1 code, driving the real
+// enqueueBounded + adapter 500 times:
+//
+//	attempts=500 refused(503)=0 queueDepth=0 scansInFlight=500
+//
+// — 500 concurrent MinIO ListObjects, each able to hold for the 2 minute
+// listTimeout, on a Raspberry Pi. Backpressure was on the eight cheap endpoints
+// and absent from the expensive one.
+//
+// So the bound lives where the work does (the viewer's concurrent-listing cap)
+// and the admission answer comes back SYNCHRONOUSLY, while the caller is still
+// there to be told 503. Nothing in Rescan touches a widget, so there is no GTK
+// thread requirement to satisfy by enqueueing it.
 func (s *Server) handleRescan(w http.ResponseWriter, r *http.Request) {
-	s.enqueue(w, s.viewer.Rescan)
+	if !s.viewer.Rescan() {
+		refuse(w, "a bucket listing is already in flight; retry shortly")
+		return
+	}
+	accepted(w)
 }

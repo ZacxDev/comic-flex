@@ -1,6 +1,7 @@
 package control
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -474,22 +475,106 @@ type routeScan struct {
 	unknown      []string // registrations this scanner cannot attribute
 }
 
-// scanRoutes parses routes() and enumerates every Handle/HandleFunc call in it.
+// srcFile is one parsed-from-memory source file. scanRoutesFiles takes a set of
+// them so the real scan can cover the WHOLE package while the positive controls
+// can still feed it a single synthetic file.
+type srcFile struct {
+	name string
+	src  string
+}
+
+// scanRoutesFiles enumerates every route registration reachable from routes().
 //
 // It identifies which mux is which STRUCTURALLY — by finding the
 // `<outer>.Handle(<pattern>, s.requireToken(<inner>))` call — rather than by the
 // variable names, so renaming a variable does not silently blind it.
-func scanRoutes(t *testing.T, filename, src string) routeScan {
+//
+// 🔴 ROUND-2 REBUILD. The round-1 version of this scanner inspected only the
+// body of routes(), and only registrations whose receiver was a bare *ast.Ident.
+// Two ordinary refactors walked straight past it, BOTH measured green at
+// 243 PASS / 0 FAIL, and both served `GET /debug/state -> 200` with a full
+// Snapshot to anyone who could reach :8790:
+//
+//  1. `s.registerDebug(mux)` — the registration moved into a helper, so all
+//     routes() contained was a CallExpr the scanner ignored.
+//  2. `wrapper.outer.HandleFunc("GET /debug/state", …)` — a SelectorExpr
+//     receiver, where the scanner did `if !ok { return true }` and SKIPPED it.
+//
+// The lesson is the shape, not the two instances: a scanner that RETURNS on a
+// form it does not recognise reports clean on every form nobody thought of. So
+// this one records an UNKNOWN — which fails the test — for anything it cannot
+// attribute:
+//
+//   - a Handle/HandleFunc whose receiver is not one of the muxes routes() built,
+//     in any expression form,
+//   - any other call inside routes() that is HANDED a mux (the helper case),
+//     which is receiver-form-independent and works even if the helper lives in
+//     another file,
+//   - any *Server method anywhere in the package that TAKES a *http.ServeMux,
+//   - any Handle/HandleFunc anywhere in the package outside routes().
+func scanRoutesFiles(t *testing.T, files []srcFile) routeScan {
 	t.Helper()
-	file := parseSource(t, filename, src)
-	fn := funcNamed(file, "routes")
+
+	parsed := make([]*ast.File, 0, len(files))
+	var fn *ast.FuncDecl
+	var fnFile string
+	for _, f := range files {
+		file := parseSource(t, f.name, f.src)
+		parsed = append(parsed, file)
+		if got := funcNamed(file, "routes"); got != nil {
+			if fn != nil {
+				t.Fatalf("two funcs named routes (%s and %s) — this guard cannot tell which one "+
+					"builds the served handler", fnFile, f.name)
+			}
+			fn, fnFile = got, f.name
+		}
+	}
 	if fn == nil {
-		t.Fatal("no func routes() in " + filename + " — this guard can no longer see the route set")
+		t.Fatal("no func routes() in the scanned sources — this guard can no longer see the route set")
 	}
 
 	var out routeScan
 
-	// Pass 1: find the mount, which tells us which mux is authenticated.
+	// The muxes routes() itself constructs. Anything registered on something
+	// else is by definition not attributable to one of them.
+	muxVars := map[string]bool{}
+	collect := func(lhs []ast.Expr, rhs []ast.Expr) {
+		if len(lhs) != 1 || len(rhs) != 1 {
+			return
+		}
+		call, ok := rhs[0].(*ast.CallExpr)
+		if !ok {
+			return
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "NewServeMux" {
+			return
+		}
+		if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "http" {
+			return
+		}
+		if id, ok := lhs[0].(*ast.Ident); ok {
+			muxVars[id.Name] = true
+		}
+	}
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.AssignStmt:
+			collect(x.Lhs, x.Rhs)
+		case *ast.ValueSpec:
+			names := make([]ast.Expr, 0, len(x.Names))
+			for _, nm := range x.Names {
+				names = append(names, nm)
+			}
+			collect(names, x.Values)
+		}
+		return true
+	})
+
+	// Pass 1: find the mount, which tells us which mux is authenticated. The
+	// wrap call is remembered by identity so pass 3 does not report it as a
+	// stray hand-off of the inner mux.
+	var mountWrap *ast.CallExpr
 	ast.Inspect(fn.Body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok || len(call.Args) != 2 {
@@ -519,10 +604,11 @@ func scanRoutes(t *testing.T, filename, src string) routeScan {
 		out.outerMux = recv.Name
 		out.innerMux = inner.Name
 		out.mountPattern = literalString(call.Args[0])
+		mountWrap = wrap
 		return true
 	})
 
-	// Pass 2: attribute every registration.
+	// Pass 2: attribute every registration inside routes().
 	ast.Inspect(fn.Body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok || len(call.Args) == 0 {
@@ -532,11 +618,17 @@ func scanRoutes(t *testing.T, filename, src string) routeScan {
 		if !ok || (sel.Sel.Name != "Handle" && sel.Sel.Name != "HandleFunc") {
 			return true
 		}
+		pattern := literalString(call.Args[0])
 		recv, ok := sel.X.(*ast.Ident)
 		if !ok {
+			// 🔴 NOT `return true`. `wrapper.outer.HandleFunc(...)` is a
+			// registration this scanner cannot attribute; skipping it is how the
+			// round-1 version reported clean on an unauthenticated /debug/state.
+			out.unknown = append(out.unknown,
+				exprString(sel.X)+"."+sel.Sel.Name+"("+strconv.Quote(pattern)+
+					") — receiver is not one of the muxes routes() built")
 			return true
 		}
-		pattern := literalString(call.Args[0])
 		switch {
 		case out.mounted && recv.Name == out.innerMux:
 			out.inner = append(out.inner, pattern)
@@ -546,15 +638,130 @@ func scanRoutes(t *testing.T, filename, src string) routeScan {
 			}
 			out.outer = append(out.outer, pattern)
 		default:
-			out.unknown = append(out.unknown, recv.Name+"."+sel.Sel.Name+"("+pattern+")")
+			out.unknown = append(out.unknown,
+				recv.Name+"."+sel.Sel.Name+"("+strconv.Quote(pattern)+")")
 		}
 		return true
 	})
+
+	// Pass 3: any OTHER call inside routes() that is handed one of the muxes.
+	// This is what catches indirect registration — `s.registerDebug(mux)` — and
+	// it does so without needing to find the helper, so it holds even when the
+	// helper lives in another file or another package.
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || call == mountWrap {
+			return true
+		}
+		if sel, ok := call.Fun.(*ast.SelectorExpr); ok &&
+			(sel.Sel.Name == "Handle" || sel.Sel.Name == "HandleFunc") {
+			return true // already attributed by pass 2
+		}
+		for _, arg := range call.Args {
+			id, ok := arg.(*ast.Ident)
+			if !ok || !muxVars[id.Name] {
+				continue
+			}
+			out.unknown = append(out.unknown,
+				exprString(call.Fun)+"("+id.Name+") — a call inside routes() is handed the mux, "+
+					"so it may register routes this scanner cannot see")
+		}
+		return true
+	})
+
+	// Pass 4, package-wide: registration that never appears in routes() at all.
+	for i, file := range parsed {
+		for _, decl := range file.Decls {
+			decl, ok := decl.(*ast.FuncDecl)
+			if !ok || decl.Body == nil || decl == fn {
+				continue
+			}
+			if serverMethodTakingMux(decl) {
+				out.unknown = append(out.unknown,
+					files[i].name+":"+decl.Name.Name+" is a *Server method taking a *http.ServeMux "+
+						"— it can register routes, and routes() calling it is invisible here")
+			}
+			ast.Inspect(decl.Body, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok || len(call.Args) == 0 {
+					return true
+				}
+				sel, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok || (sel.Sel.Name != "Handle" && sel.Sel.Name != "HandleFunc") {
+					return true
+				}
+				out.unknown = append(out.unknown,
+					files[i].name+":"+decl.Name.Name+" registers "+
+						strconv.Quote(literalString(call.Args[0]))+" outside routes()")
+				return true
+			})
+		}
+	}
 
 	sort.Strings(out.outer)
 	sort.Strings(out.inner)
 	sort.Strings(out.unknown)
 	return out
+}
+
+// serverMethodTakingMux reports whether decl is a method on Server (value or
+// pointer receiver) with a *http.ServeMux parameter.
+func serverMethodTakingMux(decl *ast.FuncDecl) bool {
+	if decl.Recv == nil || len(decl.Recv.List) != 1 {
+		return false
+	}
+	recvType := decl.Recv.List[0].Type
+	if star, ok := recvType.(*ast.StarExpr); ok {
+		recvType = star.X
+	}
+	if id, ok := recvType.(*ast.Ident); !ok || id.Name != "Server" {
+		return false
+	}
+	if decl.Type.Params == nil {
+		return false
+	}
+	for _, field := range decl.Type.Params.List {
+		star, ok := field.Type.(*ast.StarExpr)
+		if !ok {
+			continue
+		}
+		sel, ok := star.X.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "ServeMux" {
+			continue
+		}
+		if pkg, ok := sel.X.(*ast.Ident); ok && pkg.Name == "http" {
+			return true
+		}
+	}
+	return false
+}
+
+// exprString renders an expression for a failure message. It handles the forms
+// a receiver or a callee can take; anything else is reported by its Go type so
+// the message still names something a maintainer can grep for.
+func exprString(e ast.Expr) string {
+	switch x := e.(type) {
+	case *ast.Ident:
+		return x.Name
+	case *ast.SelectorExpr:
+		return exprString(x.X) + "." + x.Sel.Name
+	case *ast.ParenExpr:
+		return "(" + exprString(x.X) + ")"
+	case *ast.StarExpr:
+		return "*" + exprString(x.X)
+	case *ast.IndexExpr:
+		return exprString(x.X) + "[...]"
+	case *ast.CallExpr:
+		return exprString(x.Fun) + "(...)"
+	}
+	return fmt.Sprintf("<%T>", e)
+}
+
+// scanRoutes scans a single source. The positive controls use it; the real scan
+// goes through scanControlRoutes, which covers the whole package.
+func scanRoutes(t *testing.T, filename, src string) routeScan {
+	t.Helper()
+	return scanRoutesFiles(t, []srcFile{{name: filename, src: src}})
 }
 
 // literalString unquotes a string literal, or returns a marker that will not
@@ -572,13 +779,47 @@ func literalString(e ast.Expr) string {
 	return s
 }
 
+// scanControlRoutes scans EVERY non-test source in this package, not just
+// control.go.
+//
+// 🔴 Reading one file was a second way to be narrower than the sentence: moving
+// `registerDebug` into a new file of the same package would have taken the
+// registration out of the scanner's view entirely, and the package still serves
+// whatever routes() returns. The unit that matters is the package.
 func scanControlRoutes(t *testing.T) routeScan {
 	t.Helper()
-	src, err := os.ReadFile("control.go")
+	entries, err := os.ReadDir(".")
 	if err != nil {
-		t.Fatalf("reading control.go: %v", err)
+		t.Fatalf("reading the package directory: %v", err)
 	}
-	return scanRoutes(t, "control.go", string(src))
+	var files []srcFile
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("reading %s: %v", name, err)
+		}
+		files = append(files, srcFile{name: name, src: string(src)})
+	}
+	// Positive control on the INPUT SET: an empty or truncated file list would
+	// make every scan below vacuously clean.
+	if len(files) < 3 {
+		t.Fatalf("only %d non-test sources found in this package (%v) — the scanner is not "+
+			"looking at the package it claims to check", len(files), files)
+	}
+	var haveControl bool
+	for _, f := range files {
+		if f.name == "control.go" {
+			haveControl = true
+		}
+	}
+	if !haveControl {
+		t.Fatal("control.go was not among the scanned sources")
+	}
+	return scanRoutesFiles(t, files)
 }
 
 // TestTheAPISubtreeIsMountedBehindTheMiddleware pins the relationship the whole
@@ -702,10 +943,108 @@ func (s *Server) routes() http.Handler {
 			"mounted bare — it cannot see the whole API being served unauthenticated")
 	}
 
-	// Negative side: the real file must come back with a mount and no unknowns.
-	if real := scanControlRoutes(t); !real.mounted || len(real.unknown) != 0 {
-		t.Fatalf("the scanner misjudged the real control.go: %+v", real)
+	// 🔴 ROUND-2 MUTANT 1, measured green at 243 PASS / 0 FAIL against the
+	// round-1 rebuild of this scanner, and probed live: unauthenticated
+	// `GET /debug/state -> 200 body={"total":1,…}`. routes() contains nothing
+	// but a CallExpr, so a scanner that only enumerates Handle/HandleFunc calls
+	// in routes() sees an entirely clean function.
+	const helperRegistration = `package control
+
+func (s *Server) routes() http.Handler {
+	api := http.NewServeMux()
+	api.HandleFunc("GET /api/state", s.handleState)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	s.registerDebug(mux)
+	mux.Handle("/api/", s.requireToken(api))
+	return mux
+}
+
+func (s *Server) registerDebug(mux *http.ServeMux) {
+	mux.HandleFunc("GET /debug/state", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, s.viewer.Snapshot())
+	})
+}
+`
+	got = scanRoutes(t, "mutant4.go", helperRegistration)
+	if len(got.unknown) == 0 {
+		t.Fatalf("the scanner reported NO unknowns for a routes() that registers its debug "+
+			"endpoint through a helper (outer=%v inner=%v). An unauthenticated GET /debug/state "+
+			"returning a full Snapshot ships green, which is exactly what round 1 measured.",
+			got.outer, got.inner)
 	}
+	if equalStrings(got.outer, []string{"GET /healthz"}) && len(got.unknown) == 0 {
+		t.Fatal("the scanner attributed the helper's route to nothing at all")
+	}
+
+	// 🔴 ROUND-2 MUTANT 2, also measured green at 243 PASS / 0 FAIL: the same
+	// route, registered directly, on a receiver that is not a bare *ast.Ident.
+	// The round-1 scanner did `if !ok { return true }` here — it SKIPPED the
+	// registration rather than recording that it could not attribute it.
+	const nonIdentReceiver = `package control
+
+func (s *Server) routes() http.Handler {
+	api := http.NewServeMux()
+	api.HandleFunc("GET /api/state", s.handleState)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	wrapper := struct{ outer *http.ServeMux }{outer: mux}
+	wrapper.outer.HandleFunc("GET /debug/state", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, s.viewer.Snapshot())
+	})
+	mux.Handle("/api/", s.requireToken(api))
+	return mux
+}
+`
+	got = scanRoutes(t, "mutant5.go", nonIdentReceiver)
+	if len(got.unknown) == 0 {
+		t.Fatalf("the scanner reported NO unknowns for `wrapper.outer.HandleFunc(\"GET "+
+			"/debug/state\", …)` (outer=%v). A SelectorExpr receiver is an ordinary refactor and "+
+			"it served the snapshot unauthenticated at a fully green suite.", got.outer)
+	}
+	if containsSubstring(got.unknown, "GET /debug/state") == false {
+		t.Errorf("the scanner's unknowns %v do not name the route it could not attribute — a "+
+			"maintainer cannot act on it", got.unknown)
+	}
+
+	// A route registered from a computed pattern must also be loud rather than
+	// silently attributed to the wrong bucket.
+	const computedPattern = `package control
+
+func (s *Server) routes() http.Handler {
+	api := http.NewServeMux()
+	api.HandleFunc("GET /api/state", s.handleState)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc(debugPath, s.handleState)
+	mux.Handle("/api/", s.requireToken(api))
+	return mux
+}
+`
+	got = scanRoutes(t, "mutant6.go", computedPattern)
+	if !containsSubstring(got.outer, "<non-literal pattern>") &&
+		!containsSubstring(got.unknown, "<non-literal pattern>") {
+		t.Errorf("a route registered from a computed pattern was reported as outer=%v unknown=%v "+
+			"— neither names it, so TestOnlyHealthzIsRegisteredUnauthenticated cannot fail on it",
+			got.outer, got.unknown)
+	}
+
+	// Negative side: the real package must come back with a mount and no
+	// unknowns. Without this the scanner could simply be always-positive.
+	if real := scanControlRoutes(t); !real.mounted || len(real.unknown) != 0 {
+		t.Fatalf("the scanner misjudged the real package: %+v", real)
+	}
+}
+
+func containsSubstring(haystack []string, want string) bool {
+	for _, s := range haystack {
+		if strings.Contains(s, want) {
+			return true
+		}
+	}
+	return false
 }
 
 func equalStrings(got, want []string) bool {

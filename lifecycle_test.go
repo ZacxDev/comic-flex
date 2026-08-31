@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -217,11 +218,20 @@ func TestStartSlideshowReadsTheIntervalUnderTheLock(t *testing.T) {
 // an interception into a REGRESSION if it is missing.
 //
 // Before this PR, SIGTERM killed comic-flex instantly. The PR intercepts it, and
-// the round-1 handler read the channel exactly ONCE and returned — so a second
-// SIGTERM sat in the buffer forever and the process became unsignallable.
-// `systemctl stop` then waits out TimeoutStopSec (90 s) and SIGKILLs, on a unit
-// the deploy notes ask to run with Restart=always. Deleting the whole block was
-// measured at 200 PASS / 0 FAIL.
+// the round-1 handler read the channel exactly ONCE and returned — so every
+// later SIGINT/SIGTERM sat unread in the buffer and only SIGKILL could still
+// stop the process. Deleting the whole block was measured at 200 PASS / 0 FAIL.
+//
+// 🔴 CORRECTED. The round-1 version of this comment said `systemctl stop` then
+// "waits out TimeoutStopSec (90 s)". That is wrong and it is worth stating so:
+// the read-once handler acted on the FIRST signal, and systemd sends exactly one
+// SIGTERM before SIGKILLing at the timeout — it never re-sends, so the ordinary
+// stop was never affected. The property this test actually pins is the SECOND
+// signal: an operator's second Ctrl-C, or a second `kill`, must force an exit,
+// which is what you need when the graceful quit cannot finish because the GTK
+// loop is inside a 30 s S3 GET. That is a real regression to guard against —
+// intercepting a signal must not make the process harder to stop than the
+// default it replaced — it is just not a 90 second one.
 func TestASecondSignalExitsImmediately(t *testing.T) {
 	sigCh := make(chan os.Signal, 4)
 	quits := make(chan struct{}, 4)
@@ -261,8 +271,9 @@ func TestASecondSignalExitsImmediately(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("a second SIGTERM did NOTHING. The handler read the channel once and returned, " +
-			"so the process cannot be signalled dead: systemctl stop waits out TimeoutStopSec " +
-			"(90 s) and then SIGKILLs, on every stop and every restart.")
+			"so every later signal is buffered and dropped and only SIGKILL can still stop the " +
+			"process. An operator whose first Ctrl-C found the GTK loop inside a 30 s S3 GET has " +
+			"no second try — pressing it again is inert.")
 	}
 	select {
 	case <-quits:
@@ -392,6 +403,78 @@ func installSignalHandler(sigCh <-chan os.Signal, quit func(), hardExit func(int
 	got = scanSchedulerCallsSource(t, "good.go", good, "installSignalHandler")
 	if !got["scheduleQuit"] || got["idleOnce"] {
 		t.Errorf("the scanner misjudged correct source: %v", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Layering — control_adapter.go is the only file in package main that names
+// internal/control (round-2 finding 7)
+// ---------------------------------------------------------------------------
+
+const controlImportPath = "github.com/ZacxDev/comic-flex/internal/control"
+
+// TestOnlyTheAdapterImportsTheControlPackage turns control_adapter.go's header
+// comment into something that can fail.
+//
+// 🔴 That comment claimed the file was "the ONLY place that knows both about
+// glib and about internal/control", and it was false the moment it was written:
+// the same round added `control.DefaultAddr` to main.go, which imports gtk, gdk
+// and glib. Nothing failed, because the only structural guard covered the
+// CONVERSE direction (internal/control must not reach GTK). A comment is a claim
+// too, and this is the claim.
+//
+// The port exists so the endpoint surface stays testable without a display; that
+// property survives an extra import. What does not survive is a reader's ability
+// to find every place the two layers meet by opening one file — which is what
+// the comment promises, and now what this test enforces.
+func TestOnlyTheAdapterImportsTheControlPackage(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("reading the package directory: %v", err)
+	}
+
+	var scanned, importers []string
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		scanned = append(scanned, name)
+		src, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("reading %s: %v", name, err)
+		}
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, name, src, parser.ImportsOnly)
+		if err != nil {
+			t.Fatalf("parsing %s: %v", name, err)
+		}
+		for _, imp := range file.Imports {
+			if path, err := strconv.Unquote(imp.Path.Value); err == nil && path == controlImportPath {
+				importers = append(importers, name)
+			}
+		}
+	}
+
+	// Positive control on the RESULT SET: a scan that found no files, or found
+	// the import nowhere, would be vacuously clean. package main HAS to import
+	// internal/control somewhere or the control API is not wired up at all.
+	if len(scanned) < 3 {
+		t.Fatalf("only %d non-test sources scanned (%v) — this guard is not looking at the "+
+			"package it claims to check", len(scanned), scanned)
+	}
+	if len(importers) == 0 {
+		t.Fatalf("no file in package main imports %s, across %v. Either the control API is not "+
+			"wired into the binary at all, or this scan is broken; both make the assertion below "+
+			"meaningless.", controlImportPath, scanned)
+	}
+
+	if len(importers) != 1 || importers[0] != "control_adapter.go" {
+		t.Errorf("%v import %s. control_adapter.go's header says it is the only file in package "+
+			"main that does, and a reader trusts that to find every place the GTK side and the "+
+			"port meet. Re-export what the other file needs (see controlAddr) or correct the "+
+			"comment — do not leave the comment claiming more than the code.",
+			importers, controlImportPath)
 	}
 }
 
@@ -560,7 +643,7 @@ func TestScanningIsACountNotAFlag(t *testing.T) {
 }
 
 // TestEndScanDoesNotGoNegative: an unbalanced endScan must not make a later
-// beginScan look like nothing is happening.
+// tryBeginScan look like nothing is happening.
 func TestEndScanDoesNotGoNegative(t *testing.T) {
 	iv := newControlTestViewer(30)
 	iv.endScan()
@@ -568,10 +651,91 @@ func TestEndScanDoesNotGoNegative(t *testing.T) {
 	if n := iv.scanCount(); n != 0 {
 		t.Fatalf("scansInFlight = %d after two unbalanced endScans, want 0", n)
 	}
-	iv.beginScan()
+	if !iv.tryBeginScan() {
+		t.Fatal("tryBeginScan was refused on an idle viewer — the counter went negative the " +
+			"other way and the scan budget is permanently exhausted")
+	}
 	if !iv.isScanning() {
-		t.Fatal("beginScan after unbalanced endScans did not report scanning — the counter " +
+		t.Fatal("tryBeginScan after unbalanced endScans did not report scanning — the counter " +
 			"went negative and a real scan is now invisible")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// F6b — concurrent bucket listings are bounded (round-2 finding 1)
+// ---------------------------------------------------------------------------
+
+// TestConcurrentRescansAreBounded is the regression test for the hole the
+// round-1 queue cap left open.
+//
+// 🔴 It drives the REAL adapter — gtkViewer.Rescan, which is what
+// POST /api/rescan reaches — rather than tryBeginScan, because tryBeginScan was
+// never the thing that was broken. The round-1 path went through
+// enqueueBounded, whose closure spawns the listing onto a goroutine and returns
+// in microseconds, so the slot was released before the next request arrived.
+// Measured at c7d0a2de with this exact loop against the real enqueueBounded +
+// gtkViewer.Rescan: attempts=500 refused=0 queueDepth=0 scansInFlight=500 —
+// 500 concurrent MinIO ListObjects, each able to hold for the 2 min listTimeout,
+// on a Raspberry Pi.
+//
+// 500 overshoots maxConcurrentScans by a long way and is not a multiple of it,
+// so a mutant that admits "a few extra" is still visible.
+func TestConcurrentRescansAreBounded(t *testing.T) {
+	store := newBlockingStore("a.jpg", "b.jpg")
+	iv := newControlTestViewer(30)
+	iv.store = store
+	g := gtkViewer{iv: iv}
+	t.Cleanup(func() { drainMainContext(t) })
+
+	const attempts = 500
+	started, refused := 0, 0
+	for i := 0; i < attempts; i++ {
+		if g.Rescan() {
+			started++
+		} else {
+			refused++
+		}
+	}
+
+	if started != maxConcurrentScans {
+		t.Fatalf("%d of %d rescans started; want exactly maxConcurrentScans (%d). Nothing is "+
+			"bounding the listings: each one is a goroutine holding a MinIO ListObjects for up "+
+			"to listTimeout (%s), on a Raspberry Pi.",
+			started, attempts, maxConcurrentScans, listTimeout)
+	}
+	if refused != attempts-maxConcurrentScans {
+		t.Fatalf("%d rescans were refused, want %d", refused, attempts-maxConcurrentScans)
+	}
+	if n := iv.scanCount(); n != maxConcurrentScans {
+		t.Fatalf("scansInFlight = %d, want %d", n, maxConcurrentScans)
+	}
+	// The queue cap must NOT be what did the bounding — that is the illusion the
+	// round-1 code sold. A rescan puts nothing on the GTK loop's mutation queue.
+	if n := iv.queueDepth(); n != 0 {
+		t.Fatalf("queueDepth = %d after %d rescans; a rescan must not consume a GTK mutation "+
+			"slot, because that slot is freed in microseconds and bounds nothing", n, attempts)
+	}
+
+	// Release the admitted listings and prove the budget recovers, or the
+	// display is stuck on a stale gallery forever after four rescans.
+	for i := 0; i < started; i++ {
+		store.release <- struct{}{}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for iv.scanCount() > 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if n := iv.scanCount(); n != 0 {
+		t.Fatalf("scansInFlight = %d after every listing returned, want 0", n)
+	}
+	if !g.Rescan() {
+		t.Fatal("a rescan was refused after every listing finished — the bound is a permanent " +
+			"wall rather than backpressure")
+	}
+	store.release <- struct{}{}
+	deadline = time.Now().Add(5 * time.Second)
+	for iv.scanCount() > 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -706,8 +870,84 @@ func TestResolveVersion(t *testing.T) {
 }
 
 // TestVersionIsNotEmpty: whatever the build was, /healthz must report SOMETHING.
+//
+// 🔴 Note what this canNOT see, so nobody reads it as more: "unknown" is not
+// empty, so this passes for a build that identifies itself as nothing in
+// particular. That is not hypothetical — `nix build .#default` produced exactly
+// that until flake.nix started injecting main.injectedVersion. A guard for the
+// nix path has to look at flake.nix, which is what
+// TestTheNixPackageInjectsAVersion below does; `go test` alone cannot observe
+// how a different build system links the binary.
 func TestVersionIsNotEmpty(t *testing.T) {
 	if strings.TrimSpace(version) == "" {
 		t.Fatal("version is empty — GET /healthz would report no version at all")
 	}
+}
+
+// TestTheNixPackageInjectsAVersion pins the half TestVersionIsNotEmpty is blind
+// to: the repo's own packaged build must link a value into injectedVersion.
+//
+// Without it, buildGoModule builds from a /nix/store copy with no .git,
+// -buildvcs=auto stamps nothing, resolveVersion falls through to "unknown", and
+// every nix-built Pi reports the same non-answer on /healthz. This is a textual
+// check on flake.nix — the alternative is running `nix build` from a Go test,
+// which is neither hermetic nor fast — so it is paired with the negative control
+// below rather than trusted on its own.
+func TestTheNixPackageInjectsAVersion(t *testing.T) {
+	src, err := os.ReadFile("flake.nix")
+	if err != nil {
+		t.Fatalf("reading flake.nix: %v", err)
+	}
+	if !nixInjectsVersion(string(src)) {
+		t.Errorf("flake.nix does not link a value into main.injectedVersion. buildGoModule builds "+
+			"from a /nix/store copy with no .git, so -buildvcs stamps nothing and resolveVersion "+
+			"answers %q for every nix-built binary — and TestVersionIsNotEmpty passes on that.",
+			resolveVersion("", nil))
+	}
+	// The property the injection exists for, stated as a claim about the code
+	// rather than about the build: with nothing injected and no VCS stamp,
+	// resolveVersion really does produce "unknown".
+	if got := resolveVersion("", nil); got != "unknown" {
+		t.Fatalf("resolveVersion(\"\", nil) = %q, want \"unknown\" — the failure mode this "+
+			"guard describes is not the one the code has", got)
+	}
+}
+
+// TestNixVersionDetectorCanFire is the positive control: fed a flake that does
+// NOT inject, the detector must say so, and fed one that does, it must not.
+func TestNixVersionDetectorCanFire(t *testing.T) {
+	const without = `{
+  outputs = { self, nixpkgs }: {
+    packages.default = pkgs.buildGoModule {
+      pname = "comic-flex";
+      vendorHash = null;
+      env.CGO_ENABLED = 1;
+    };
+  };
+}`
+	if nixInjectsVersion(without) {
+		t.Error("the detector claims a flake with no ldflags injects a version — it cannot " +
+			"observe the hazard, so its verdict on the real flake.nix means nothing")
+	}
+	const with = `{
+  outputs = { self, nixpkgs }: {
+    packages.default = pkgs.buildGoModule {
+      ldflags = [ "-X main.injectedVersion=${revision}" ];
+    };
+  };
+}`
+	if !nixInjectsVersion(with) {
+		t.Error("the detector did not recognise an ldflags injection it should accept")
+	}
+	// And a near-miss: injecting some OTHER symbol must not count.
+	const wrongSymbol = `ldflags = [ "-X main.buildDate=${revision}" ];`
+	if nixInjectsVersion(wrongSymbol) {
+		t.Error("the detector accepted an ldflags line that sets a different symbol — it is " +
+			"matching on \"ldflags\" rather than on what gets injected")
+	}
+}
+
+// nixInjectsVersion reports whether src links a value into main.injectedVersion.
+func nixInjectsVersion(src string) bool {
+	return strings.Contains(src, "-X main.injectedVersion=")
 }

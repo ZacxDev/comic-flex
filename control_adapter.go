@@ -10,8 +10,17 @@ import (
 	"github.com/gotk3/gotk3/glib"
 )
 
-// This file is the GTK side of the control API: the ONLY place that knows both
-// about glib and about internal/control.
+// This file is the GTK side of the control API: the ONLY file in package main
+// that names internal/control.
+//
+// 🔴 That was FALSE for one round and is true again. Round 1 added
+// `control.DefaultAddr` to main.go, which already imports gtk/gdk/glib, so the
+// claim this comment makes was broken by the same commit that wrote it and
+// nothing failed. The fix is the deterministic one rather than a reworded
+// comment: controlAddr below re-exports the constant, main.go passes THAT, and
+// package main's dependency on internal/control is back to this one file.
+// TestOnlyTheAdapterImportsTheControlPackage enforces it — the invariant now
+// has a guard instead of a sentence.
 //
 // internal/control deliberately imports neither gotk3 nor glib — that is
 // asserted by TestControlPackageDependenciesIncludeNoGTK in
@@ -19,6 +28,14 @@ import (
 // transitive dependency set — because gotk3 is cgo-bound to GTK3, needs a
 // GTK3 + X11 toolchain, and cannot be cross-compiled. Keeping the endpoint
 // surface free of it means every handler is unit-testable with no display.
+
+// controlAddr is the address main binds the control API to.
+//
+// It exists so main.go does not have to name internal/control for the one
+// constant it needs. That is not cosmetic: main.go imports gtk, gdk and glib, so
+// a reference from there is exactly the layering this file's header claims does
+// not exist, and round 1 introduced one.
+const controlAddr = control.DefaultAddr
 
 // idleOnce schedules fn to run once on the GTK main loop, at the ordinary idle
 // priority.
@@ -59,7 +76,9 @@ type gtkViewer struct{ iv *ImageViewer }
 var _ control.Viewer = gtkViewer{}
 
 // Enqueue schedules fn on the GTK main loop, or refuses when the loop already
-// has maxQueuedMutations closures outstanding. See enqueueBounded in state.go.
+// has maxQueuedMutations MUTATION closures outstanding. See enqueueBounded in
+// state.go — and note the cap's stated scope there: Rescan does not come through
+// here, and the scan-completion closure is bounded by maxConcurrentScans.
 func (g gtkViewer) Enqueue(fn func()) bool { return g.iv.enqueueBounded(idleOnce, fn) }
 
 func (g gtkViewer) Snapshot() control.Snapshot {
@@ -117,7 +136,10 @@ func (g gtkViewer) SetInterval(seconds int) {
 	g.iv.setSlideInterval(uint(seconds))
 }
 
-func (g gtkViewer) Rescan() { g.iv.scanImagesAsync() }
+// Rescan starts a bucket listing, or refuses when maxConcurrentScans are
+// already running. Unlike every other write here it runs on the HTTP handler
+// goroutine — see the Viewer.Rescan contract and maxConcurrentScans in state.go.
+func (g gtkViewer) Rescan() bool { return g.iv.scanImagesAsync() }
 
 // toControlViewMode maps the internal enum to the wire value.
 func toControlViewMode(m ViewMode) control.ViewMode {

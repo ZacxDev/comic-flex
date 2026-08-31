@@ -126,7 +126,9 @@ func TestSnapshotIsOneConsistentRead(t *testing.T) {
 	iv := newControlTestViewer(37, "a/1.jpg", "b/2.jpg", "c/3.jpg")
 	iv.setViewModeState(ViewLandscapeTwo)
 	iv.setPausedState(true)
-	iv.beginScan()
+	if !iv.tryBeginScan() {
+		t.Fatal("tryBeginScan refused on an idle viewer")
+	}
 	if !iv.gotoKey("b/2.jpg") {
 		t.Fatal("gotoKey failed")
 	}
@@ -151,7 +153,9 @@ func TestSnapshotIsOneConsistentRead(t *testing.T) {
 func TestSnapshotOfAnUnscannedGalleryIsNotAnEmptyOne(t *testing.T) {
 	iv := newControlTestViewer(30)
 
-	iv.beginScan()
+	if !iv.tryBeginScan() {
+		t.Fatal("tryBeginScan refused on an idle viewer")
+	}
 	before := iv.snapshot()
 	if before.total != 0 || !before.scanning {
 		t.Fatalf("mid-scan snapshot = %+v, want total 0 and scanning true", before)
@@ -258,7 +262,9 @@ func TestAdapterSnapshotMapsEveryField(t *testing.T) {
 	iv := newControlTestViewer(37, "a/1.jpg", "b/2.jpg", "c/3.jpg")
 	iv.setViewModeState(ViewPortraitSingle)
 	iv.setPausedState(true)
-	iv.beginScan()
+	if !iv.tryBeginScan() {
+		t.Fatal("tryBeginScan refused on an idle viewer")
+	}
 	if !iv.gotoKey("c/3.jpg") {
 		t.Fatal("gotoKey failed")
 	}

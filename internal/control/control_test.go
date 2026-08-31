@@ -136,7 +136,10 @@ func TestMutationsAccept202WithoutRunningTheWork(t *testing.T) {
 		{"goto key", "/api/goto", `{"key":"c/3.jpg"}`, "GotoKey:c/3.jpg@2"},
 		{"goto index", "/api/goto", `{"index":1}`, "GotoIndex:1"},
 		{"interval", "/api/interval", `{"seconds":45}`, "SetInterval:45"},
-		{"rescan", "/api/rescan", "", "Rescan"},
+		// POST /api/rescan is deliberately NOT here: it is not an enqueued
+		// mutation. TestRescanStartsTheListingWithoutEnqueueingIt covers it, and
+		// TestEveryAcceptedMutationIsCoveredByOneAdmissionTest asserts the two
+		// sets partition the 202 endpoints so a new one cannot land in neither.
 	}
 
 	for _, tc := range cases {

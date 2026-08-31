@@ -113,6 +113,23 @@ type Viewer interface {
 	// SetInterval sets the slide interval in seconds; it takes effect on the
 	// next tick without restarting the timer.
 	SetInterval(seconds int)
-	// Rescan re-lists the bucket. The gallery swap must clamp currentIndex.
-	Rescan()
+	// Rescan starts a bucket listing in the background and reports whether one
+	// was STARTED. It reports false, having started nothing, when the
+	// implementation already has as many listings in flight as it allows, and
+	// the handler then answers 503 rather than 202.
+	//
+	// 🔴 Rescan is the one write that is NOT an R1 method: it is called
+	// synchronously on the HTTP handler goroutine, never from inside an Enqueue
+	// closure. That is not an inconsistency, it is the fix for one. Routing it
+	// through Enqueue bounded the wrong thing — the closure returns in
+	// microseconds because the listing is spawned onto its own goroutine, so the
+	// queue slot was freed immediately and 500 concurrent listings were admitted
+	// with zero refusals (measured; see maxConcurrentScans in the adapter). The
+	// admission decision has to be made while the caller is still there to be
+	// told, so it is made here.
+	//
+	// The implementation must therefore be safe to call off the GTK thread, must
+	// not block on the listing, and must clamp currentIndex when it swaps the
+	// gallery in.
+	Rescan() (started bool)
 }

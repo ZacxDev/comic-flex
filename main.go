@@ -20,7 +20,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ZacxDev/comic-flex/internal/control"
 	"github.com/gotk3/gotk3/gdk"
 	"github.com/gotk3/gotk3/glib"
 	"github.com/gotk3/gotk3/gtk"
@@ -273,7 +272,21 @@ var injectedVersion string
 // would have gone on reporting 0.2.0 for every subsequent deploy that nobody
 // remembered to hand-edit, which is worse than reporting nothing. resolveVersion
 // prefers the link-time value and otherwise derives one from the commit the
-// binary was built from, so an un-edited build still identifies itself.
+// binary was built from.
+//
+// 🔴 SCOPE, corrected. This comment used to end "so an un-edited build still
+// identifies itself", full stop. That holds for a `go build` in a git clone —
+// which is how the Pi builds — and it did NOT hold for the repo's own
+// `nix build .#default`: buildGoModule copies the source into /nix/store with
+// no .git, so -buildvcs=auto stamps nothing, the VCS branch below finds no
+// revision, and this resolves to "unknown". Nothing caught it, because
+// TestVersionIsNotEmpty passes on "unknown" — it is not empty.
+//
+// The fix is in flake.nix, which now injects `-X main.injectedVersion=<rev>`,
+// so the FIRST branch of resolveVersion answers for a nix build and the VCS
+// branch answers for a plain clone. Both paths now identify the binary; if you
+// add a third build path, give it one of the two or it lands on "unknown"
+// silently.
 var version = resolveVersion(injectedVersion, buildSettings())
 
 // buildSettings returns the toolchain's VCS stamp, or nil when there is none
@@ -408,17 +421,32 @@ func NewImageViewer(config *Config, store ImageStore) (*ImageViewer, error) {
 	}, nil
 }
 
-func (iv *ImageViewer) scanImagesAsync() {
+// scanImagesAsync starts a bucket listing in the background and reports whether
+// one was started. It returns false, having started nothing, when
+// maxConcurrentScans listings are already in flight.
+//
+// 🔴 The bool is the ADMISSION DECISION for POST /api/rescan, and it is answered
+// SYNCHRONOUSLY on the caller's goroutine. That is why the handler does not
+// enqueue this onto the GTK main loop: nothing here touches a widget (the
+// goroutine's only GTK contact is the idleOnce below, which is exactly how a
+// non-GTK thread is supposed to reach the loop), and routing it through
+// enqueueBounded made the queue cap LOOK like it bounded rescans while the
+// closure completed in microseconds and the listing it spawned ran free. See
+// maxConcurrentScans in state.go for the measurement.
+func (iv *ImageViewer) scanImagesAsync() bool {
 	// Counted synchronously, before the goroutine starts. Counting it inside the
 	// goroutine would leave a window in which GET /api/state reports
 	// scanning:false with total 0 — the "no comics" answer — for a gallery that
 	// is about to be listed.
 	//
-	// 🔴 beginScan/endScan are a COUNTER. Two listings genuinely overlap here:
+	// 🔴 tryBeginScan/endScan are a COUNTER. Two listings genuinely overlap here:
 	// POST /api/rescan can arrive during the startup scan, or twice in a row.
 	// A boolean flag let whichever goroutine returned first clear it while the
 	// other was still listing.
-	iv.beginScan()
+	if !iv.tryBeginScan() {
+		log.Printf("rescan refused: %d bucket listings already in flight", maxConcurrentScans)
+		return false
+	}
 
 	go func() {
 		defer iv.endScan()
@@ -440,10 +468,15 @@ func (iv *ImageViewer) scanImagesAsync() {
 
 		// Update the first image if none is showing. idleOnce is the program's
 		// single glib.IdleAdd call site — see control_adapter.go.
+		// 🔴 This idleOnce is OUTSIDE enqueueBounded's accounting, deliberately
+		// and unavoidably — the listing goroutine has no HTTP response left to
+		// refuse with. It is bounded instead by maxConcurrentScans: at most one
+		// of these per admitted listing. maxQueuedMutations' comment names it.
 		idleOnce(func() {
 			iv.onScanComplete(iv.updateImage)
 		})
 	}()
+	return true
 }
 
 func (iv *ImageViewer) updateImage() {
@@ -847,12 +880,23 @@ func (iv *ImageViewer) startSlideshow() {
 // installSignalHandler turns SIGINT/SIGTERM into a GTK main-loop quit, and a
 // SECOND one into an immediate exit.
 //
-// 🔴 The second half is the load-bearing one. Reading the channel ONCE and
-// returning — which is what this was — leaves a second SIGTERM buffered in the
-// channel and never acted on, so the process becomes UNSIGNALLABLE: the only
-// thing that can still stop it is SIGKILL. `systemctl stop` then waits out
-// TimeoutStopSec (90 s by default) on every stop and restart, which is exactly
-// the combination the deploy notes ask for with Restart=always.
+// 🔴 CORRECTED — the round-1 justification for the loop was FALSE, and it is
+// recorded here rather than deleted because a maintainer who read it came away
+// believing every `systemctl stop` was taking 90 s. It claimed that reading the
+// channel once left the process unsignallable, so "systemctl stop then waits out
+// TimeoutStopSec (90 s) on every stop and every restart". That could not happen:
+// the read-once handler DID act on the first signal, and systemd sends exactly
+// one SIGTERM and then SIGKILLs at the timeout — it never re-sends. One signal
+// was always enough for the ordinary stop, before this loop and after it.
+//
+// What the loop actually buys, which is smaller but real: a SECOND signal can
+// force an exit. Reading once and returning leaves signal.Notify still delivering
+// into a channel nobody reads, so every later SIGINT/SIGTERM is buffered and
+// dropped. That matters exactly when the graceful quit does NOT complete — the
+// GTK loop still inside a 30 s S3 GET, or wedged — because the operator's second
+// Ctrl-C or second `kill` is then the only thing short of SIGKILL that stops it.
+// Under systemd it changes nothing about the normal stop; under a human at a
+// terminal it is the difference between "press it again" and "find the PID".
 //
 // quit is SCHEDULED rather than called, so this returns immediately and the loop
 // is always ready for the next signal. hardExit is os.Exit in production and is
@@ -932,7 +976,7 @@ func main() {
 	// there is no new supervision object and the existing unit restarts both
 	// together. It returns nil, having logged why, if the token precondition
 	// fails; the slideshow then runs with no control surface at all.
-	ctrl := startControlAPI(viewer, control.DefaultAddr)
+	ctrl := startControlAPI(viewer, controlAddr)
 
 	// There was no signal handling here at all. gtk.MainQuit() is what returns
 	// from gtk.Main(), so a SIGTERM has to be turned into one — and it must be

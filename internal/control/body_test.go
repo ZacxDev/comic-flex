@@ -132,11 +132,62 @@ func TestTrailingJSONIsRefused(t *testing.T) {
 // stand on. The property that matters is not that a request is dropped — it is
 // that the client is TOLD: a 202 for work that was never scheduled is the same
 // lie as the discarded second JSON object above.
-func TestAFullQueueIs503NotAFalse202(t *testing.T) {
-	// Every mutation endpoint, so a handler that replies without going through
-	// Server.enqueue is visible.
+// enqueuedMutationPaths is every 202 endpoint whose admission goes through
+// Server.enqueue, i.e. the GTK work queue. scanAdmittedPaths is every 202
+// endpoint admitted by the concurrent-scan bound instead.
+//
+// 🔴 They are asserted to PARTITION the 202 endpoints by
+// TestEveryAcceptedMutationIsCoveredByOneAdmissionTest. Without that, a ninth
+// mutation endpoint added tomorrow lands in neither list and is never driven
+// against a full queue at all — the round-1 shape exactly: a ledger that catches
+// removal and not growth.
+var (
+	enqueuedMutationPaths = []string{
+		"/api/next", "/api/prev", "/api/pause", "/api/resume",
+		"/api/viewmode", "/api/goto", "/api/interval",
+	}
+	scanAdmittedPaths = []string{"/api/rescan"}
+)
+
+func TestEveryAcceptedMutationIsCoveredByOneAdmissionTest(t *testing.T) {
+	covered := map[string]int{}
+	for _, p := range enqueuedMutationPaths {
+		covered[p]++
+	}
+	for _, p := range scanAdmittedPaths {
+		covered[p]++
+	}
+
+	seen := map[string]bool{}
 	for _, rt := range authedRoutes {
 		if rt.wantOK != http.StatusAccepted {
+			continue
+		}
+		seen[rt.path] = true
+		switch covered[rt.path] {
+		case 1: // exactly one admission test drives it
+		case 0:
+			t.Errorf("%s answers 202 but appears in NEITHER enqueuedMutationPaths nor "+
+				"scanAdmittedPaths, so nothing drives it against a full queue. It can answer "+
+				"202 for work that was refused and no test would see it.", rt.path)
+		default:
+			t.Errorf("%s appears in BOTH admission lists; they are meant to partition the 202 "+
+				"endpoints, and one of the two tests is asserting the wrong contract for it", rt.path)
+		}
+	}
+	for p := range covered {
+		if !seen[p] {
+			t.Errorf("%s is listed as an admission-tested mutation but no longer answers 202 in "+
+				"authedRoutes — this list is stale and the coverage it claims is imaginary", p)
+		}
+	}
+}
+
+func TestAFullQueueIs503NotAFalse202(t *testing.T) {
+	// Every enqueued mutation endpoint, so a handler that replies without going
+	// through Server.enqueue is visible.
+	for _, rt := range authedRoutes {
+		if rt.wantOK != http.StatusAccepted || !containsString(enqueuedMutationPaths, rt.path) {
 			continue
 		}
 		t.Run(rt.method+" "+rt.path, func(t *testing.T) {
@@ -181,6 +232,123 @@ func TestAFullQueueIs503NotAFalse202(t *testing.T) {
 					"permanent wall rather than backpressure", rt.method, rt.path, w.Code)
 			}
 		})
+	}
+}
+
+func containsString(haystack []string, want string) bool {
+	for _, s := range haystack {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestRescanStartsTheListingWithoutEnqueueingIt pins what POST /api/rescan
+// actually is: a synchronous admission decision, not a queued mutation.
+//
+// 🔴 Round-1 it WAS a queued mutation, and that is precisely why it was the only
+// unbounded endpoint of the nine: the closure spawns the listing onto its own
+// goroutine and returns in microseconds, so the queue slot it took was free
+// again before the next request arrived. Driving the real enqueueBounded plus
+// the real adapter 500 times measured
+// `attempts=500 refused(503)=0 queueDepth=0 scansInFlight=500`.
+func TestRescanStartsTheListingWithoutEnqueueingIt(t *testing.T) {
+	f := newFakeViewer("a/1.jpg")
+	s := newTestServer(t, f)
+
+	w := do(t, s, "POST", "/api/rescan", "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("POST /api/rescan -> %d, want 202 (body %s)", w.Code, w.Body.String())
+	}
+	// The listing was STARTED, synchronously, before the handler answered...
+	if got := f.callLog(); len(got) != 1 || got[0] != "Rescan" {
+		t.Fatalf("calls = %v, want exactly [Rescan] — the listing must be admitted while the "+
+			"caller is still there to be told 503, not deferred to the GTK loop", got)
+	}
+	// ...and NOTHING was put on the GTK main loop's queue. A closure here means
+	// the admission decision has been moved back behind the queue, where the
+	// bound cannot see the work it is supposed to bound.
+	if n := f.pendingCount(); n != 0 {
+		t.Fatalf("POST /api/rescan enqueued %d closures on the GTK loop; it must enqueue none — "+
+			"a rescan routed through Enqueue frees its slot in microseconds and the cap becomes "+
+			"decorative", n)
+	}
+}
+
+// TestAFullScanBudgetIs503NotAFalse202 is the rescan half of the 503 contract:
+// the same "the client is TOLD" property, against the bound that actually
+// governs rescans.
+func TestAFullScanBudgetIs503NotAFalse202(t *testing.T) {
+	for _, path := range scanAdmittedPaths {
+		t.Run("POST "+path, func(t *testing.T) {
+			f := newFakeViewer("a/1.jpg")
+			f.scanCapacity = 2 // small, and not the real cap: this is the handler's contract
+			s := newTestServer(t, f)
+
+			for i := 0; i < f.scanCapacity; i++ {
+				if w := do(t, s, "POST", path, ""); w.Code != http.StatusAccepted {
+					t.Fatalf("request %d of %d -> %d, want 202", i+1, f.scanCapacity, w.Code)
+				}
+			}
+
+			w := do(t, s, "POST", path, "")
+			if w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("POST %s with the scan budget full -> %d, want 503. The handler answers "+
+					"202 for a listing that was never started, so the caller believes the gallery "+
+					"is being refreshed when nothing is. (body %s)", path, w.Code, w.Body.String())
+			}
+			if got := w.Header().Get("Retry-After"); got == "" {
+				t.Error("a 503 with no Retry-After — the caller is told to back off with no idea how long")
+			}
+			if ct := w.Header().Get("Content-Type"); ct != "application/json" {
+				t.Errorf("Content-Type = %q, want application/json", ct)
+			}
+			var body errorBody
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil || body.Error == "" {
+				t.Errorf("503 body = %q, want a JSON error message", w.Body.String())
+			}
+			if n := f.scansRefusedCount(); n != 1 {
+				t.Fatalf("the viewer refused %d listings, want 1", n)
+			}
+			if got := f.callLog(); len(got) != f.scanCapacity {
+				t.Fatalf("calls = %v, want %d — the refused request started a listing anyway",
+					got, f.scanCapacity)
+			}
+
+			// And it recovers: a listing finishing makes room again. A permanent
+			// wall would leave the display stuck on a stale gallery forever.
+			f.endScan()
+			if w := do(t, s, "POST", path, ""); w.Code != http.StatusAccepted {
+				t.Fatalf("after a listing finished, POST %s -> %d, want 202 — the bound is a "+
+					"permanent wall rather than backpressure", path, w.Code)
+			}
+		})
+	}
+}
+
+// TestRescanIsNotSubjectToTheGTKQueueCap is the converse of
+// TestReadsAreNotSubjectToTheQueueCap, and it pins the asymmetry the round-2
+// audit found backwards. A backlog of page turns on the GTK loop must not stop
+// an operator refreshing the gallery, and — the part that matters — a rescan
+// must not be admitted merely because the page-turn queue happens to be empty.
+func TestRescanIsNotSubjectToTheGTKQueueCap(t *testing.T) {
+	f := newFakeViewer("a/1.jpg")
+	f.capacity = 1 // the GTK queue is full after one page turn
+	s := newTestServer(t, f)
+
+	if w := do(t, s, "POST", "/api/next", ""); w.Code != http.StatusAccepted {
+		t.Fatalf("first mutation -> %d, want 202", w.Code)
+	}
+	if w := do(t, s, "POST", "/api/next", ""); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("second mutation -> %d, want 503", w.Code)
+	}
+	if w := do(t, s, "POST", "/api/rescan", ""); w.Code != http.StatusAccepted {
+		t.Fatalf("POST /api/rescan with a full GTK queue -> %d, want 202 — the rescan bound is "+
+			"the scan budget, not the page-turn queue", w.Code)
+	}
+	if n := f.refusedCount(); n != 1 {
+		t.Fatalf("Enqueue refused %d times, want 1 — the rescan went through Enqueue", n)
 	}
 }
 
