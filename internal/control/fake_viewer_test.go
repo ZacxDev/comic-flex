@@ -106,9 +106,55 @@ func (f *fakeViewer) refusedCount() int {
 	return f.refused
 }
 
-func (f *fakeViewer) Next()                  { f.record("Next") }
-func (f *fakeViewer) Prev()                  { f.record("Prev") }
-func (f *fakeViewer) SetPaused(p bool)       { f.record("SetPaused:" + boolStr(p)) }
+func (f *fakeViewer) Next() { f.record("Next") }
+func (f *fakeViewer) Prev() { f.record("Prev") }
+
+// SetPaused writes the flag as well as recording the call. The write is what
+// lets a toggle test tell an absolute write apart from a flip: without it every
+// fake is permanently un-paused and `TogglePaused` would flip the same way
+// forever, so a mutant that ignored the current value would survive.
+func (f *fakeViewer) SetPaused(p bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.snap.Paused = p
+	f.calls = append(f.calls, "SetPaused:"+boolStr(p))
+}
+
+// TogglePaused flips the flag and records the value it LANDED ON, under one
+// acquisition of the fake's mutex — the same atomicity the real viewer's
+// togglePaused provides.
+//
+// Recording the result rather than the call is what makes the direction of the
+// flip visible in callLog, so a test can assert paused -> playing and
+// playing -> paused separately instead of seeing an identical "TogglePaused"
+// for both.
+func (f *fakeViewer) TogglePaused() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.snap.Paused = !f.snap.Paused
+	f.calls = append(f.calls, "TogglePaused:"+boolStr(f.snap.Paused))
+	return f.snap.Paused
+}
+
+// setPaused replaces the flag from outside, standing in for the `p` keypress on
+// the Pi — or another queued closure — moving it AFTER a handler answered 202
+// and BEFORE the toggle closure runs. It is the fixture for the atomicity test,
+// exactly as setKeys is for goto's.
+func (f *fakeViewer) setPaused(p bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.snap.Paused = p
+}
+
+// pausedFlag reads the fake's paused flag without recording a Snapshot read, so
+// a test can check the landed state without polluting readLog — which several
+// tests assert is EMPTY.
+func (f *fakeViewer) pausedFlag() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.snap.Paused
+}
+
 func (f *fakeViewer) SetViewMode(m ViewMode) { f.record("SetViewMode:" + string(m)) }
 func (f *fakeViewer) GotoKey(k string) {
 	// Resolve first, then record: indexOf takes the same mutex record does.

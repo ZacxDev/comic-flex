@@ -141,6 +141,21 @@ func (g gtkViewer) Prev() {
 
 func (g gtkViewer) SetPaused(paused bool) { g.iv.setPausedState(paused) }
 
+// TogglePaused flips the paused flag and reports what it landed on.
+//
+// 🔴 It delegates to iv.togglePaused, which is the SAME primitive the `p`
+// keypress in main.go uses, and that is deliberate: one rule, one place. The
+// keypress and POST /api/toggle mean exactly the same thing — "the other one" —
+// and a second implementation here would be a second chance to get the flip
+// wrong, in a code path only one of the two callers exercises.
+//
+// togglePaused reads and writes under a single write-lock acquisition, so the
+// flip is atomic against the keypress handler and against any other queued
+// mutation. Nothing here renders: the flag is read by the slide timer on its
+// next tick, exactly as SetPaused's is, so there is no widget to touch and no
+// updateImage() to add by symmetry with Next/Prev.
+func (g gtkViewer) TogglePaused() bool { return g.iv.togglePaused() }
+
 func (g gtkViewer) SetViewMode(mode control.ViewMode) {
 	// setViewMode does the whole live switch, including the two blocking xrandr
 	// calls — which is precisely why this runs on the GTK thread behind a 202
