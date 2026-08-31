@@ -67,9 +67,26 @@ func idleHigh(fn func()) {
 
 // gtkViewer adapts *ImageViewer to control.Viewer.
 //
-// Reads (Snapshot, Resolve) run on the handler goroutine and take only the read
-// lock. Everything else is called from inside an idleOnce closure, i.e. on the
-// GTK thread, and may render.
+// THREE kinds of method, not two, and the third is the one to read before
+// editing anything here:
+//
+//	Snapshot, Resolve — reads. They run on the HTTP handler goroutine and take
+//	                    only the read lock. They must not render.
+//	Rescan            — 🔴 ALSO RUNS ON THE HTTP HANDLER GOROUTINE, and it is a
+//	                    WRITE. See its own doc below for why. It must not render
+//	                    either, and nothing it calls may reach a widget.
+//	everything else   — called from inside an idleOnce closure, i.e. on the GTK
+//	                    thread, and may render.
+//
+// 🔴 This comment used to say "everything else is called from inside an idleOnce
+// closure … and may render", full stop, with Rescan's exception stated 70 lines
+// further down. That is the belief that makes the obvious mistake here look
+// safe: Next, Prev, GotoKey and GotoIndex all call updateImage() after their
+// state change, so adding the same line to Rescan is what the four neighbours
+// do — and it was measured at 250 PASS / 0 FAIL / 0 races under -race, because
+// every test viewer's LoadImage errors out before the widget calls.
+// TestNothingOffTheGTKThreadCanReachAWidget is the guard; the comment is no
+// longer the only thing holding it.
 type gtkViewer struct{ iv *ImageViewer }
 
 // Compile-time proof that the adapter satisfies the port.
@@ -136,9 +153,14 @@ func (g gtkViewer) SetInterval(seconds int) {
 	g.iv.setSlideInterval(uint(seconds))
 }
 
-// Rescan starts a bucket listing, or refuses when maxConcurrentScans are
-// already running. Unlike every other write here it runs on the HTTP handler
+// Rescan starts a bucket listing, or refuses when maxConcurrentScans scans are
+// already outstanding. Unlike every other write here it runs on the HTTP handler
 // goroutine — see the Viewer.Rescan contract and maxConcurrentScans in state.go.
+//
+// 🔴 So it MUST NOT RENDER, and neither may anything it calls. Do not add
+// `g.iv.updateImage()` here by symmetry with Next/Prev/GotoKey/GotoIndex: those
+// four run inside an Enqueue closure on the GTK thread and this does not.
+// TestNothingOffTheGTKThreadCanReachAWidget fails if it ever can.
 func (g gtkViewer) Rescan() bool { return g.iv.scanImagesAsync() }
 
 // toControlViewMode maps the internal enum to the wire value.

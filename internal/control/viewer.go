@@ -115,8 +115,14 @@ type Viewer interface {
 	SetInterval(seconds int)
 	// Rescan starts a bucket listing in the background and reports whether one
 	// was STARTED. It reports false, having started nothing, when the
-	// implementation already has as many listings in flight as it allows, and
+	// implementation already has as many scans outstanding as it allows, and
 	// the handler then answers 503 rather than 202.
+	//
+	// 🔴 "Outstanding" spans more than the listing: the implementation must not
+	// treat a scan as finished until the work it hands to the display has RUN.
+	// The comic-flex implementation released its slot as soon as the completion
+	// callback was SCHEDULED, and 40 sequential rescans then left 40 callbacks
+	// queued on the GTK main loop — bounded listings, unbounded callbacks.
 	//
 	// 🔴 Rescan is the one write that is NOT an R1 method: it is called
 	// synchronously on the HTTP handler goroutine, never from inside an Enqueue

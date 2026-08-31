@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -404,6 +406,36 @@ func installSignalHandler(sigCh <-chan os.Signal, quit func(), hardExit func(int
 	if !got["scheduleQuit"] || got["idleOnce"] {
 		t.Errorf("the scanner misjudged correct source: %v", got)
 	}
+
+	// 🔴 The form scanImagesAsync uses: the scheduler is never CALLED here, it is
+	// handed to a helper. A scanner that only records callee identifiers reports
+	// the empty set for this, which reads exactly like "schedules nothing".
+	const handedOn = `package main
+
+func scanImagesAsync() bool {
+	return scanImagesAsyncVia(idleOnce)
+}
+`
+	got = scanSchedulerCallsSource(t, "handedon.go", handedOn, "scanImagesAsync")
+	if !got["idleOnce"] {
+		t.Error("the scanner did NOT see idleOnce passed as a value to scanImagesAsyncVia — it " +
+			"cannot tell that form apart from `scanImagesAsyncVia(runInline)`, which would run " +
+			"the rendering completion closure straight on the listing goroutine")
+	}
+	if got["idleHigh"] {
+		t.Error("the scanner reported idleHigh in source that neither calls nor passes it")
+	}
+
+	const handedOnWrong = `package main
+
+func scanImagesAsync() bool {
+	return scanImagesAsyncVia(idleHigh)
+}
+`
+	got = scanSchedulerCallsSource(t, "handedonwrong.go", handedOnWrong, "scanImagesAsync")
+	if !got["idleHigh"] || got["idleOnce"] {
+		t.Errorf("the scanner misjudged a handed-on idleHigh: %v", got)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -478,7 +510,15 @@ func TestOnlyTheAdapterImportsTheControlPackage(t *testing.T) {
 	}
 }
 
-// scanSchedulerCalls reports which scheduling functions the named function calls.
+// scanSchedulerCalls reports which scheduling functions the named function
+// CALLS or HANDS ON as a value.
+//
+// 🔴 Both, not just calls. `scanImagesAsyncVia(idleOnce)` schedules through
+// idleOnce without ever containing a call to it, and the round-2 version of this
+// scanner recorded only `call.Fun.(*ast.Ident)` — so it would have reported an
+// empty set for the very function whose scheduler it exists to identify, and
+// `scanImagesAsyncVia(runInline)` would have read exactly the same. The widening
+// is free for the existing caller: installSignalHandler passes neither.
 func scanSchedulerCalls(t *testing.T, path, fnName string) map[string]bool {
 	t.Helper()
 	src, err := os.ReadFile(path)
@@ -512,6 +552,13 @@ func scanSchedulerCallsSource(t *testing.T, filename, src, fnName string) map[st
 		}
 		if id, ok := call.Fun.(*ast.Ident); ok {
 			out[id.Name] = true
+		}
+		// A scheduler handed on as a VALUE schedules just as effectively as one
+		// that is called here.
+		for _, arg := range call.Args {
+			if id, ok := arg.(*ast.Ident); ok {
+				out[id.Name] = true
+			}
 		}
 		return true
 	})
@@ -609,11 +656,12 @@ func TestScanningIsACountNotAFlag(t *testing.T) {
 	}
 
 	// Release ONE. The other is still listing, so scanning must stay true.
+	//
+	// 🔴 The slot comes back only when the completion closure that listing
+	// scheduled has RUN, not when ListImages returned — see scanImagesAsyncVia —
+	// so the main context has to be iterated for the count to move at all.
 	store.release <- struct{}{}
-	deadline := time.Now().Add(3 * time.Second)
-	for iv.scanCount() > 1 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
+	waitScanCount(t, iv, 1)
 	if n := iv.scanCount(); n != 1 {
 		t.Fatalf("after one of two listings finished, scansInFlight = %d, want 1", n)
 	}
@@ -629,10 +677,7 @@ func TestScanningIsACountNotAFlag(t *testing.T) {
 
 	// Release the second: now it is genuinely over.
 	store.release <- struct{}{}
-	deadline = time.Now().Add(3 * time.Second)
-	for iv.isScanning() && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
+	waitScanCount(t, iv, 0)
 	if iv.isScanning() {
 		t.Fatal("both listings finished and scanning is still true — the counter never " +
 			"returns to zero, so a client renders 'indexing…' forever")
@@ -716,26 +761,346 @@ func TestConcurrentRescansAreBounded(t *testing.T) {
 			"slot, because that slot is freed in microseconds and bounds nothing", n, attempts)
 	}
 
-	// Release the admitted listings and prove the budget recovers, or the
-	// display is stuck on a stale gallery forever after four rescans.
+	// Release the admitted listings. Every ListImages has now returned.
 	for i := 0; i < started; i++ {
 		store.release <- struct{}{}
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for iv.scanCount() > 0 && time.Now().Before(deadline) {
+
+	// 🔴 The budget must NOT come back yet, and this is the round-3 finding on
+	// the REAL (idleOnce) path rather than through a stand-in scheduler. Until
+	// round 3 the goroutine's `defer iv.endScan()` returned the slot here — a
+	// scan whose completion closure had merely been SCHEDULED counted as over —
+	// so 40 sequential rescans left 40 closures queued on the main context, each
+	// one an updateImage and a permanent gotk3 callback-registry entry.
+	//
+	// A window rather than one sample: at 99a9dca the listing goroutines finish
+	// in microseconds, so a single check could pass on timing alone.
+	hold := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(hold) {
+		if n := iv.scanCount(); n != maxConcurrentScans {
+			t.Fatalf("scansInFlight fell to %d with every listing finished but NO completion "+
+				"closure run. The slot is being returned when the closure is SCHEDULED rather "+
+				"than when it RUNS, so maxConcurrentScans bounds concurrent listings and bounds "+
+				"nothing about the closures they queue onto the GTK main loop.", n)
+		}
 		time.Sleep(time.Millisecond)
 	}
+
+	// Now run them, and prove the budget recovers — or the display is stuck on a
+	// stale gallery forever after four rescans.
+	waitScanCount(t, iv, 0)
 	if n := iv.scanCount(); n != 0 {
-		t.Fatalf("scansInFlight = %d after every listing returned, want 0", n)
+		t.Fatalf("scansInFlight = %d after every listing returned and the main context was "+
+			"drained, want 0", n)
 	}
 	if !g.Rescan() {
 		t.Fatal("a rescan was refused after every listing finished — the bound is a permanent " +
 			"wall rather than backpressure")
 	}
 	store.release <- struct{}{}
-	deadline = time.Now().Add(5 * time.Second)
-	for iv.scanCount() > 0 && time.Now().Before(deadline) {
+	waitScanCount(t, iv, 0)
+}
+
+// waitScanCount iterates the GTK main context — running any scan-completion
+// closures it holds — until scansInFlight reaches want, or the deadline passes.
+//
+// It deliberately does NOT assert. The caller's own check is the one carrying
+// the diagnosis, and a helper that fataled here would replace it.
+func waitScanCount(t *testing.T, iv *ImageViewer, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for iv.scanCount() != want && time.Now().Before(deadline) {
+		drainMainContext(t)
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// instantStore lists immediately and serves no images.
+type instantStore struct{ images []string }
+
+func (s *instantStore) ListImages() ([]string, error) {
+	out := make([]string, len(s.images))
+	copy(out, s.images)
+	return out, nil
+}
+
+func (s *instantStore) LoadImage(key string) (*gdk.Pixbuf, error) {
+	return nil, fmt.Errorf("instantStore serves no images (%s)", key)
+}
+
+// TestTheScanSlotIsHeldUntilTheCompletionClosureRuns is the round-3 regression
+// test: maxConcurrentScans must bound OUTSTANDING SCANS, and a scan is not over
+// when its completion closure has been scheduled — it is over when that closure
+// has run.
+//
+// 🔴 Measured at 99a9dca, where `defer iv.endScan()` sat in the listing
+// goroutine: 40 sequential admitted rescans gave `admitted=40 refused=0
+// queueDepth=0` and left 40 completion closures queued on the GTK main context
+// at once. Each of those re-enters onScanComplete -> updateImage -> LoadImage —
+// a 30 s S3 GET apiece — and holds a gotk3 callback-registry entry, which is
+// precisely the growth maxQueuedMutations exists to prevent and which
+// maxConcurrentScans' comment claimed to prevent here.
+//
+// It drives scanImagesAsyncVia with a stand-in scheduler for the same reason
+// TestEnqueueIsBounded does: the property is WHEN the slot comes back, and with
+// the real idleOnce that is decided by a main loop the test would have to race.
+// The real path is covered by TestConcurrentRescansAreBounded's hold window and
+// by TestScanImagesAsyncSchedulesThroughTheGTKMainLoop below.
+func TestTheScanSlotIsHeldUntilTheCompletionClosureRuns(t *testing.T) {
+	iv := newControlTestViewer(30)
+	iv.store = &instantStore{images: []string{"a.jpg", "b.jpg"}}
+
+	// The stand-in main loop: it CAPTURES closures and runs none of them.
+	var pending []func()
+	var mu sync.Mutex
+	scheduled := make(chan struct{}, 128)
+	schedule := func(fn func()) {
+		mu.Lock()
+		pending = append(pending, fn)
+		mu.Unlock()
+		scheduled <- struct{}{}
+	}
+	outstanding := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(pending)
+	}
+
+	const attempts = 40
+	admitted, refused := 0, 0
+	for i := 0; i < attempts; i++ {
+		if iv.scanImagesAsyncVia(schedule) {
+			admitted++
+			// Wait for this listing to reach the scheduler, so the count below is
+			// of closures genuinely outstanding rather than of goroutines that
+			// have not started yet.
+			waitFor(t, scheduled, "the admitted scan's completion closure to be scheduled")
+		} else {
+			refused++
+		}
+	}
+
+	if admitted+refused != attempts {
+		t.Fatalf("admitted %d + refused %d != %d attempts", admitted, refused, attempts)
+	}
+	if admitted != maxConcurrentScans {
+		t.Fatalf("%d of %d rescans were admitted with NO completion closure yet run; want exactly "+
+			"maxConcurrentScans (%d). The slot is being returned by the listing goroutine, so it "+
+			"comes back as soon as the closure is SCHEDULED — %d closures are queued on the GTK "+
+			"main loop at once, each one an updateImage and a permanent gotk3 callback-registry "+
+			"entry, which is the growth this bound exists to prevent.",
+			admitted, attempts, maxConcurrentScans, outstanding())
+	}
+	if n := outstanding(); n != maxConcurrentScans {
+		t.Fatalf("%d completion closures outstanding, want %d", n, maxConcurrentScans)
+	}
+	if n := iv.scanCount(); n != maxConcurrentScans {
+		t.Fatalf("scansInFlight = %d while %d closures are outstanding, want %d",
+			n, outstanding(), maxConcurrentScans)
+	}
+	if n := iv.queueDepth(); n != 0 {
+		t.Fatalf("queueDepth = %d; a rescan must not consume a GTK MUTATION slot — that slot is "+
+			"freed in microseconds and bounds nothing", n)
+	}
+
+	// Running the closures gives the budget back, one slot per closure. A bound
+	// that never recovers is worse than no bound.
+	mu.Lock()
+	queued := pending
+	pending = nil
+	mu.Unlock()
+	for i, fn := range queued {
+		fn()
+		if n := iv.scanCount(); n != maxConcurrentScans-1-i {
+			t.Fatalf("after running %d of %d completion closures scansInFlight = %d, want %d",
+				i+1, len(queued), n, maxConcurrentScans-1-i)
+		}
+	}
+	if !iv.scanImagesAsyncVia(schedule) {
+		t.Fatal("a rescan was refused after every completion closure ran — the bound is a " +
+			"permanent wall rather than backpressure, and the display can never be rescanned again")
+	}
+	waitFor(t, scheduled, "the recovery scan's completion closure to be scheduled")
+}
+
+// TestAFailedListingReturnsItsScanSlot: the completion closure is only scheduled
+// on the success path, so the error path has to return the slot itself. Four
+// failed listings must not exhaust the budget permanently.
+func TestAFailedListingReturnsItsScanSlot(t *testing.T) {
+	iv := newControlTestViewer(30)
+	iv.store = failingStore{}
+
+	schedule := func(fn func()) {
+		t.Error("a listing that FAILED scheduled a completion closure; it has nothing to show")
+	}
+	for i := 0; i < maxConcurrentScans+2; i++ {
+		if !iv.scanImagesAsyncVia(schedule) {
+			t.Fatalf("rescan %d of %d was refused. A listing that returns an error schedules no "+
+				"closure, so if the slot is only released inside that closure the budget is gone "+
+				"for good after %d MinIO errors — every later POST /api/rescan answers 503 and the "+
+				"display is stuck on whatever it last showed.",
+				i+1, maxConcurrentScans+2, maxConcurrentScans)
+		}
+		waitScanCount(t, iv, 0)
+		if n := iv.scanCount(); n != 0 {
+			t.Fatalf("scansInFlight = %d after a failed listing, want 0", n)
+		}
+	}
+}
+
+type failingStore struct{}
+
+func (failingStore) ListImages() ([]string, error) { return nil, fmt.Errorf("MinIO is unreachable") }
+func (failingStore) LoadImage(key string) (*gdk.Pixbuf, error) {
+	return nil, fmt.Errorf("MinIO is unreachable (%s)", key)
+}
+
+// TestScanImagesAsyncSchedulesThroughTheGTKMainLoop closes the seam the stand-in
+// scheduler above opens: scanImagesAsyncVia is only correct for production if
+// the production entry point hands it the REAL main-loop scheduler.
+//
+// `scanImagesAsyncVia(inline)`, where inline runs the closure immediately, would
+// pass every behavioural test in this file and would run updateImage — a
+// window.GetSize() and an image.SetFromPixbuf() — on the listing goroutine.
+func TestScanImagesAsyncSchedulesThroughTheGTKMainLoop(t *testing.T) {
+	got := scanSchedulerCalls(t, "main.go", "scanImagesAsync")
+	if !got["idleOnce"] {
+		t.Error("scanImagesAsync neither calls nor passes idleOnce. Whatever it schedules the " +
+			"scan-completion closure with, it is not the program's single glib.IdleAdd call site, " +
+			"so the closure — which renders — may run off the GTK main thread.")
+	}
+	if got["idleHigh"] {
+		t.Error("scanImagesAsync schedules through idleHigh (G_PRIORITY_HIGH). That is the " +
+			"shutdown priority: a scan completion would overtake every page turn already queued.")
+	}
+}
+
+// TestRefusalLoggingIsCoalesced pins the counting, on a fake clock so it neither
+// sleeps nor flakes.
+func TestRefusalLoggingIsCoalesced(t *testing.T) {
+	var r refusalLog
+	base := time.Unix(1700000000, 0)
+
+	if n, report := r.note(base); !report || n != 1 {
+		t.Fatalf("first refusal reported (%d, %v), want (1, true) — the first one must always be "+
+			"visible or an operator sees nothing at all", n, report)
+	}
+	for i := 1; i <= 5; i++ {
+		if n, report := r.note(base.Add(time.Duration(i) * time.Second)); report {
+			t.Fatalf("refusal %d inside the window reported (%d, true); it must be suppressed", i, n)
+		}
+	}
+	// The window closes and the suppressed ones are accounted for, not lost.
+	n, report := r.note(base.Add(refusalLogInterval))
+	if !report {
+		t.Fatal("no refusal was reported after the window closed — refusals are now invisible " +
+			"forever, which is not coalescing, it is silence")
+	}
+	if n != 6 {
+		t.Errorf("the report after the window named %d refusals, want 6 (the 5 suppressed plus "+
+			"this one). A count that does not carry the suppressed ones hides the magnitude, "+
+			"which is the only thing the line is for.", n)
+	}
+	if n, report := r.note(base.Add(refusalLogInterval + time.Second)); report {
+		t.Errorf("the refusal right after a report was itself reported (%d) — the window did not "+
+			"restart", n)
+	}
+}
+
+// TestRefusedRescansDoNotWriteALinePerRefusal is the behavioural half: this is
+// the DoS-adjacent path, and round 2 wrote one journald line per refusal.
+//
+// 🔴 496 lines from a single run of TestConcurrentRescansAreBounded, on a
+// Raspberry Pi whose journal is on the SD card.
+func TestRefusedRescansDoNotWriteALinePerRefusal(t *testing.T) {
+	iv := newControlTestViewer(30)
+	iv.store = &instantStore{images: []string{"a.jpg"}}
+	g := gtkViewer{iv: iv}
+	t.Cleanup(func() { drainMainContext(t) })
+
+	var buf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	const attempts = 500
+	refused := 0
+	for i := 0; i < attempts; i++ {
+		if !g.Rescan() {
+			refused++
+		}
+	}
+	// Positive control on the INPUT: this test can only speak about log volume if
+	// it actually drove a lot of refusals. It is deliberately NOT expressed as
+	// attempts-maxConcurrentScans — that would couple it to WHEN the scan slot is
+	// returned, which is a different guard's job, and it would then fail here for
+	// that other reason instead.
+	if refused < 100 {
+		t.Fatalf("only %d of %d rescans were refused; this test cannot observe the log volume of "+
+			"a refusal path it never drove", refused, attempts)
+	}
+
+	lines := 0
+	for _, line := range strings.Split(buf.String(), "\n") {
+		if strings.Contains(line, "rescan refused") {
+			lines++
+		}
+	}
+	// Positive control: the first refusal MUST be logged, or a zero here would
+	// mean "the logger is wired to nothing" rather than "it is coalescing".
+	if lines == 0 {
+		t.Fatalf("%d refusals produced no log line at all. Backpressure that leaves no trace is "+
+			"indistinguishable from a display nobody is talking to.", refused)
+	}
+	if lines > 1 {
+		t.Errorf("%d refusals produced %d log lines. Refusals are caused by the CALLER, so one "+
+			"line each lets an authenticated client that merely retries convert its own "+
+			"backpressure into unbounded journald volume on a Pi.", refused, lines)
+	}
+}
+
+// TestRefusedMutationsDoNotWriteALinePerRefusal is the other half of the pair.
+//
+// 🔴 enqueueBounded's comment claims its refusal line is "symmetric with the
+// scan-refusal line"; a claim in a comment is a claim, and this is what makes it
+// checkable. Round 2 was asymmetric the other way — one line per refused rescan
+// and nothing at all here.
+func TestRefusedMutationsDoNotWriteALinePerRefusal(t *testing.T) {
+	iv := newControlTestViewer(30, "a.jpg")
+	schedule := func(fn func()) {} // never runs anything: the queue stays full
+
+	var buf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	const attempts = 500
+	refused := 0
+	for i := 0; i < attempts; i++ {
+		if !iv.enqueueBounded(schedule, func() {}) {
+			refused++
+		}
+	}
+	if refused < 100 {
+		t.Fatalf("only %d of %d enqueues were refused; this test cannot observe the log volume of "+
+			"a refusal path it never drove", refused, attempts)
+	}
+
+	lines := 0
+	for _, line := range strings.Split(buf.String(), "\n") {
+		if strings.Contains(line, "mutation refused") {
+			lines++
+		}
+	}
+	if lines == 0 {
+		t.Fatalf("%d refused mutations produced no log line at all, while a refused RESCAN "+
+			"produces one. That is the asymmetry the comment on enqueueBounded says is gone: an "+
+			"operator watching the journal sees the display refusing rescans and never sees it "+
+			"refusing page turns.", refused)
+	}
+	if lines > 1 {
+		t.Errorf("%d refused mutations produced %d log lines; the refusal log must coalesce here "+
+			"for the same reason it does for rescans", refused, lines)
 	}
 }
 

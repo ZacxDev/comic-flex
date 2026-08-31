@@ -255,6 +255,12 @@ type ImageViewer struct {
 	// queuedMutations counts control-API closures handed to the GTK main loop
 	// and not yet run. Guarded by mutex like the rest; see maxQueuedMutations.
 	queuedMutations int
+	// scanRefusals and queueRefusals coalesce the log lines the two admission
+	// points write when they refuse. They carry their OWN mutex (see refusalLog
+	// in state.go) and are deliberately not guarded by iv.mutex: a refusal must
+	// not contend for the lock every render takes.
+	scanRefusals  refusalLog
+	queueRefusals refusalLog
 }
 
 // injectedVersion is set at link time by a release build:
@@ -423,17 +429,53 @@ func NewImageViewer(config *Config, store ImageStore) (*ImageViewer, error) {
 
 // scanImagesAsync starts a bucket listing in the background and reports whether
 // one was started. It returns false, having started nothing, when
-// maxConcurrentScans listings are already in flight.
+// maxConcurrentScans scans are already outstanding.
 //
 // 🔴 The bool is the ADMISSION DECISION for POST /api/rescan, and it is answered
 // SYNCHRONOUSLY on the caller's goroutine. That is why the handler does not
 // enqueue this onto the GTK main loop: nothing here touches a widget (the
-// goroutine's only GTK contact is the idleOnce below, which is exactly how a
+// goroutine's only GTK contact is the scheduler below, which is exactly how a
 // non-GTK thread is supposed to reach the loop), and routing it through
 // enqueueBounded made the queue cap LOOK like it bounded rescans while the
 // closure completed in microseconds and the listing it spawned ran free. See
 // maxConcurrentScans in state.go for the measurement.
 func (iv *ImageViewer) scanImagesAsync() bool {
+	return iv.scanImagesAsyncVia(idleOnce)
+}
+
+// scanImagesAsyncVia is scanImagesAsync with the GTK-main-loop scheduler as a
+// parameter, exactly as enqueueBounded takes one and for the same reason: the
+// property that matters here is WHEN THE SLOT IS RETURNED, and that now happens
+// inside the scheduled closure, which no test can observe without either a
+// running GTK main loop or a stand-in scheduler.
+//
+// 🔴 THE SLOT SPANS THE WHOLE SCAN, INCLUDING THE COMPLETION CLOSURE. It used to
+// be returned by a `defer iv.endScan()` in the goroutine — i.e. as soon as the
+// completion closure had been SCHEDULED rather than when it RAN. That is round
+// 1's defect one level down: a bound that frees its slot before the work it
+// bounds completes. Measured at 99a9dca, 40 sequential admitted rescans with
+// maxConcurrentScans=4:
+//
+//	admitted=40 refused=0 queueDepth=0 -> 40 scan-completion closures
+//	outstanding on the GTK main context at once
+//
+// Each of those closures re-enters onScanComplete -> updateImage -> LoadImage,
+// so N rescans bought N serialized 30 s image loads and N gotk3
+// callback-registry entries — exactly the growth maxQueuedMutations exists to
+// prevent, on the one endpoint that was supposed to be bounded by
+// maxConcurrentScans. Releasing in the closure makes maxConcurrentScans bound
+// what its comment claims: listings AND their completion closures.
+//
+// 🔴 The one way a slot can now be lost is a closure that is scheduled and never
+// runs, i.e. the main loop stopping (shutdown). That is deliberate and it is the
+// SAME behaviour maxQueuedMutations already has — releaseQueueSlot also only
+// runs from inside the scheduled closure — and it is the honest answer: a main
+// loop that is never going to run another closure is not going to display a
+// rescan's results either, so refusing is correct rather than a leak. What is
+// NOT allowed is losing a slot on a path that terminates for any other reason,
+// which is why the release below is a sync.Once reached from both the error
+// return and the closure.
+func (iv *ImageViewer) scanImagesAsyncVia(schedule func(func())) bool {
 	// Counted synchronously, before the goroutine starts. Counting it inside the
 	// goroutine would leave a window in which GET /api/state reports
 	// scanning:false with total 0 — the "no comics" answer — for a gallery that
@@ -444,16 +486,29 @@ func (iv *ImageViewer) scanImagesAsync() bool {
 	// A boolean flag let whichever goroutine returned first clear it while the
 	// other was still listing.
 	if !iv.tryBeginScan() {
-		log.Printf("rescan refused: %d bucket listings already in flight", maxConcurrentScans)
+		// 🔴 COALESCED, not one line per refusal. This is the DoS-adjacent path:
+		// an authenticated client that loops POST /api/rescan was turning its own
+		// backpressure into unbounded journald volume on a Raspberry Pi — 496
+		// lines from a single test run. See refusalLog in state.go.
+		if n, report := iv.scanRefusals.note(time.Now()); report {
+			log.Printf("rescan refused: %d scans already outstanding (max %d); "+
+				"%d refusal(s) in the last %s", iv.scanCount(), maxConcurrentScans, n, refusalLogInterval)
+		}
 		return false
 	}
 
 	go func() {
-		defer iv.endScan()
+		// Exactly one release, on exactly one of the two paths that can end this
+		// scan. sync.Once makes a double release impossible (it would hand out a
+		// slot nobody holds) and makes the missing-release case a held slot
+		// rather than a silently negative counter.
+		var once sync.Once
+		release := func() { once.Do(iv.endScan) }
 
 		images, err := iv.store.ListImages()
 		if err != nil {
 			log.Printf("Error listing images: %v", err)
+			release()
 			return
 		}
 
@@ -466,13 +521,15 @@ func (iv *ImageViewer) scanImagesAsync() bool {
 
 		iv.setImages(images)
 
-		// Update the first image if none is showing. idleOnce is the program's
-		// single glib.IdleAdd call site — see control_adapter.go.
-		// 🔴 This idleOnce is OUTSIDE enqueueBounded's accounting, deliberately
+		// Update the first image if none is showing. schedule is idleOnce in
+		// production, the program's single glib.IdleAdd call site — see
+		// control_adapter.go.
+		// 🔴 This scheduling is OUTSIDE enqueueBounded's accounting, deliberately
 		// and unavoidably — the listing goroutine has no HTTP response left to
-		// refuse with. It is bounded instead by maxConcurrentScans: at most one
-		// of these per admitted listing. maxQueuedMutations' comment names it.
-		idleOnce(func() {
+		// refuse with. It is bounded instead by maxConcurrentScans, and that is
+		// true only because the slot is released BELOW, when this closure runs.
+		schedule(func() {
+			defer release()
 			iv.onScanComplete(iv.updateImage)
 		})
 	}()

@@ -1,6 +1,10 @@
 package main
 
 import (
+	"log"
+	"sync"
+	"time"
+
 	"github.com/gotk3/gotk3/glib"
 )
 
@@ -200,7 +204,19 @@ func (iv *ImageViewer) setPausedState(paused bool) {
 	iv.paused = paused
 }
 
-// maxConcurrentScans bounds how many bucket listings may be in flight at once.
+// maxConcurrentScans bounds how many SCANS may be outstanding at once, where a
+// scan spans the bucket listing AND the completion closure it schedules on the
+// GTK main loop.
+//
+// 🔴 The two halves are one unit on purpose, and saying so is the round-3 fix.
+// The slot used to be returned by a `defer iv.endScan()` in the listing
+// goroutine, so it came back the moment the closure was SCHEDULED. That bounded
+// concurrent listings and bounded nothing about the closures: measured at
+// 99a9dca, 40 sequential admitted rescans produced `admitted=40 refused=0
+// queueDepth=0` and left 40 completion closures queued on the main context at
+// once, each one an updateImage and a gotk3 callback-registry entry. The release
+// now happens inside the closure (scanImagesAsyncVia in main.go), so this
+// constant bounds both.
 //
 // 🔴 This is the bound that actually protects the Pi, and the GTK queue cap
 // below is NOT it. POST /api/rescan reaches scanImagesAsync, which spawns a
@@ -217,6 +233,41 @@ func (iv *ImageViewer) setPausedState(paused bool) {
 // It is above the 2 that TestScanningIsACountNotAFlag drives on purpose — a cap
 // chosen to equal a fixture is a cap no fixture can see move.
 const maxConcurrentScans = 4
+
+// refusalLogInterval is how often a refusing admission point may write a log
+// line. Refusals are caused by the caller, so one line per refusal lets an
+// authenticated client that merely retries turn its own backpressure into
+// unbounded journald volume on a Raspberry Pi.
+const refusalLogInterval = time.Minute
+
+// refusalLog coalesces a refusal message to at most one line per
+// refusalLogInterval, carrying the count of everything it suppressed so the
+// operator still sees the magnitude.
+//
+// It has its own mutex rather than sharing the viewer's, so a refusal cannot
+// contend with a render for the lock the whole slideshow serialises on.
+type refusalLog struct {
+	mu         sync.Mutex
+	suppressed int
+	last       time.Time
+	started    bool
+}
+
+// note records one refusal at time now. It returns the number of refusals the
+// caller should report and whether it should report at all; total counts every
+// refusal since the previous report, including this one.
+func (r *refusalLog) note(now time.Time) (total int, report bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.suppressed++
+	if r.started && now.Sub(r.last) < refusalLogInterval {
+		return 0, false
+	}
+	r.started = true
+	r.last = now
+	total, r.suppressed = r.suppressed, 0
+	return total, true
+}
 
 // tryBeginScan reserves one of the maxConcurrentScans slots and records that a
 // bucket listing is in flight. It reports false, having reserved nothing, when
@@ -287,19 +338,26 @@ func (iv *ImageViewer) scanCount() int {
 // deliberately and still bounded memory.
 //
 // 🔴 SCOPE, stated exactly, because the round-1 version of this comment claimed
-// more than the code delivers. This bounds the closures enqueueBounded
-// schedules — the eight R1 mutation endpoints. It does NOT bound every closure
-// on the main loop. Two others exist and are bounded elsewhere:
+// more than the code delivers and the round-2 version claimed an invariant the
+// code did not enforce. This bounds the closures enqueueBounded schedules — the
+// eight R1 mutation endpoints. It does NOT bound every closure on the main loop.
+// Two others exist and are bounded elsewhere:
 //
-//   - scanImagesAsync schedules its completion callback (the one that reaches
-//     updateSingleImage and a 30 s S3 GET) with idleOnce DIRECTLY, outside this
-//     accounting. At most one per listing, so maxConcurrentScans bounds it.
+//   - scanImagesAsyncVia schedules its completion callback (the one that reaches
+//     updateSingleImage and a 30 s S3 GET) DIRECTLY, outside this accounting. It
+//     is bounded by maxConcurrentScans, and that is true only because the scan
+//     slot is released INSIDE that closure rather than by the goroutine that
+//     scheduled it. Round 2 released it in the goroutine's defer and asserted the
+//     bound here anyway; 40 sequential rescans then left 40 closures outstanding.
 //   - scheduleQuit schedules the shutdown at PRIORITY_HIGH, once per process.
 //
-// So the true invariant is: at most maxQueuedMutations + maxConcurrentScans + 1
-// control-originated closures outstanding. Anything new that calls idleOnce
-// without going through enqueueBounded must state its own bound here or it
-// makes this comment false again.
+// So the invariant is: at most maxQueuedMutations + maxConcurrentScans + 1
+// control-originated closures outstanding — and it holds only while every
+// scheduled closure RELEASES THE SLOT THAT ADMITTED IT, from inside itself.
+// Anything new that schedules onto the main loop without going through
+// enqueueBounded must state its own bound here, and must free that bound in the
+// closure, or it makes this comment false again.
+// TestTheScanSlotIsHeldUntilTheCompletionClosureRuns is the guard.
 const maxQueuedMutations = 64
 
 // reserveQueueSlot takes one of the maxQueuedMutations slots, or reports false.
@@ -338,6 +396,15 @@ func (iv *ImageViewer) queueDepth() int {
 // passes a stand-in that runs the closure when it chooses.
 func (iv *ImageViewer) enqueueBounded(schedule func(func()), fn func()) bool {
 	if !iv.reserveQueueSlot() {
+		// Symmetric with the scan-refusal line in scanImagesAsyncVia, and
+		// coalesced for the same reason: this is the other admission point a
+		// client can drive as fast as the Pi accepts connections. Round 2 logged
+		// one line per refused rescan and nothing at all here; both are now the
+		// same shape.
+		if n, report := iv.queueRefusals.note(time.Now()); report {
+			log.Printf("mutation refused: the GTK queue holds %d of %d closures; "+
+				"%d refusal(s) in the last %s", iv.queueDepth(), maxQueuedMutations, n, refusalLogInterval)
+		}
 		return false
 	}
 	schedule(func() {

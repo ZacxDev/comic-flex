@@ -397,7 +397,10 @@ func (s *Server) handleInterval(w http.ResponseWriter, r *http.Request) {
 // thread requirement to satisfy by enqueueing it.
 func (s *Server) handleRescan(w http.ResponseWriter, r *http.Request) {
 	if !s.viewer.Rescan() {
-		refuse(w, "a bucket listing is already in flight; retry shortly")
+		// Plural: the bound is maxConcurrentScans (4 today), not 1. The singular
+		// wording told an operator a concurrent-scan refusal meant ONE listing
+		// was running.
+		refuse(w, "the bucket-listing budget is exhausted; retry shortly")
 		return
 	}
 	accepted(w)
