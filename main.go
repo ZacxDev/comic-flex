@@ -246,11 +246,14 @@ type ImageViewer struct {
 	timeoutID    glib.SourceHandle
 	paused       bool
 	viewMode     ViewMode
-	// scansInFlight counts the bucket listings currently running. Non-zero is
-	// what lets GET /api/state tell "not yet scanned" (total 0, indexing) apart
-	// from "scanned and empty" (total 0, no comics). It is a COUNT and not a
-	// flag because listings overlap — see beginScan in state.go. Guarded by
-	// mutex like the rest.
+	// scansInFlight counts the SCANS outstanding — each one a bucket listing plus
+	// the display callback it schedules, which is why the slot is released inside
+	// that callback and not when the listing returns. Non-zero is what lets
+	// GET /api/state tell "not yet scanned" (total 0, indexing) apart from
+	// "scanned and empty" (total 0, no comics); note that it also stays non-zero
+	// AFTER total is populated, until the callback runs. It is a COUNT and not a
+	// flag because scans overlap — see tryBeginScan in state.go. Guarded by mutex
+	// like the rest.
 	scansInFlight int
 	// queuedMutations counts control-API closures handed to the GTK main loop
 	// and not yet run. Guarded by mutex like the rest; see maxQueuedMutations.
@@ -490,9 +493,11 @@ func (iv *ImageViewer) scanImagesAsyncVia(schedule func(func())) bool {
 		// an authenticated client that loops POST /api/rescan was turning its own
 		// backpressure into unbounded journald volume on a Raspberry Pi — 496
 		// lines from a single test run. See refusalLog in state.go.
-		if n, report := iv.scanRefusals.note(time.Now()); report {
+		// Depth read BEFORE note() — see the same pattern in enqueueBounded.
+		outstanding := iv.scanCount()
+		if n, since, report := iv.scanRefusals.note(time.Now()); report {
 			log.Printf("rescan refused: %d scans already outstanding (max %d); "+
-				"%d refusal(s) in the last %s", iv.scanCount(), maxConcurrentScans, n, refusalLogInterval)
+				"%d refusal(s) %s", outstanding, maxConcurrentScans, n, refusalSpan(since))
 		}
 		return false
 	}

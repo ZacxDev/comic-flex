@@ -44,6 +44,20 @@ const controlAddr = control.DefaultAddr
 // safe and an http.Handler runs on a goroutine that is not the main loop, so
 // every mutation and every render must come through here. Returning false makes
 // the source one-shot.
+//
+// 🔴 NOTHING IS DISCARDED HERE, and that is a measurement rather than a claim.
+// A round-4 review asked for the dropped glib.IdleAdd error to be handled, on
+// the ground that since round 3 a lost idle source costs a permanently held
+// SCAN slot (maxConcurrentScans is released from inside the scheduled closure)
+// as well as a missed render. The blast radius is right; the premise is not. At
+// the pinned gotk3 v0.6.2, `func IdleAdd(f interface{}) SourceHandle` returns
+// ONE value: there is no error, and a bad argument PANICS rather than reporting.
+// The SourceHandle is genuinely unused, and correctly so — the closure returns
+// false, so the source removes itself and there is nothing left to remove.
+//
+// The hazard the review named is real and stays OPEN by the dependency's design:
+// if the main loop never runs a scheduled closure, its slot is never returned.
+// scanImagesAsyncVia states that case and why refusing is the honest answer.
 func idleOnce(fn func()) {
 	glib.IdleAdd(func() bool {
 		fn()

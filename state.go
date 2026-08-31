@@ -254,29 +254,59 @@ type refusalLog struct {
 }
 
 // note records one refusal at time now. It returns the number of refusals the
-// caller should report and whether it should report at all; total counts every
-// refusal since the previous report, including this one.
-func (r *refusalLog) note(now time.Time) (total int, report bool) {
+// caller should report, the span that count covers, and whether it should report
+// at all; total counts every refusal since the previous report, including this
+// one, and since is the time elapsed since that previous report.
+//
+// 🔴 since exists because the caller cannot derive it. refusalLogInterval is the
+// MINIMUM silence, not the actual one: a burst that stops for an hour and then
+// refuses once reports that single refusal an hour later, and printing "in the
+// last 1m0s" there overstated the rate by 60x. For the first report of a run
+// there is no previous line, so since is 0 — see refusalSpan.
+func (r *refusalLog) note(now time.Time) (total int, since time.Duration, report bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.suppressed++
 	if r.started && now.Sub(r.last) < refusalLogInterval {
-		return 0, false
+		return 0, 0, false
+	}
+	if r.started {
+		since = now.Sub(r.last)
 	}
 	r.started = true
 	r.last = now
 	total, r.suppressed = r.suppressed, 0
-	return total, true
+	return total, since, true
+}
+
+// refusalSpan renders the silence a coalesced count covers, for the log line.
+// The first report of a run covers no previous window at all — it is emitted
+// immediately — and there is no honest duration to name for it.
+func refusalSpan(since time.Duration) string {
+	if since <= 0 {
+		return "since this process started refusing"
+	}
+	return "in the last " + since.Round(time.Second).String()
 }
 
 // tryBeginScan reserves one of the maxConcurrentScans slots and records that a
-// bucket listing is in flight. It reports false, having reserved nothing, when
-// the bound is reached.
+// scan is OUTSTANDING. It reports false, having reserved nothing, when the bound
+// is reached.
+//
+// 🔴 "Outstanding", not "in flight" — round 4 corrected this wording, and the
+// difference is observable. The slot is released inside the completion closure
+// (scanImagesAsyncVia), so a scan stays counted after ListImages has returned
+// and after setImages has already published the results, for as long as that
+// closure sits on the GTK main loop. Measured: with the completion closure
+// QUEUED, `snapshot() -> total=3 scanning=true`.
 //
 // The counter is what lets GET /api/state distinguish "not yet scanned" from
 // "empty". Until the first ListImages returns, total is 0 and a client must
 // render "indexing…" rather than "0 comics"; they are different states and the
-// API must not collapse them.
+// API must not collapse them. Note which way round that is: the state a client
+// must key on is scanning AND total == 0. scanning alone now stays true past the
+// point where total is populated — see Snapshot.Scanning in
+// internal/control/viewer.go, which states the contract.
 //
 // 🔴 A COUNTER, NOT A FLAG — and that is a bug fix, not a style choice. Listings
 // overlap the moment the control API exists: POST /api/rescan twice, or once
@@ -308,14 +338,19 @@ func (iv *ImageViewer) endScan() {
 	}
 }
 
-// isScanning reports whether any listing is still in flight.
+// isScanning reports whether any SCAN is still outstanding — which is not the
+// same as a listing being in flight. A scan spans its completion closure, so
+// this stays true after ListImages returned and after setImages published the
+// results, until that closure has run on the GTK main loop. It is what
+// Snapshot.Scanning carries; see the contract there.
 func (iv *ImageViewer) isScanning() bool {
 	iv.mutex.RLock()
 	defer iv.mutex.RUnlock()
 	return iv.scansInFlight > 0
 }
 
-// scanCount reports how many listings are in flight. It exists so a test can
+// scanCount reports how many scans are outstanding — listings still running plus
+// listings whose completion closure has not yet run. It exists so a test can
 // assert the COUNT rather than only the boolean derived from it — a boolean
 // cannot distinguish "one of two finished" from "both finished".
 func (iv *ImageViewer) scanCount() int {
@@ -401,9 +436,14 @@ func (iv *ImageViewer) enqueueBounded(schedule func(func()), fn func()) bool {
 		// client can drive as fast as the Pi accepts connections. Round 2 logged
 		// one line per refused rescan and nothing at all here; both are now the
 		// same shape.
-		if n, report := iv.queueRefusals.note(time.Now()); report {
+		// 🔴 Read the depth BEFORE note(), not in the argument list: arguments are
+		// evaluated left to right, so reading it after note() returned reported a
+		// depth another goroutine may already have drained — a number that did not
+		// describe the refusal it was printed for.
+		depth := iv.queueDepth()
+		if n, since, report := iv.queueRefusals.note(time.Now()); report {
 			log.Printf("mutation refused: the GTK queue holds %d of %d closures; "+
-				"%d refusal(s) in the last %s", iv.queueDepth(), maxQueuedMutations, n, refusalLogInterval)
+				"%d refusal(s) %s", depth, maxQueuedMutations, n, refusalSpan(since))
 		}
 		return false
 	}

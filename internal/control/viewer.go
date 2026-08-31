@@ -49,6 +49,16 @@ func ParseViewMode(s string) (ViewMode, bool) {
 // Scanning is load-bearing: until the first ListImages returns, Total is 0 and
 // a client must render "indexing…" rather than "0 comics". An empty gallery and
 // an un-scanned gallery are different states and this API distinguishes them.
+//
+// 🔴 Scanning stays true until the DISPLAY CALLBACK HAS RUN, not merely until
+// the listing returns — the implementation holds its scan slot across the
+// closure it schedules on the display thread (see Viewer.Rescan below, and
+// maxConcurrentScans in state.go). The results are published BEFORE that
+// closure runs, so `{"total": 3, "scanning": true}` is a legal and expected
+// answer, and it can persist for the whole drain latency of the display queue.
+// A client that renders a spinner on Scanning ALONE will therefore cover a
+// fully populated gallery: the "indexing…" condition is `Scanning && Total == 0`.
+// Scanning on its own means "a rescan is not finished with the display yet".
 type Snapshot struct {
 	Total         int    `json:"total"`
 	Index         int    `json:"index"`

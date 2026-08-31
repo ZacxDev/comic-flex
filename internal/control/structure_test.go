@@ -508,10 +508,9 @@ type srcFile struct {
 //   - a Handle/HandleFunc whose receiver is not one of the muxes routes() built,
 //     in any expression form,
 //   - any other call inside routes() that is HANDED a mux, or an ALIAS of one
-//     (the helper case), which is receiver-form-independent and holds wherever
-//     the helper lives, including another package,
-//   - any *Server method anywhere in this package that takes a *http.ServeMux
-//     AND registers on it or hands it on,
+//     (the helper case), which holds wherever the helper lives, including
+//     another package — for the argument forms muxMention recognises, which is
+//     the round-4 correction below,
 //   - any Handle/HandleFunc anywhere in this package outside routes(), whose
 //     receiver is a mux this scanner can identify or whose first argument is a
 //     literal route pattern.
@@ -533,8 +532,23 @@ type srcFile struct {
 //  3. Pass 4 flagged any *Server method TAKING a *http.ServeMux, so a read-only
 //     `func (s *Server) describeMux(mux *http.ServeMux) string` failed two
 //     tests. It now flags only a method that actually registers on that mux or
-//     hands it on — the hand-off from routes() is caught independently by pass 3
-//     however far away the helper lives, so nothing is lost.
+//     hands it on.
+//
+// 🔴 ROUND-4 REBUILD, one finding — and it is finding 3's "so nothing is lost",
+// which was MEASURED FALSE. Pass 3 and pass 4's receiver test both asked
+// `x.(*ast.Ident)`, so a SELECTOR walked past both:
+//
+//	s.mux = mux                 // in routes()
+//	s.installDebug(s.mux)       // arg is a SelectorExpr -> pass 3 silent
+//	func (s *Server) installDebug(m *http.ServeMux) { debugreg.Register(m) }
+//
+// measured `mounted=true outer=[GET /healthz] inner=[GET /api/state]
+// unknown=[]`, i.e. an unauthenticated route on the SERVED mux at a green suite.
+// And `s.mux.HandleFunc(debugPattern, s.handleState)` outside routes() —
+// a Server field with a non-literal pattern — also measured `unknown=[]`.
+// Both are now caught by muxIdents tracking selector assignments and by
+// muxMention, and the removal rationale further down states the narrower claim
+// the body actually supports instead of the wide one it used to assert.
 func scanRoutesFiles(t *testing.T, files []srcFile) routeScan {
 	t.Helper()
 
@@ -648,6 +662,27 @@ func scanRoutesFiles(t *testing.T, files []srcFile) routeScan {
 	//
 	// That is the only cross-package claim in this file, and it is a claim about
 	// hand-offs FROM routes(). Pass 4 below is package-scoped and says so.
+	//
+	// 🔴 WHAT "HANDED ONE OF THE MUXES" MEANS HERE, stated as the body implements
+	// it rather than as the sentence above would like it to be — round 4's
+	// finding. Until round 4 the argument had to be a bare *ast.Ident present in
+	// muxVars, so a SELECTOR defeated the whole pass: two ordinary lines inside
+	// routes(),
+	//
+	//	s.mux = mux
+	//	s.installDebug(s.mux)
+	//
+	// with `func (s *Server) installDebug(m *http.ServeMux) { debugreg.Register(m) }`,
+	// were measured at `mounted=true outer=[GET /healthz] inner=[GET /api/state]
+	// unknown=[]` — an unauthenticated route on the SERVED mux, with every route
+	// guard green. muxMention below is what the sentence needs: it looks through
+	// the argument expression, matches an identifier or a SELECTOR this scanner
+	// has seen assigned a mux (`s.mux = mux` is now tracked), and — because a
+	// field it never saw assigned is still a field — anything whose selected name
+	// is mux-shaped. That last half is a NAME heuristic and is stated as one: a
+	// mux stashed in a field this scanner never saw written, under a name with no
+	// "mux" in it, is still invisible here. Pass 4's route-pattern half is the
+	// backstop for that, and it is only a backstop for a LITERAL pattern.
 	ast.Inspect(fn.Body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok || call == mountWrap {
@@ -658,12 +693,12 @@ func scanRoutesFiles(t *testing.T, files []srcFile) routeScan {
 			return true // already attributed by pass 2
 		}
 		for _, arg := range call.Args {
-			id, ok := arg.(*ast.Ident)
-			if !ok || !muxVars[id.Name] {
+			held := muxMention(arg, muxVars)
+			if held == "" {
 				continue
 			}
 			out.unknown = append(out.unknown,
-				exprString(call.Fun)+"("+id.Name+") — a call inside routes() is handed the mux, "+
+				exprString(call.Fun)+"("+held+") — a call inside routes() is handed the mux, "+
 					"so it may register routes this scanner cannot see")
 		}
 		return true
@@ -699,10 +734,13 @@ func scanRoutesFiles(t *testing.T, files []srcFile) routeScan {
 				// enough: the receiver is something this scanner can SEE is a mux,
 				// or the first argument is literally a route pattern (in which
 				// case whatever it is registering on, it is registering a route).
-				recvIsMux := false
-				if id, ok := sel.X.(*ast.Ident); ok && local[id.Name] {
-					recvIsMux = true
-				}
+				//
+				// 🔴 ROUND 4: "can SEE is a mux" was *ast.Ident only, so
+				// `s.mux.HandleFunc(debugPattern, s.handleState)` outside routes()
+				// — a Server FIELD, with a non-literal pattern — matched neither
+				// half and was measured at `unknown=[]`. muxMention covers the
+				// selector form, by the same rule pass 3 uses.
+				recvIsMux := muxMention(sel.X, local) != ""
 				if !recvIsMux && !isRoutePatternLiteral(call.Args[0]) {
 					return true
 				}
@@ -720,14 +758,21 @@ func scanRoutesFiles(t *testing.T, files []srcFile) routeScan {
 	return out
 }
 
-// muxIdents reports every identifier inside fn that holds an *http.ServeMux, as
-// far as this scanner can tell: a parameter declared *http.ServeMux, a local
-// assigned from http.NewServeMux(), and any alias of either, followed to a
-// fixpoint. seed lets a caller add names it already knows.
+// muxIdents reports every EXPRESSION inside fn that holds an *http.ServeMux, as
+// far as this scanner can tell, keyed by its rendered form: a parameter declared
+// *http.ServeMux, anything assigned from http.NewServeMux(), and any alias of
+// either, followed to a fixpoint. seed lets a caller add names it already knows.
 //
 // 🔴 The alias fixpoint is round 3's finding 1. Two lines — `dbg := mux` then
 // handing dbg to a sibling package's registrar — served an unauthenticated
 // endpoint past all three route guards.
+//
+// 🔴 ROUND 4: the left-hand side may be a SELECTOR, not only an identifier.
+// `s.mux = mux` stashes the served mux on the Server, and until round 4 that
+// assignment was invisible here — so `s.installDebug(s.mux)` on the next line
+// was invisible to pass 3. Keying on the rendered expression is why "s.mux" can
+// be recorded at all; for an *ast.Ident the rendered form IS the name, so this
+// is a superset of the previous behaviour rather than a change to it.
 func muxIdents(fn *ast.FuncDecl, seed map[string]bool) map[string]bool {
 	out := map[string]bool{}
 	for k := range seed {
@@ -746,8 +791,16 @@ func muxIdents(fn *ast.FuncDecl, seed map[string]bool) map[string]bool {
 	for changed := true; changed; {
 		changed = false
 		note := func(lhs ast.Expr, rhs ast.Expr) {
-			id, ok := lhs.(*ast.Ident)
-			if !ok || id.Name == "_" || out[id.Name] {
+			var key string
+			switch l := lhs.(type) {
+			case *ast.Ident:
+				key = l.Name
+			case *ast.SelectorExpr:
+				key = exprString(l)
+			default:
+				return
+			}
+			if key == "_" || out[key] {
 				return
 			}
 			switch r := rhs.(type) {
@@ -763,10 +816,14 @@ func muxIdents(fn *ast.FuncDecl, seed map[string]bool) map[string]bool {
 				if !out[r.Name] {
 					return
 				}
+			case *ast.SelectorExpr:
+				if !out[exprString(r)] {
+					return
+				}
 			default:
 				return
 			}
-			out[id.Name] = true
+			out[key] = true
 			changed = true
 		}
 		ast.Inspect(fn.Body, func(n ast.Node) bool {
@@ -820,22 +877,91 @@ func isRoutePatternLiteral(e ast.Expr) bool {
 	return method == strings.ToUpper(method)
 }
 
+// muxMention reports which sub-expression of e this scanner believes holds one
+// of the muxes in known, rendered for a failure message, and "" if it sees none.
+//
+// It is the round-4 fix for pass 3 and for pass 4's receiver test, both of which
+// asked `arg.(*ast.Ident)` and so were defeated by a selector. Two rules, and
+// the second is a NAME heuristic that is labelled as one:
+//
+//  1. the rendered expression is in known — an identifier or a selector this
+//     scanner watched being assigned a mux (`s.mux = mux`, tracked by muxIdents);
+//  2. the SELECTED name is mux-shaped (contains "mux", case-insensitively), for
+//     the field this scanner never saw written.
+//
+// 🔴 What it does NOT see, so this is not read as wider than it is: a mux in a
+// field under a name with no "mux" in it, assigned somewhere this scanner is not
+// looking. `s.h = mux` in New, then `s.installDebug(s.h)` in routes(), is
+// invisible to rule 2 and, because the assignment is not in routes(), to rule 1.
+// The backstop for that is pass 4's route-pattern half, and only for a LITERAL
+// pattern. It is a narrower claim than "nothing can reach the served mux
+// unseen", and saying so is the point.
+//
+// Rule 2 cannot cry wolf on the shapes round 3 deleted the old blanket rule for:
+// `fmt.Sprintf("%T", mux)` and `func (s *Server) describeMux(mux *http.ServeMux)
+// string` live OUTSIDE routes(), which pass 3 never walks, and neither is a
+// Handle/HandleFunc, which is all pass 4 looks at. TestRouteScannerCanFire holds
+// both as controls.
+func muxMention(e ast.Expr, known map[string]bool) string {
+	switch x := e.(type) {
+	case *ast.Ident:
+		if known[x.Name] {
+			return x.Name
+		}
+	case *ast.SelectorExpr:
+		rendered := exprString(x)
+		if known[rendered] || strings.Contains(strings.ToLower(x.Sel.Name), "mux") {
+			return rendered
+		}
+		return muxMention(x.X, known)
+	case *ast.ParenExpr:
+		return muxMention(x.X, known)
+	case *ast.StarExpr:
+		return muxMention(x.X, known)
+	case *ast.UnaryExpr:
+		return muxMention(x.X, known)
+	case *ast.IndexExpr:
+		return muxMention(x.X, known)
+	}
+	return ""
+}
+
 // 🔴 REMOVED in round 3: a rule that flagged any *Server method merely TAKING a
 // *http.ServeMux. It fired on `func (s *Server) describeMux(mux *http.ServeMux)
 // string`, which registers nothing, and any widening of it to "…and hands it on"
 // fired on `fmt.Sprintf("%T", mux)`. A guard that fails on ordinary code is a
 // guard someone deletes, and a deleted guard covers nothing.
 //
-// Nothing is lost, and this is the argument rather than an assertion. The only
-// way a registrar can touch the mux that gets SERVED is to be handed it, and the
-// only place it can be handed it from is routes() — which pass 3 flags at the
-// FIRST HOP, whatever the callee is and wherever it lives. A helper that is
-// never reached from routes() cannot affect the served mux; a helper reached
-// through a chain is flagged at the chain's first hop; a route registered on a
-// Server FIELD (`s.mux.HandleFunc("GET /debug", …)`) from anywhere in the
-// package is flagged by the route-pattern half of the sweep above; and New
-// serving something other than routes() is TestTheServedHandlerIsTheOneRoutesBuilt.
-// TestRouteScannerCanFire holds a control for each of those.
+// 🔴 ROUND 4 CORRECTION. This block used to argue that nothing was lost, because
+// "the only place [a registrar] can be handed [the mux] from is routes() — which
+// pass 3 flags at the FIRST HOP, whatever the callee is and wherever it lives".
+// That was MEASURED FALSE. Pass 3 required the argument to be an *ast.Ident in
+// muxVars, so the first hop was silent for a selector, and `s.mux = mux;
+// s.installDebug(s.mux)` came back `mounted=true outer=[GET /healthz]
+// inner=[GET /api/state] unknown=[]` with an unauthenticated route on the served
+// mux. The same paragraph's claim about a Server FIELD held only for a LITERAL
+// pattern: `s.mux.HandleFunc(debugPattern, s.handleState)` outside routes() also
+// came back `unknown=[]`. Round 3 traded a cry-wolf false positive for a real
+// false negative reachable by a two-line refactor.
+//
+// So the coverage is restored in the BODY — muxMention above, used by pass 3 and
+// by pass 4's receiver test — and the claim is now the narrower one that body
+// supports:
+//
+//   - a helper reached from routes() is flagged at the first hop when the
+//     expression handed over is an identifier or selector this scanner tracks,
+//     or is mux-shaped by name;
+//   - a Handle/HandleFunc anywhere in the package is flagged when its receiver
+//     is a mux by either of those tests, or its first argument is a literal
+//     route pattern;
+//   - New serving something other than routes() is
+//     TestTheServedHandlerIsTheOneRoutesBuilt.
+//
+// The residual gap is muxMention's: a mux in a field this scanner never saw
+// assigned, named without "mux", registering a NON-literal pattern. That is
+// three coincidences rather than a two-line refactor, and it is written down
+// here rather than argued away. TestRouteScannerCanFire holds a control for
+// every bullet above and for both round-4 mutants.
 
 // exprString renders an expression for a failure message. It handles the forms
 // a receiver or a callee can take; anything else is reported by its Go type so
@@ -1253,6 +1379,131 @@ func (s *Server) late() {
 		t.Errorf("the scanner's unknowns %v do not name a route-pattern registration made outside "+
 			"routes() on a receiver it cannot identify. The narrowing must key on the PATTERN when "+
 			"it cannot key on the receiver, or it fails open.", got.unknown)
+	}
+
+	// 🔴 ROUND-4 MUTANT 1, measured at d025210 as `mounted=true
+	// outer=[GET /healthz] inner=[GET /api/state] unknown=[]`: the round-2
+	// helper-registration mutant with ONE character changed — the helper is
+	// handed `s.mux` instead of `mux`. Pass 3 required an *ast.Ident in muxVars,
+	// so a SelectorExpr made the first hop silent, and round 3 had deleted the
+	// blanket "*Server method taking a mux" rule on the argument that pass 3
+	// caught this.
+	const selectorHandOff = `package control
+
+func (s *Server) routes() http.Handler {
+	api := http.NewServeMux()
+	api.HandleFunc("GET /api/state", s.handleState)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	s.mux = mux
+	s.installDebug(s.mux)
+	mux.Handle("/api/", s.requireToken(api))
+	return mux
+}
+
+func (s *Server) installDebug(m *http.ServeMux) {
+	debugreg.Register(m)
+}
+`
+	got = scanRoutes(t, "mutant8.go", selectorHandOff)
+	if len(got.unknown) == 0 {
+		t.Fatalf("the scanner reported NO unknowns for `s.mux = mux; s.installDebug(s.mux)` "+
+			"(outer=%v inner=%v). Two ordinary lines put an unauthenticated route on the served "+
+			"mux, and neither the hand-off nor the helper is Handle/HandleFunc, so every other "+
+			"pass is silent too.", got.outer, got.inner)
+	}
+	if !containsSubstring(got.unknown, "s.mux") {
+		t.Errorf("the scanner's unknowns %v do not name the selector it could not follow", got.unknown)
+	}
+
+	// ... and the same hand-off with the field RENAMED so muxMention's name
+	// heuristic cannot see it. This one is caught only by muxIdents tracking the
+	// selector assignment, and it exists so that half has a control of its own
+	// rather than riding on the mutant above.
+	const renamedFieldHandOff = `package control
+
+func (s *Server) routes() http.Handler {
+	api := http.NewServeMux()
+	api.HandleFunc("GET /api/state", s.handleState)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	s.h = mux
+	s.installDebug(s.h)
+	mux.Handle("/api/", s.requireToken(api))
+	return mux
+}
+
+func (s *Server) installDebug(m *http.ServeMux) {
+	debugreg.Register(m)
+}
+`
+	got = scanRoutes(t, "mutant8b.go", renamedFieldHandOff)
+	if len(got.unknown) == 0 {
+		t.Fatalf("the scanner reported NO unknowns for `s.h = mux; s.installDebug(s.h)` "+
+			"(outer=%v inner=%v). Renaming the field is not a mechanism — muxIdents watched the "+
+			"assignment, so the hand-off must be flagged whatever the field is called.",
+			got.outer, got.inner)
+	}
+	if !containsSubstring(got.unknown, "s.h") {
+		t.Errorf("the scanner's unknowns %v do not name s.h — the assignment was not tracked and "+
+			"something else fired", got.unknown)
+	}
+
+	// 🔴 ROUND-4 MUTANT 2, also measured `unknown=[]` at d025210: registration on
+	// a Server FIELD outside routes(), with a NON-literal pattern. Pass 4's
+	// receiver half asked for an *ast.Ident and its pattern half needs a literal,
+	// so neither fired.
+	const fieldNonLiteralOutsideRoutes = `package control
+
+func (s *Server) routes() http.Handler {
+	api := http.NewServeMux()
+	api.HandleFunc("GET /api/state", s.handleState)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	s.mux = mux
+	mux.Handle("/api/", s.requireToken(api))
+	return mux
+}
+
+func (s *Server) late() {
+	s.mux.HandleFunc(debugPattern, s.handleState)
+}
+`
+	got = scanRoutes(t, "mutant9.go", fieldNonLiteralOutsideRoutes)
+	if len(got.unknown) == 0 {
+		t.Fatalf("the scanner reported NO unknowns for `s.mux.HandleFunc(debugPattern, …)` "+
+			"outside routes() (outer=%v inner=%v). A Server field and a computed pattern defeat "+
+			"BOTH halves of pass 4's narrowing, which is the shape round 3's narrowing opened.",
+			got.outer, got.inner)
+	}
+
+	// ... and the round-4 widening must not cry wolf either. A field whose name
+	// says nothing about a mux, only READ, is not a registration.
+	const harmlessField = `package control
+
+func (s *Server) routes() http.Handler {
+	api := http.NewServeMux()
+	api.HandleFunc("GET /api/state", s.handleState)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	log.Printf("serving as %s on %s", s.name, s.addr)
+	mux.Handle("/api/", s.requireToken(api))
+	return mux
+}
+
+func (s *Server) tick() {
+	s.queue.Handle("tick")
+}
+`
+	got = scanRoutes(t, "harmless2.go", harmlessField)
+	if len(got.unknown) != 0 {
+		t.Errorf("the scanner reported %v for ordinary field reads and a job queue's Handle. The "+
+			"round-4 widening keys on a mux-shaped selector, not on selectors in general; if it "+
+			"fires here it will fire on every server that logs its own address.", got.unknown)
 	}
 
 	// Negative side: the real package must come back with a mount and no

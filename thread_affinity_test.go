@@ -42,7 +42,86 @@ import (
 
 // widgetFields are the two gtk widget handles ImageViewer owns. A call on either
 // is a GTK call and must happen on the GTK main thread.
+//
+// 🔴 It is a SPELLED list, and a spelled list silently narrows: add a third
+// widget handle to ImageViewer and every call on it becomes invisible to this
+// whole file, with no test going red. It is not derived from the struct because
+// every fixture in TestThreadAffinityDetectorCanFire declares
+// `type ImageViewer struct{}` with no fields at all, so a derived list would be
+// EMPTY for them and the positive controls would stop controlling anything.
+// TestWidgetFieldsIsTheWholeSetOfWidgetHandles is the ledger instead: it reads
+// the REAL struct and fails if the two sets ever disagree, in either direction.
 var widgetFields = []string{"window", "image"}
+
+// TestWidgetFieldsIsTheWholeSetOfWidgetHandles asserts the ledger above against
+// the struct it claims to enumerate.
+//
+// It fails when the set GROWS (a third gtk handle nothing in this file can see)
+// and when it SHRINKS (a name in the list that no longer exists, which would
+// make widgetCall match nothing while still looking like it matches something).
+func TestWidgetFieldsIsTheWholeSetOfWidgetHandles(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "main.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parsing main.go: %v", err)
+	}
+
+	var found []string
+	ast.Inspect(file, func(n ast.Node) bool {
+		spec, ok := n.(*ast.TypeSpec)
+		if !ok || spec.Name.Name != "ImageViewer" {
+			return true
+		}
+		st, ok := spec.Type.(*ast.StructType)
+		if !ok {
+			return true
+		}
+		for _, field := range st.Fields.List {
+			star, ok := field.Type.(*ast.StarExpr)
+			if !ok {
+				continue
+			}
+			sel, ok := star.X.(*ast.SelectorExpr)
+			if !ok {
+				continue
+			}
+			pkg, ok := sel.X.(*ast.Ident)
+			if !ok || pkg.Name != "gtk" {
+				continue
+			}
+			for _, name := range field.Names {
+				found = append(found, name.Name)
+			}
+		}
+		return false
+	})
+
+	if len(found) == 0 {
+		t.Fatal("no *gtk.* fields found on ImageViewer in main.go — this ledger is reading the " +
+			"wrong thing, so its agreement with widgetFields below means nothing")
+	}
+	sort.Strings(found)
+	want := append([]string(nil), widgetFields...)
+	sort.Strings(want)
+	if !equalStringSlices(found, want) {
+		t.Errorf("ImageViewer's gtk widget handles are %v but widgetFields says %v. Every guard in "+
+			"this file matches widget calls by these names, so a handle missing from the list is a "+
+			"GTK call nothing here can see, and a name in the list that is not a handle is a "+
+			"matcher that quietly matches nothing.", found, want)
+	}
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
 
 // threadAffinity is the package's call graph, annotated with which functions
 // touch a widget directly.
@@ -53,30 +132,31 @@ type threadAffinity struct {
 }
 
 // reaches reports whether from can reach a widget call, and by what path.
+//
+// seen doubles as the parent map the path is rebuilt from; the queue carries
+// names only. It used to carry a `prev` field as well, written on every push and
+// read nowhere — two records of the same edge, one of which could go stale
+// without anything noticing.
 func (g *threadAffinity) reaches(from string) ([]string, bool) {
-	type step struct {
-		name string
-		prev string
-	}
 	seen := map[string]string{from: ""}
-	queue := []step{{name: from}}
+	queue := []string{from}
 	for len(queue) > 0 {
 		cur := queue[0]
 		queue = queue[1:]
-		if touch, ok := g.direct[cur.name]; ok {
+		if touch, ok := g.direct[cur]; ok {
 			// Rebuild the path back to `from`.
 			var path []string
-			for at := cur.name; at != ""; at = seen[at] {
+			for at := cur; at != ""; at = seen[at] {
 				path = append([]string{at}, path...)
 			}
 			return append(path, touch), true
 		}
-		for _, next := range g.edges[cur.name] {
+		for _, next := range g.edges[cur] {
 			if _, been := seen[next]; been {
 				continue
 			}
-			seen[next] = cur.name
-			queue = append(queue, step{name: next, prev: cur.name})
+			seen[next] = cur
+			queue = append(queue, next)
 		}
 	}
 	return nil, false
@@ -97,9 +177,47 @@ func (g *threadAffinity) names() []string {
 // resolution is by NAME, not by type — a method call X.M(...) is treated as an
 // edge to EVERY method named M in this package. That over-approximates the graph,
 // which is the fail-closed direction: it can report a path that types would rule
-// out, never miss one that types would allow. What it cannot see at all is a
-// widget reached through a func value stored in a struct field, or through a
-// package this scan does not read.
+// out, never miss one that types would allow.
+//
+// 🔴 WHAT IT CANNOT SEE. The round-3 version of this paragraph named two things:
+// a func value stored in a STRUCT FIELD, and a package this scan does not read.
+// Round 4 measured four escapes, and NONE of them was on that list — a list of
+// blind spots that omits the blind spots is worse than no list, because it reads
+// as coverage. The measured set, at d025210:
+//
+//	g.iv.onScanComplete(g.iv.updateImage)  func value as a PARAMETER  reaches=false
+//	w := iv.window; w.GetSize()            receiver ALIAS             reaches=false
+//	scanImagesAsyncVia(runInline)          inline scheduler           reaches=false
+//	gdk.ScreenGetDefault()                 package gdk                reaches=false
+//
+// The first is CLOSED in round 4: a function handed to a call as a VALUE is now
+// an edge to it, unless the call hands its arguments to the main loop (see
+// handsToMainLoop). It was the serious one — `onScanComplete(update func())` is
+// the idiom scanImagesAsyncVia uses two lines from the guarded call.
+//
+// The other three are OPEN and are stated as open:
+//
+//   - a receiver ALIAS. widgetCall matches on the rendered receiver, so
+//     `w := iv.window` renames the widget out of its view. Closing it needs the
+//     alias fixpoint that internal/control's mux scanner has.
+//   - a scheduler parameter whose ARGUMENT is not a scheduler. schedulerParams
+//     exempts by the parameter's declared type func(func()) and never resolves
+//     what the caller passed, so `scanImagesAsyncVia(runInline)` is exempted on a
+//     type. This is the claim the 🔴 comment in TestThreadAffinityDetectorCanFire
+//     used to make and did not hold; it is corrected there.
+//   - package gdk. widgetCall treats a call into package gtk as a widget call and
+//     gdk as ordinary. That is deliberate, not an oversight to fix by adding gdk:
+//     gdk-pixbuf loading OFF the main thread is correct and is what the image
+//     path does, so flagging every gdk call would cry wolf on the code as
+//     written.
+//
+// The real seams the last two would sit on are covered from the other side by
+// TestScanImagesAsyncSchedulesThroughTheGTKMainLoop and
+// TestTheSignalHandlerSchedulesThroughScheduleQuit, which assert through
+// scanSchedulerCalls that the production entry points hand over idleOnce /
+// scheduleQuit specifically rather than some other func(func()). That is what
+// makes "nothing is open today" a measurement rather than a hope — and it is a
+// SEPARATE guard, so deleting it reopens these.
 func TestNothingOffTheGTKThreadCanReachAWidget(t *testing.T) {
 	g := scanThreadAffinity(t, packageSources(t))
 
@@ -233,10 +351,22 @@ func (g gtkViewer) Next() { g.iv.updateImage() }
 			"updateImage directly")
 	}
 
-	// 🔴 A scheduler that is not a scheduler must NOT be treated as the bridge.
-	// The exemption is earned structurally — by the parameter's type being
-	// func(func()) or by the callee being a function that itself calls
-	// glib.IdleAdd — so an inline "scheduler" cannot buy its way out of it.
+	// 🔴 A scheduler that is not a scheduler must NOT be treated as the bridge,
+	// AT THE CALL SITE. The exemption is earned structurally — by the callee being
+	// a function that itself calls glib.IdleAdd, or by the parameter's declared
+	// type being func(func()).
+	//
+	// 🔴 ROUND-4 CORRECTION. This comment used to end "so an inline 'scheduler'
+	// cannot buy its way out of it", and that was false in one direction the
+	// fixture below does not exercise. `runNow(func(){ … })` is caught, as here,
+	// because runNow is neither a bridge nor a declared func(func()) parameter.
+	// But `scanImagesAsyncVia(runInline)` IS exempted: inside
+	// scanImagesAsyncVia the parameter `schedule` is exempt on its declared TYPE,
+	// and schedulerParams never resolves the VALUE the caller passed — measured
+	// `reaches=false` at d025210. So the exemption is earned by the callee's own
+	// signature, not by what any caller hands it; what pins the caller is
+	// TestScanImagesAsyncSchedulesThroughTheGTKMainLoop, which asserts through
+	// scanSchedulerCalls that scanImagesAsync hands over idleOnce specifically.
 	const fakeBridge = `package main
 
 type ImageViewer struct{}
@@ -259,6 +389,64 @@ func (g gtkViewer) Rescan() bool {
 			"a way out of this guard (graph: %v)", g.names())
 	} else {
 		t.Logf("fake-bridge path: %s", strings.Join(path, " -> "))
+	}
+
+	// 🔴 ROUND-4 MUTANT, measured `reaches=false` at d025210: the render is
+	// reached through a func value handed to a PARAMETER. This is the shape
+	// scanImagesAsyncVia itself uses two lines from the guarded call, so a
+	// maintainer writing it in Rescan is copying the neighbouring line.
+	const funcValueParam = `package main
+
+type ImageViewer struct{}
+type gtkViewer struct{ iv *ImageViewer }
+
+func idleOnce(fn func()) { glib.IdleAdd(func() bool { fn(); return false }) }
+
+func (iv *ImageViewer) updateImage()       { iv.updateSingleImage() }
+func (iv *ImageViewer) updateSingleImage() { iv.window.GetSize() }
+func (iv *ImageViewer) onScanComplete(update func()) { update() }
+
+func (g gtkViewer) Rescan() bool {
+	g.iv.onScanComplete(g.iv.updateImage)
+	return true
+}
+`
+	g = scanThreadAffinity(t, []goSource{{name: "funcvalue.go", src: funcValueParam}})
+	path, ok = g.reaches("gtkViewer.Rescan")
+	if !ok {
+		t.Errorf("the detector did not see `g.iv.onScanComplete(g.iv.updateImage)` reaching a "+
+			"widget (graph: %v). The rendering call is in the callee and updateImage appears only "+
+			"as an ARGUMENT, so a graph built from callees alone renders off the GTK thread with "+
+			"this guard silent.", g.names())
+	} else {
+		t.Logf("func-value path: %s", strings.Join(path, " -> "))
+	}
+
+	// ... and the widening must not swallow the bridge. Handing the SAME method
+	// value to the main loop is the correct way to render from off-thread, and it
+	// must stay exempt — otherwise every scheduling function looks unsafe and the
+	// guard is one nobody can keep green.
+	const funcValueThroughTheBridge = `package main
+
+type ImageViewer struct{}
+type gtkViewer struct{ iv *ImageViewer }
+
+func idleOnce(fn func()) { glib.IdleAdd(func() bool { fn(); return false }) }
+
+func (iv *ImageViewer) updateImage()       { iv.updateSingleImage() }
+func (iv *ImageViewer) updateSingleImage() { iv.window.GetSize() }
+
+func (g gtkViewer) Rescan() bool {
+	idleOnce(g.iv.updateImage)
+	return true
+}
+`
+	g = scanThreadAffinity(t, []goSource{{name: "bridged.go", src: funcValueThroughTheBridge}})
+	if path, ok := g.reaches("gtkViewer.Rescan"); ok {
+		t.Errorf("the detector reports `idleOnce(g.iv.updateImage)` as reaching a widget off the "+
+			"GTK thread (%s). That IS the bridge — the render runs on the main loop — and flagging "+
+			"it makes the one correct way to schedule a render fail this guard.",
+			strings.Join(path, " -> "))
 	}
 }
 
@@ -376,6 +564,23 @@ func scanThreadAffinity(t *testing.T, files []goSource) *threadAffinity {
 
 	for name, fn := range g.funcs {
 		schedulers := schedulerParams(fn)
+		// edgeTo resolves a callee-or-func-value expression to this package's
+		// declarations, by NAME — the same over-approximation the whole graph uses.
+		edgeTo := func(e ast.Expr) {
+			switch x := e.(type) {
+			case *ast.Ident:
+				if to, ok := byFunc[x.Name]; ok {
+					g.edges[name] = append(g.edges[name], to)
+				}
+			case *ast.SelectorExpr:
+				// Skip a call into an imported package: it cannot be one of this
+				// package's methods however its name reads.
+				if pkg, ok := x.X.(*ast.Ident); ok && imports[pkg.Name] {
+					return
+				}
+				g.edges[name] = append(g.edges[name], byMethod[x.Sel.Name]...)
+			}
+		}
 		walkNonBridgedCalls(fn, bridges, schedulers, func(call *ast.CallExpr) {
 			if touch, ok := widgetCall(call); ok {
 				if _, already := g.direct[name]; !already {
@@ -383,22 +588,48 @@ func scanThreadAffinity(t *testing.T, files []goSource) *threadAffinity {
 				}
 				return
 			}
-			switch callee := call.Fun.(type) {
-			case *ast.Ident:
-				if to, ok := byFunc[callee.Name]; ok {
-					g.edges[name] = append(g.edges[name], to)
-				}
-			case *ast.SelectorExpr:
-				// Skip a call into an imported package: it cannot be one of this
-				// package's methods however its name reads.
-				if pkg, ok := callee.X.(*ast.Ident); ok && imports[pkg.Name] {
-					return
-				}
-				g.edges[name] = append(g.edges[name], byMethod[callee.Sel.Name]...)
+			edgeTo(call.Fun)
+
+			// 🔴 ROUND 4: a function passed as a VALUE is a call this graph did not
+			// see. `g.iv.onScanComplete(g.iv.updateImage)` renders — the rendering
+			// call is in the callee, and `func onScanComplete(update func())` is the
+			// exact idiom scanImagesAsyncVia uses two lines from the guarded call —
+			// but updateImage appeared only as an argument, so Rescan measured
+			// `reaches=false`. Handing a func value to a call is treated as reaching
+			// it.
+			//
+			// The bridge exemption is preserved because handsToMainLoop is asked
+			// first: `idleOnce(g.iv.updateImage)` is a render scheduled ONTO the main
+			// loop, which is correct and must not count, exactly as the closure form
+			// `idleOnce(func(){ … })` does not.
+			if handsToMainLoop(call, bridges, schedulers) {
+				return
+			}
+			for _, arg := range call.Args {
+				edgeTo(arg)
 			}
 		})
 	}
 	return g
+}
+
+// handsToMainLoop reports whether call gives its arguments to the GTK main loop,
+// so that whatever they contain runs ON that loop and may render.
+//
+// One predicate, one place: walkNonBridgedCalls uses it to decide whether to
+// descend into the arguments, and the func-value edge above uses it to decide
+// whether an argument is a hand-off to the loop or an ordinary call. Two copies
+// of this test would be two chances to disagree about the one exemption in this
+// file.
+func handsToMainLoop(call *ast.CallExpr, bridges, schedulers map[string]bool) bool {
+	switch callee := call.Fun.(type) {
+	case *ast.Ident:
+		return bridges[callee.Name] || schedulers[callee.Name]
+	case *ast.SelectorExpr:
+		pkg, ok := callee.X.(*ast.Ident)
+		return ok && pkg.Name == "glib" && strings.HasPrefix(callee.Sel.Name, "IdleAdd")
+	}
+	return false
 }
 
 // widgetCall reports whether call is a GTK call: a method on one of
@@ -455,17 +686,6 @@ func walkNonBridgedCalls(fn *ast.FuncDecl, bridges, schedulers map[string]bool, 
 			return true
 		}
 		visit(call)
-		switch callee := call.Fun.(type) {
-		case *ast.Ident:
-			if bridges[callee.Name] || schedulers[callee.Name] {
-				return false // its arguments run on the GTK main loop
-			}
-		case *ast.SelectorExpr:
-			if pkg, ok := callee.X.(*ast.Ident); ok && pkg.Name == "glib" &&
-				strings.HasPrefix(callee.Sel.Name, "IdleAdd") {
-				return false
-			}
-		}
-		return true
+		return !handsToMainLoop(call, bridges, schedulers) // its arguments run on the GTK main loop
 	})
 }

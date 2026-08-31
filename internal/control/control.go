@@ -400,7 +400,15 @@ func (s *Server) handleRescan(w http.ResponseWriter, r *http.Request) {
 		// Plural: the bound is maxConcurrentScans (4 today), not 1. The singular
 		// wording told an operator a concurrent-scan refusal meant ONE listing
 		// was running.
-		refuse(w, "the bucket-listing budget is exhausted; retry shortly")
+		//
+		// 🔴 "scan", NOT "bucket listing" — round 4. A scan now spans the listing
+		// AND the completion closure the implementation hands to the display, so
+		// this refusal can be held entirely by queued display callbacks with ZERO
+		// listings running. "the bucket-listing budget is exhausted" sent the
+		// operator to look for network activity that is not there.
+		refuse(w, "the scan budget is exhausted (a scan is held until its results have been "+
+			"displayed, so this can be queued display work rather than a running listing); "+
+			"retry shortly")
 		return
 	}
 	accepted(w)

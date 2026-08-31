@@ -923,6 +923,69 @@ func TestTheScanSlotIsHeldUntilTheCompletionClosureRuns(t *testing.T) {
 	waitFor(t, scheduled, "the recovery scan's completion closure to be scheduled")
 }
 
+// TestScanningStaysTrueUntilTheDisplayCallbackHasRun pins the CONTRACT the
+// round-3 change created and the round-3 prose did not state.
+//
+// 🔴 It is a contract guard, not a regression test: it fails on either side.
+// Move the slot release back into the listing goroutine and `scanning` goes
+// false with the closure still queued (the round-3 defect); leave it where it is
+// and `total > 0 && scanning == true` is reachable and lasts for the whole drain
+// latency of the display queue — up to maxQueuedMutations × 30 s. Snapshot.Scanning
+// in internal/control/viewer.go now documents exactly this, so this test is what
+// stops that documentation drifting from the code again.
+//
+// Measured at d025210, before the docs were corrected: `snapshot with the
+// completion closure QUEUED: total=3 scanning=true`, while three docstrings on
+// the counter still said "in flight" and the 503 body still said "the
+// bucket-listing budget is exhausted" for a refusal that can be held entirely by
+// queued display work.
+func TestScanningStaysTrueUntilTheDisplayCallbackHasRun(t *testing.T) {
+	iv := newControlTestViewer(30)
+	iv.store = &instantStore{images: []string{"a.jpg", "b.jpg", "c.jpg"}}
+
+	var mu sync.Mutex
+	var pending []func()
+	scheduled := make(chan struct{}, 8)
+	schedule := func(fn func()) {
+		mu.Lock()
+		pending = append(pending, fn)
+		mu.Unlock()
+		scheduled <- struct{}{}
+	}
+
+	if !iv.scanImagesAsyncVia(schedule) {
+		t.Fatal("the first scan was refused with nothing outstanding")
+	}
+	waitFor(t, scheduled, "the completion closure to be scheduled")
+
+	// The listing has returned and setImages has already published its results,
+	// but the display callback has not run.
+	got := iv.snapshot()
+	if got.total != 3 {
+		t.Fatalf("total = %d with the listing finished, want 3 — this test is not in the state it "+
+			"claims to be measuring", got.total)
+	}
+	if !got.scanning {
+		t.Fatalf("scanning = false with %d display callbacks still queued. The scan slot is being "+
+			"released before the work it bounds has run, which is the round-3 defect, and 40 "+
+			"sequential rescans then queue 40 closures at once.", len(pending))
+	}
+
+	// ... and it is NOT stuck: running the callback ends the scan.
+	mu.Lock()
+	queued := pending
+	pending = nil
+	mu.Unlock()
+	for _, fn := range queued {
+		fn()
+	}
+	if got := iv.snapshot(); got.scanning {
+		t.Errorf("scanning is still true after every display callback ran (total=%d). A flag that "+
+			"never clears is not a flag, and a client keyed on it renders a spinner forever.",
+			got.total)
+	}
+}
+
 // TestAFailedListingReturnsItsScanSlot: the completion closure is only scheduled
 // on the success path, so the error path has to return the slot itself. Four
 // failed listings must not exhaust the budget permanently.
@@ -981,17 +1044,22 @@ func TestRefusalLoggingIsCoalesced(t *testing.T) {
 	var r refusalLog
 	base := time.Unix(1700000000, 0)
 
-	if n, report := r.note(base); !report || n != 1 {
+	n, since, report := r.note(base)
+	if !report || n != 1 {
 		t.Fatalf("first refusal reported (%d, %v), want (1, true) — the first one must always be "+
 			"visible or an operator sees nothing at all", n, report)
 	}
+	if since != 0 {
+		t.Errorf("the FIRST report claimed a %s window; there is no previous line for it to "+
+			"span, and naming one invents a rate out of nothing", since)
+	}
 	for i := 1; i <= 5; i++ {
-		if n, report := r.note(base.Add(time.Duration(i) * time.Second)); report {
+		if n, _, report := r.note(base.Add(time.Duration(i) * time.Second)); report {
 			t.Fatalf("refusal %d inside the window reported (%d, true); it must be suppressed", i, n)
 		}
 	}
 	// The window closes and the suppressed ones are accounted for, not lost.
-	n, report := r.note(base.Add(refusalLogInterval))
+	n, since, report = r.note(base.Add(refusalLogInterval))
 	if !report {
 		t.Fatal("no refusal was reported after the window closed — refusals are now invisible " +
 			"forever, which is not coalescing, it is silence")
@@ -1001,9 +1069,40 @@ func TestRefusalLoggingIsCoalesced(t *testing.T) {
 			"this one). A count that does not carry the suppressed ones hides the magnitude, "+
 			"which is the only thing the line is for.", n)
 	}
-	if n, report := r.note(base.Add(refusalLogInterval + time.Second)); report {
+	if since != refusalLogInterval {
+		t.Errorf("the second report spanned %s, want %s", since, refusalLogInterval)
+	}
+	if n, _, report := r.note(base.Add(refusalLogInterval + time.Second)); report {
 		t.Errorf("the refusal right after a report was itself reported (%d) — the window did not "+
 			"restart", n)
+	}
+
+	// 🔴 The nit this replaced: the span is the ACTUAL silence, not
+	// refusalLogInterval. A run that goes quiet for an hour and then refuses once
+	// must not be printed as "in the last 1m0s" — that overstates the rate 60x,
+	// and it is the operator's only signal for how hard the API is being driven.
+	// Two points, a boundary and a far one, because a constant satisfies either
+	// alone: this is exactly the fixture-equals-the-constant trap.
+	//
+	// The gap is deliberately 1h0m7s rather than a whole hour: a duration that is
+	// a round multiple of the interval cannot distinguish "the measured gap" from
+	// "some arithmetic on refusalLogInterval".
+	quiet := base.Add(refusalLogInterval + time.Hour + 7*time.Second)
+	n, since, report = r.note(quiet)
+	if !report || n != 2 {
+		t.Fatalf("the refusal after an hour of silence reported (%d, %v), want (2, true)", n, report)
+	}
+	if want := time.Hour + 7*time.Second; since != want {
+		t.Errorf("the report after an hour of near-silence spanned %s, want %s. Printing the "+
+			"coalescing interval instead of the measured gap tells the operator a burst is "+
+			"happening when one refusal happened.", since, want)
+	}
+	if got := refusalSpan(since); got != "in the last 1h0m7s" {
+		t.Errorf("refusalSpan(%s) = %q, want %q", since, got, "in the last 1h0m7s")
+	}
+	if got := refusalSpan(0); got == "in the last 0s" || strings.Contains(got, "1m0s") {
+		t.Errorf("refusalSpan(0) = %q — the first line of a run spans no window, so it must "+
+			"neither name a duration of zero nor the coalescing interval", got)
 	}
 }
 
