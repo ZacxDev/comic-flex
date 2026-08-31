@@ -159,8 +159,15 @@ func TestToggleReadsAndFlipsInsideTheClosure(t *testing.T) {
 	}
 
 	// The handler decided nothing and read nothing.
+	//
+	// 🔴 Errorf, not Fatalf, deliberately: the structural finding (a read happened
+	// here) and the behavioural one (the flip landed on the stale value) are
+	// independent, and a Fatal here would hide the second one behind the first for
+	// the very mutant this test exists to catch. Measured against
+	// `paused := s.viewer.Snapshot().Paused; enqueue(SetPaused(!paused))`, both
+	// report.
 	if got := f.readLog(); len(got) != 0 {
-		t.Fatalf("the toggle handler made R2 reads %v. The direction of the flip must be "+
+		t.Errorf("the toggle handler made R2 reads %v. The direction of the flip must be "+
 			"decided inside the closure, under one lock acquisition — a read here is the "+
 			"read-then-write this endpoint replaces, and it is stale by the time the closure "+
 			"runs.", got)
