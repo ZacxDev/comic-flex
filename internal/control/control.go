@@ -118,6 +118,7 @@ func (s *Server) routes() http.Handler {
 	api.HandleFunc("POST /api/prev", s.handlePrev)
 	api.HandleFunc("POST /api/pause", s.handlePause)
 	api.HandleFunc("POST /api/resume", s.handleResume)
+	api.HandleFunc("POST /api/toggle", s.handleToggle)
 	api.HandleFunc("POST /api/viewmode", s.handleViewMode)
 	api.HandleFunc("POST /api/goto", s.handleGoto)
 	api.HandleFunc("POST /api/interval", s.handleInterval)
@@ -160,7 +161,7 @@ func accepted(w http.ResponseWriter) {
 }
 
 // enqueue is the ONE place an R1 mutation endpoint replies, so the 202/503
-// decision cannot drift between the nine handlers that make it.
+// decision cannot drift between the handlers that make it.
 //
 // 🔴 Enqueue can REFUSE. The GTK main loop drains at up to 30 s per image
 // (updateSingleImage sits on an S3 GET) while a client can POST as fast as the
@@ -276,6 +277,73 @@ func (s *Server) handlePause(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
 	s.enqueue(w, func() { s.viewer.SetPaused(false) })
+}
+
+// handleToggle flips the slideshow between paused and playing.
+//
+// 🔴 THE FLIP IS MADE IN THE CLOSURE, NOT HERE, AND THIS HANDLER READS NOTHING.
+// That is the entire reason the endpoint exists. The obvious implementation —
+//
+//	if s.viewer.Snapshot().Paused {   // read, on the handler goroutine
+//	    s.enqueue(w, func() { s.viewer.SetPaused(false) })   // write, later
+//	} else {
+//	    s.enqueue(w, func() { s.viewer.SetPaused(true) })
+//	}
+//
+// — is the bug this endpoint replaces, moved one hop closer to the state. The
+// read and the write are two lock acquisitions with an unbounded gap between
+// them (the closure sits behind up to maxQueuedMutations page turns, each of
+// which can hold the GTK loop for 30 s on an S3 GET), and in that gap the `p`
+// keypress on the Pi, a queued POST /api/pause, or a second toggle can move the
+// flag. The absolute value written then derives from a state that no longer
+// exists: the user's tap does nothing, or silently undoes someone else's.
+//
+// So the port method takes no argument (Viewer.TogglePaused), the whole
+// read-and-flip happens under ONE lock acquisition inside the implementation,
+// and there is no value for this handler to capture even if a maintainer wanted
+// to. TestToggleReadsAndFlipsInsideTheClosure is the behavioural guard: it moves
+// the paused flag AFTER the 202 and asserts the flip landed on the late value.
+//
+// 🔴 WHAT THE CALLER IS TOLD, and why it is not the resulting state. This
+// answers 202 {"accepted":true}, exactly like the other seven enqueued
+// mutations. The state the flip lands on is not knowable here without waiting
+// for the closure to run, and waiting is forbidden — the loop drains at up to
+// 30 s per image. Putting a predicted `"paused": !observed` in the body would be
+// the same lie as a 202 for work that was never queued: it is a guess made from
+// a read taken before the flip, and the guard above exists precisely because
+// that read can be stale. A caller that needs the landed state polls
+// GET /api/state, which is an R2 read and is deliberately NOT subject to the
+// queue cap (TestReadsAreNotSubjectToTheQueueCap), so it answers even while the
+// toggle is still queued.
+//
+// 🔴 SCANNING — the deliberate tri-state decision. GET /api/state reports three
+// user-visible conditions (playing, paused, scanning), and a scan can be
+// outstanding for the whole drain latency of the display queue, including the
+// startup scan at boot. The decision: A TOGGLE DURING A SCAN PROCEEDS. It is not
+// refused, not deferred, and it does not touch Scanning.
+//
+// The reasons, since "refuse with 409 while scanning" is the plausible
+// alternative:
+//
+//   - paused and scanning are ORTHOGONAL axes, not three values of one field.
+//     The slideshow is paused-or-playing whether or not a listing is running,
+//     and the flag it flips is read by the slide timer on its next tick.
+//     Collapsing them would be the flattening this API refuses elsewhere (see
+//     Snapshot.Scanning: `Scanning && Total == 0` is "indexing…", Scanning alone
+//     is not).
+//   - a refusal would have to be decided from a read taken here, which is the
+//     stale read this whole endpoint exists to eliminate. The scan can start or
+//     end between the check and the closure, so the refusal would be wrong in
+//     both directions.
+//   - Scanning is true at boot and after every rescan, so refusing would make
+//     the play/pause button dead exactly when an operator is most likely to
+//     press it.
+//
+// The tri-state is preserved for the UI by scanning staying reported, and
+// untouched, in GET /api/state. TestToggleWhileScanningFlipsAndLeavesScanning
+// pins both halves.
+func (s *Server) handleToggle(w http.ResponseWriter, r *http.Request) {
+	s.enqueue(w, func() { s.viewer.TogglePaused() })
 }
 
 func (s *Server) handleViewMode(w http.ResponseWriter, r *http.Request) {

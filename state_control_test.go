@@ -37,6 +37,63 @@ func TestSetPausedStateIsAbsoluteNotAToggle(t *testing.T) {
 	}
 }
 
+// TestAdapterTogglePausedFlipsAndReportsWhatItLandedOn is the package-main half
+// of POST /api/toggle: the adapter method the enqueued closure actually calls.
+//
+// Two properties, and the second is the one a wrong implementation loses:
+//
+//   - it FLIPS rather than latching, so two calls return to the start;
+//   - it reports the value it landed on, and that value AGREES with what the
+//     viewer holds afterwards. An implementation that returned the PREVIOUS
+//     value would leave the caller — and the log line the keypress handler
+//     prints — describing the opposite state.
+func TestAdapterTogglePausedFlipsAndReportsWhatItLandedOn(t *testing.T) {
+	iv := newControlTestViewer(30)
+	g := gtkViewer{iv: iv}
+
+	if iv.isPaused() {
+		t.Fatal("a fresh viewer is already paused; the flips below would start from the wrong end")
+	}
+	for i, want := range []bool{true, false, true, false} {
+		got := g.TogglePaused()
+		if got != want {
+			t.Fatalf("toggle %d returned %v, want %v — the flip latched instead of alternating",
+				i+1, got, want)
+		}
+		if live := iv.isPaused(); live != got {
+			t.Fatalf("toggle %d reported %v but the viewer holds %v — the return value describes "+
+				"a state the slideshow is not in", i+1, got, live)
+		}
+	}
+}
+
+// TestAdapterTogglePausedUsesTheSamePrimitiveAsTheKeypress pins that the API and
+// the `p` key agree, by driving them alternately against one viewer.
+//
+// One rule, one place: main.go's keypress handler calls iv.togglePaused and so
+// does the adapter, so a toggle from either source is the same atomic flip on
+// the same flag. If the adapter grew its own read-then-write, the interleaving
+// below would produce two writes of the same absolute value and the sequence
+// would stop alternating.
+func TestAdapterTogglePausedUsesTheSamePrimitiveAsTheKeypress(t *testing.T) {
+	iv := newControlTestViewer(30)
+	g := gtkViewer{iv: iv}
+
+	if got := g.TogglePaused(); !got { // API: playing -> paused
+		t.Fatalf("API toggle returned %v, want true", got)
+	}
+	if got := iv.togglePaused(); got { // keypress: paused -> playing
+		t.Fatalf("keypress toggle returned %v, want false", got)
+	}
+	if got := g.TogglePaused(); !got { // API again: playing -> paused
+		t.Fatalf("API toggle after a keypress returned %v, want true — the two sources are not "+
+			"flipping the same flag", got)
+	}
+	if !iv.isPaused() {
+		t.Fatal("after paused/playing/paused the viewer is not paused")
+	}
+}
+
 func TestSlideIntervalRoundTrips(t *testing.T) {
 	// 37 and 91: neither is the 30 default, neither is a power of two, and
 	// neither is a multiple of the other.

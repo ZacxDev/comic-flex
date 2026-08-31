@@ -113,6 +113,33 @@ type Viewer interface {
 	Prev()
 	// SetPaused pauses or resumes the slideshow timer.
 	SetPaused(paused bool)
+
+	// TogglePaused flips the paused flag and reports the value it landed on.
+	//
+	// 🔴 IT TAKES NO ARGUMENT, AND THAT IS THE WHOLE POINT. The flip must read
+	// and write the flag under ONE lock acquisition, in the implementation,
+	// because there is no other place it can be atomic. A caller that reads
+	// Snapshot().Paused and then calls SetPaused(!paused) has two lock
+	// acquisitions with a gap between them, and in that gap the keypress handler
+	// on the Pi (main.go's `p` key calls togglePaused) or another queued closure
+	// can move the flag — so the second half writes an absolute value derived
+	// from a state that no longer exists, and the user's tap does nothing or
+	// undoes someone else's.
+	//
+	// That is not a hypothetical: it is what the PWA does today, from across the
+	// network, with a poll interval's worth of staleness rather than a
+	// microsecond's. POST /api/toggle exists to move that decision to the one
+	// place it can be made correctly, and a signature with no parameter is what
+	// makes the wrong version fail to compile rather than fail in the field.
+	//
+	// The return value is the state the flip landed on. It is NOT reported to
+	// the HTTP caller — the closure runs after the handler has answered 202 (see
+	// handleToggle) — but it is what the implementation logs and what a test
+	// asserts, and it is the honest shape for the operation.
+	//
+	// It is an R1 write: called ONLY from inside an Enqueue closure. It does its
+	// own locking and must not render.
+	TogglePaused() (paused bool)
 	// SetViewMode switches layout, rotating the display if orientation changed.
 	SetViewMode(mode ViewMode)
 	// GotoKey selects the given object key, resolving it under the lock. It is

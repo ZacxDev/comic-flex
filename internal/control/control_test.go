@@ -67,6 +67,7 @@ func TestEndpointTable(t *testing.T) {
 		{"prev", "POST", "/api/prev", "", http.StatusAccepted, false},
 		{"pause", "POST", "/api/pause", "", http.StatusAccepted, false},
 		{"resume", "POST", "/api/resume", "", http.StatusAccepted, false},
+		{"toggle", "POST", "/api/toggle", "", http.StatusAccepted, false},
 		{"rescan", "POST", "/api/rescan", "", http.StatusAccepted, false},
 
 		{"viewmode landscape_single", "POST", "/api/viewmode", `{"mode":"landscape_single"}`, http.StatusAccepted, false},
@@ -96,6 +97,7 @@ func TestEndpointTable(t *testing.T) {
 
 		// Method discipline: mutations are POST-only, reads are GET-only.
 		{"next via GET", "GET", "/api/next", "", http.StatusMethodNotAllowed, true},
+		{"toggle via GET", "GET", "/api/toggle", "", http.StatusMethodNotAllowed, true},
 		{"state via POST", "POST", "/api/state", "", http.StatusMethodNotAllowed, true},
 		{"unknown api route", "POST", "/api/bogus", "", http.StatusNotFound, true},
 	}
@@ -132,6 +134,10 @@ func TestMutationsAccept202WithoutRunningTheWork(t *testing.T) {
 		{"prev", "/api/prev", "", "Prev"},
 		{"pause", "/api/pause", "", "SetPaused:true"},
 		{"resume", "/api/resume", "", "SetPaused:false"},
+		// The fake starts un-paused, so the flip lands on true. That the RESULT is
+		// recorded rather than the call is what makes the direction observable
+		// here; toggle_test.go drives both directions.
+		{"toggle", "/api/toggle", "", "TogglePaused:true"},
 		{"viewmode", "/api/viewmode", `{"mode":"landscape_two"}`, "SetViewMode:landscape_two"},
 		{"goto key", "/api/goto", `{"key":"c/3.jpg"}`, "GotoKey:c/3.jpg@2"},
 		{"goto index", "/api/goto", `{"index":1}`, "GotoIndex:1"},

@@ -96,6 +96,7 @@ var authedRoutes = []struct {
 	{"POST", "/api/prev", "", http.StatusAccepted},
 	{"POST", "/api/pause", "", http.StatusAccepted},
 	{"POST", "/api/resume", "", http.StatusAccepted},
+	{"POST", "/api/toggle", "", http.StatusAccepted},
 	{"POST", "/api/viewmode", `{"mode":"portrait_single"}`, http.StatusAccepted},
 	{"POST", "/api/goto", `{"key":"a/1.jpg"}`, http.StatusAccepted},
 	{"POST", "/api/interval", `{"seconds":60}`, http.StatusAccepted},

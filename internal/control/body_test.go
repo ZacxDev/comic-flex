@@ -137,13 +137,15 @@ func TestTrailingJSONIsRefused(t *testing.T) {
 // endpoint admitted by the concurrent-scan bound instead.
 //
 // 🔴 They are asserted to PARTITION the 202 endpoints by
-// TestEveryAcceptedMutationIsCoveredByOneAdmissionTest. Without that, a ninth
+// TestEveryAcceptedMutationIsCoveredByOneAdmissionTest. Without that, another
 // mutation endpoint added tomorrow lands in neither list and is never driven
 // against a full queue at all — the round-1 shape exactly: a ledger that catches
-// removal and not growth.
+// removal and not growth. (POST /api/toggle is exactly such an endpoint, added
+// after these lists were written; the partition test is what made adding it here
+// non-optional rather than something to remember.)
 var (
 	enqueuedMutationPaths = []string{
-		"/api/next", "/api/prev", "/api/pause", "/api/resume",
+		"/api/next", "/api/prev", "/api/pause", "/api/resume", "/api/toggle",
 		"/api/viewmode", "/api/goto", "/api/interval",
 	}
 	scanAdmittedPaths = []string{"/api/rescan"}
