@@ -11,10 +11,13 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gotk3/gotk3/gdk"
@@ -142,8 +145,20 @@ func NewS3Store(endpoint, bucket, prefix string, useSSL, skipVerify bool) (*S3St
 	}, nil
 }
 
+// listTimeout bounds a bucket listing.
+//
+// 🔴 There was none. ListImages used a bare context.Background(), unlike
+// LoadImage's 30 s below, so a MinIO that accepted the connection and then went
+// quiet parked the scanning goroutine FOREVER: `scanning` never cleared, the
+// display never got its first image, and — once POST /api/rescan exists — every
+// retry leaked another goroutine and another concurrent ListObjects. A listing
+// is many round trips rather than one GET, so it gets a longer budget than
+// LoadImage, but it gets one.
+const listTimeout = 2 * time.Minute
+
 func (s *S3Store) ListImages() ([]string, error) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), listTimeout)
+	defer cancel()
 	var images []string
 
 	objectCh := s.client.ListObjects(ctx, s.bucket, minio.ListObjectsOptions{
@@ -231,6 +246,95 @@ type ImageViewer struct {
 	timeoutID    glib.SourceHandle
 	paused       bool
 	viewMode     ViewMode
+	// scansInFlight counts the SCANS outstanding — each one a bucket listing plus
+	// the display callback it schedules, which is why the slot is released inside
+	// that callback and not when the listing returns. Non-zero is what lets
+	// GET /api/state tell "not yet scanned" (total 0, indexing) apart from
+	// "scanned and empty" (total 0, no comics); note that it also stays non-zero
+	// AFTER total is populated, until the callback runs. It is a COUNT and not a
+	// flag because scans overlap — see tryBeginScan in state.go. Guarded by mutex
+	// like the rest.
+	scansInFlight int
+	// queuedMutations counts control-API closures handed to the GTK main loop
+	// and not yet run. Guarded by mutex like the rest; see maxQueuedMutations.
+	queuedMutations int
+	// scanRefusals and queueRefusals coalesce the log lines the two admission
+	// points write when they refuse. They carry their OWN mutex (see refusalLog
+	// in state.go) and are deliberately not guarded by iv.mutex: a refusal must
+	// not contend for the lock every render takes.
+	scanRefusals  refusalLog
+	queueRefusals refusalLog
+}
+
+// injectedVersion is set at link time by a release build:
+//
+//	go build -ldflags "-X main.injectedVersion=0.2.0"
+//
+// It is empty in an ordinary build, and resolveVersion then falls back to the
+// VCS stamp the toolchain embeds.
+var injectedVersion string
+
+// version is reported by GET /healthz.
+//
+// 🔴 It is deliberately NOT a hand-maintained constant. It used to be
+// `const version = "0.2.0"`, with nothing in the build bumping it — so /healthz
+// would have gone on reporting 0.2.0 for every subsequent deploy that nobody
+// remembered to hand-edit, which is worse than reporting nothing. resolveVersion
+// prefers the link-time value and otherwise derives one from the commit the
+// binary was built from.
+//
+// 🔴 SCOPE, corrected. This comment used to end "so an un-edited build still
+// identifies itself", full stop. That holds for a `go build` in a git clone —
+// which is how the Pi builds — and it did NOT hold for the repo's own
+// `nix build .#default`: buildGoModule copies the source into /nix/store with
+// no .git, so -buildvcs=auto stamps nothing, the VCS branch below finds no
+// revision, and this resolves to "unknown". Nothing caught it, because
+// TestVersionIsNotEmpty passes on "unknown" — it is not empty.
+//
+// The fix is in flake.nix, which now injects `-X main.injectedVersion=<rev>`,
+// so the FIRST branch of resolveVersion answers for a nix build and the VCS
+// branch answers for a plain clone. Both paths now identify the binary; if you
+// add a third build path, give it one of the two or it lands on "unknown"
+// silently.
+var version = resolveVersion(injectedVersion, buildSettings())
+
+// buildSettings returns the toolchain's VCS stamp, or nil when there is none
+// (ReadBuildInfo has no build info, or the build was made with -buildvcs=false).
+func buildSettings() []debug.BuildSetting {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return nil
+	}
+	return info.Settings
+}
+
+// resolveVersion picks the most specific identifier available: an explicit
+// link-time value, else the VCS revision (short, with a -dirty marker), else
+// "unknown". It takes both inputs as parameters so it is testable without
+// rebuilding the binary under different flags.
+func resolveVersion(injected string, settings []debug.BuildSetting) string {
+	if injected != "" {
+		return injected
+	}
+	revision, dirty := "", false
+	for _, s := range settings {
+		switch s.Key {
+		case "vcs.revision":
+			revision = s.Value
+		case "vcs.modified":
+			dirty = s.Value == "true"
+		}
+	}
+	if revision == "" {
+		return "unknown"
+	}
+	if len(revision) > 12 {
+		revision = revision[:12]
+	}
+	if dirty {
+		return revision + "-dirty"
+	}
+	return revision
 }
 
 func loadManifest(path string) (*Manifest, error) {
@@ -326,11 +430,90 @@ func NewImageViewer(config *Config, store ImageStore) (*ImageViewer, error) {
 	}, nil
 }
 
-func (iv *ImageViewer) scanImagesAsync() {
+// scanImagesAsync starts a bucket listing in the background and reports whether
+// one was started. It returns false, having started nothing, when
+// maxConcurrentScans scans are already outstanding.
+//
+// 🔴 The bool is the ADMISSION DECISION for POST /api/rescan, and it is answered
+// SYNCHRONOUSLY on the caller's goroutine. That is why the handler does not
+// enqueue this onto the GTK main loop: nothing here touches a widget (the
+// goroutine's only GTK contact is the scheduler below, which is exactly how a
+// non-GTK thread is supposed to reach the loop), and routing it through
+// enqueueBounded made the queue cap LOOK like it bounded rescans while the
+// closure completed in microseconds and the listing it spawned ran free. See
+// maxConcurrentScans in state.go for the measurement.
+func (iv *ImageViewer) scanImagesAsync() bool {
+	return iv.scanImagesAsyncVia(idleOnce)
+}
+
+// scanImagesAsyncVia is scanImagesAsync with the GTK-main-loop scheduler as a
+// parameter, exactly as enqueueBounded takes one and for the same reason: the
+// property that matters here is WHEN THE SLOT IS RETURNED, and that now happens
+// inside the scheduled closure, which no test can observe without either a
+// running GTK main loop or a stand-in scheduler.
+//
+// 🔴 THE SLOT SPANS THE WHOLE SCAN, INCLUDING THE COMPLETION CLOSURE. It used to
+// be returned by a `defer iv.endScan()` in the goroutine — i.e. as soon as the
+// completion closure had been SCHEDULED rather than when it RAN. That is round
+// 1's defect one level down: a bound that frees its slot before the work it
+// bounds completes. Measured at 99a9dca, 40 sequential admitted rescans with
+// maxConcurrentScans=4:
+//
+//	admitted=40 refused=0 queueDepth=0 -> 40 scan-completion closures
+//	outstanding on the GTK main context at once
+//
+// Each of those closures re-enters onScanComplete -> updateImage -> LoadImage,
+// so N rescans bought N serialized 30 s image loads and N gotk3
+// callback-registry entries — exactly the growth maxQueuedMutations exists to
+// prevent, on the one endpoint that was supposed to be bounded by
+// maxConcurrentScans. Releasing in the closure makes maxConcurrentScans bound
+// what its comment claims: listings AND their completion closures.
+//
+// 🔴 The one way a slot can now be lost is a closure that is scheduled and never
+// runs, i.e. the main loop stopping (shutdown). That is deliberate and it is the
+// SAME behaviour maxQueuedMutations already has — releaseQueueSlot also only
+// runs from inside the scheduled closure — and it is the honest answer: a main
+// loop that is never going to run another closure is not going to display a
+// rescan's results either, so refusing is correct rather than a leak. What is
+// NOT allowed is losing a slot on a path that terminates for any other reason,
+// which is why the release below is a sync.Once reached from both the error
+// return and the closure.
+func (iv *ImageViewer) scanImagesAsyncVia(schedule func(func())) bool {
+	// Counted synchronously, before the goroutine starts. Counting it inside the
+	// goroutine would leave a window in which GET /api/state reports
+	// scanning:false with total 0 — the "no comics" answer — for a gallery that
+	// is about to be listed.
+	//
+	// 🔴 tryBeginScan/endScan are a COUNTER. Two listings genuinely overlap here:
+	// POST /api/rescan can arrive during the startup scan, or twice in a row.
+	// A boolean flag let whichever goroutine returned first clear it while the
+	// other was still listing.
+	if !iv.tryBeginScan() {
+		// 🔴 COALESCED, not one line per refusal. This is the DoS-adjacent path:
+		// an authenticated client that loops POST /api/rescan was turning its own
+		// backpressure into unbounded journald volume on a Raspberry Pi — 496
+		// lines from a single test run. See refusalLog in state.go.
+		// Depth read BEFORE note() — see the same pattern in enqueueBounded.
+		outstanding := iv.scanCount()
+		if n, since, report := iv.scanRefusals.note(time.Now()); report {
+			log.Printf("rescan refused: %d scans already outstanding (max %d); "+
+				"%d refusal(s) %s", outstanding, maxConcurrentScans, n, refusalSpan(since))
+		}
+		return false
+	}
+
 	go func() {
+		// Exactly one release, on exactly one of the two paths that can end this
+		// scan. sync.Once makes a double release impossible (it would hand out a
+		// slot nobody holds) and makes the missing-release case a held slot
+		// rather than a silently negative counter.
+		var once sync.Once
+		release := func() { once.Do(iv.endScan) }
+
 		images, err := iv.store.ListImages()
 		if err != nil {
 			log.Printf("Error listing images: %v", err)
+			release()
 			return
 		}
 
@@ -343,11 +526,19 @@ func (iv *ImageViewer) scanImagesAsync() {
 
 		iv.setImages(images)
 
-		// Update the first image if none is showing.
-		glib.IdleAdd(func() {
+		// Update the first image if none is showing. schedule is idleOnce in
+		// production, the program's single glib.IdleAdd call site — see
+		// control_adapter.go.
+		// 🔴 This scheduling is OUTSIDE enqueueBounded's accounting, deliberately
+		// and unavoidably — the listing goroutine has no HTTP response left to
+		// refuse with. It is bounded instead by maxConcurrentScans, and that is
+		// true only because the slot is released BELOW, when this closure runs.
+		schedule(func() {
+			defer release()
 			iv.onScanComplete(iv.updateImage)
 		})
 	}()
+	return true
 }
 
 func (iv *ImageViewer) updateImage() {
@@ -732,7 +923,10 @@ func (iv *ImageViewer) startSlideshow() {
 			glib.SourceRemove(previous)
 		}
 
-		iv.swapTimeout(glib.TimeoutAdd(iv.config.SlideInterval*1000, func() bool {
+		// Read through the accessor: POST /api/interval writes this field from
+		// an enqueued closure, so an unlocked read here would be a data race
+		// against GET /api/state's reader.
+		iv.swapTimeout(glib.TimeoutAdd(iv.slideInterval()*1000, func() bool {
 			if !iv.isPaused() {
 				if iv.advance(iv.stepSize()) {
 					iv.updateImage()
@@ -745,7 +939,71 @@ func (iv *ImageViewer) startSlideshow() {
 	startTimer()
 }
 
+// installSignalHandler turns SIGINT/SIGTERM into a GTK main-loop quit, and a
+// SECOND one into an immediate exit.
+//
+// 🔴 CORRECTED — the round-1 justification for the loop was FALSE, and it is
+// recorded here rather than deleted because a maintainer who read it came away
+// believing every `systemctl stop` was taking 90 s. It claimed that reading the
+// channel once left the process unsignallable, so "systemctl stop then waits out
+// TimeoutStopSec (90 s) on every stop and every restart". That could not happen:
+// the read-once handler DID act on the first signal, and systemd sends exactly
+// one SIGTERM and then SIGKILLs at the timeout — it never re-sends. One signal
+// was always enough for the ordinary stop, before this loop and after it.
+//
+// What the loop actually buys, which is smaller but real: a SECOND signal can
+// force an exit. Reading once and returning leaves signal.Notify still delivering
+// into a channel nobody reads, so every later SIGINT/SIGTERM is buffered and
+// dropped. That matters exactly when the graceful quit does NOT complete — the
+// GTK loop still inside a 30 s S3 GET, or wedged — because the operator's second
+// Ctrl-C or second `kill` is then the only thing short of SIGKILL that stops it.
+// Under systemd it changes nothing about the normal stop; under a human at a
+// terminal it is the difference between "press it again" and "find the PID".
+//
+// quit is SCHEDULED rather than called, so this returns immediately and the loop
+// is always ready for the next signal. hardExit is os.Exit in production and is
+// a parameter so the second-signal path is testable without killing the test
+// binary.
+func installSignalHandler(sigCh <-chan os.Signal, quit func(), hardExit func(int)) {
+	go func() {
+		quitting := false
+		for sig := range sigCh {
+			if !quitting {
+				quitting = true
+				log.Printf("received %s, quitting the GTK main loop", sig)
+				// 🔴 Through scheduleQuit, NOT idleOnce — see its comment. The
+				// priority is the difference between shutting down now and
+				// shutting down after a backlog of 30 s image loads.
+				scheduleQuit(quit)
+				continue
+			}
+			log.Printf("received %s while already shutting down — exiting immediately", sig)
+			hardExit(1)
+			return
+		}
+	}()
+}
+
+// scheduleQuit puts quit on the GTK main loop AHEAD of queued work.
+//
+// 🔴 idleOnce would be wrong here, and silently so. It schedules at
+// G_PRIORITY_DEFAULT_IDLE, which is where every control-API mutation closure
+// sits — and updateSingleImage inside one of those can block for up to 30 s on
+// an S3 GET. A quit queued behind a backlog of them waits for all of them.
+// PRIORITY_HIGH jumps that queue, so shutdown waits only for the closure that
+// is already RUNNING.
+//
+// It takes quit as a parameter so TestQuitJumpsTheQueueOfPendingWork can drive
+// THIS function — the one that makes the priority decision — with a harmless
+// payload instead of gtk.MainQuit. A test that called idleHigh directly would
+// prove that idleHigh is high-priority and nothing about the shutdown path;
+// that version of this guard let `idleHigh` -> `idleOnce` here survive.
+func scheduleQuit(quit func()) { idleHigh(quit) }
+
 func main() {
+	// 🔴 The relative literal is load-bearing: the systemd unit's
+	// WorkingDirectory=/home/zach/comic-flex is what makes it resolve. Do not
+	// "clean this up" into an absolute path without changing the unit too.
 	config, err := loadConfig("config.yaml")
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
@@ -776,5 +1034,34 @@ func main() {
 	// Start the slideshow
 	viewer.startSlideshow()
 
+	// The control API runs in this same process — it is not a second unit, so
+	// there is no new supervision object and the existing unit restarts both
+	// together. It returns nil, having logged why, if the token precondition
+	// fails; the slideshow then runs with no control surface at all.
+	ctrl := startControlAPI(viewer, controlAddr)
+
+	// There was no signal handling here at all. gtk.MainQuit() is what returns
+	// from gtk.Main(), so a SIGTERM has to be turned into one — and it must be
+	// raised ON the GTK thread, which is what scheduleQuit is for.
+	//
+	// 🔴 Intercepting a signal is not free: before this existed, SIGTERM killed
+	// the process instantly. Both properties below exist so that intercepting it
+	// does not make `systemctl stop` WORSE than the default it replaced. See
+	// installSignalHandler and scheduleQuit.
+	sigCh := make(chan os.Signal, 4)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	installSignalHandler(sigCh, gtk.MainQuit, os.Exit)
+
 	gtk.Main()
+
+	// gtk.Main() has returned, so main() is about to end. This is the whole of
+	// the new plumbing §4.4 calls for: without it the process would exit with
+	// the listener still accepting.
+	if ctrl != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := ctrl.Shutdown(ctx); err != nil {
+			log.Printf("control API shutdown: %v", err)
+		}
+	}
 }
