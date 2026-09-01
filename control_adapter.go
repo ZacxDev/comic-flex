@@ -222,16 +222,19 @@ func (g gtkViewer) GotoIndex(index int) {
 // than on value equality — a different design with different edge cases. Do not
 // "tighten" the equality check and believe the wider sentence has become true.
 //
-// ⚠ CORRECTED — and it was wrong in the REASSURING direction, which is why it is
-// spelled out rather than quietly reworded. This said "bind address and
-// firewalling are OPERATIONAL assumptions, not properties of this code". Only the
-// firewall half is true. The bind address is pinned IN THIS REPO AT COMPILE TIME,
-// and to the most permissive value there is: controlAddr = control.DefaultAddr =
-// "0.0.0.0:8790", passed by main with no environment override anywhere. So the
-// listener is on ALL INTERFACES by construction, and the only thing narrowing it
-// is a firewall rule that lives outside this repo and that nothing here checks.
-// Read the old wording and you would think the deployment chose the address; it
-// does not.
+// ⚠ The BIND ADDRESS is not an operational choice: controlAddr =
+// control.DefaultAddr = "0.0.0.0:8790" is pinned here at compile time and main
+// passes that constant, with no environment, flag or config override anywhere in
+// the repo. The listener is on ALL INTERFACES by construction.
+//
+// 🔴 DO NOT RESTATE THE NETWORK SITUATION HERE — read control.DefaultAddr's own
+// comment, which MEASURED it. Two successive versions of this paragraph got it
+// wrong in the reassuring direction: the first called the bind address an
+// operational assumption (it is not), and the second said the listener is
+// narrowed by "a firewall rule that lives outside this repo" — asserting, in the
+// present tense, a control that DefaultAddr's comment records as measured ABSENT
+// on the Pi and still owed. Restating a fact that lives somewhere else is what
+// generated both errors; pointing at it cannot.
 //
 // PAUSED: it re-arms anyway, and that is the decision rather than an oversight.
 // The slide timer runs while paused — startSlideshow re-arms on every tick and

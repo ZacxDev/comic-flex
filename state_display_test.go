@@ -1021,15 +1021,19 @@ func armedTimer(iv *ImageViewer) (glib.SourceHandle, time.Time) {
 // shared default main context, transitively — so that is what is written.
 //
 // Add t.Parallel anywhere in this package and the invariant stops holding: an
-// expired slide timeout would be dispatched inside an unrelated test. What
-// happens then is usually a PANIC, not a slow test — measured, not assumed.
-// newControlTestViewer leaves the store field nil, so the closure reaches
-// iv.store.LoadImage and nil-dereferences, aborting the whole test binary from
-// inside a test that never armed anything. ("Usually": a fixture that is PAUSED
-// when its source expires re-arms silently instead, because the closure gates the
-// render on !isPaused — still a stray source in a foreign test, just a quiet one.
-// An earlier version of this note said "a real S3 GET", which would have sent the
-// next maintainer hunting a network problem in the wrong test.)
+// expired slide timeout would be dispatched inside an unrelated test, and the
+// result is a PANIC, not a slow test — measured, not assumed. newControlTestViewer
+// leaves the store field nil, so the closure reaches iv.store.LoadImage and
+// nil-dereferences, aborting the whole test binary from inside a test that never
+// armed anything.
+//
+// 🔴 Two earlier versions of that sentence were wrong, in opposite directions.
+// One said "a real S3 GET", which would send the next maintainer hunting a
+// network problem in the wrong test. The other hedged it to "usually", reasoning
+// that the one PAUSED fixture would re-arm silently instead — the mechanism is
+// real (the closure gates the render on !isPaused) but it does not apply here,
+// because that test RESUMES before it returns and its surviving source therefore
+// expires unpaused like every other. It is all of them, not most of them.
 func retireArmedTimer(t *testing.T, iv *ImageViewer) {
 	t.Helper()
 	if previous := iv.swapTimeout(0, time.Time{}); previous != 0 {
