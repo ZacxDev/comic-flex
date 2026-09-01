@@ -144,21 +144,31 @@ func ParseViewMode(s string) (ViewMode, bool) {
 //	0 when paused (no countdown is running), and 0 when no slide timer is armed.
 //	Always within [0, SlideInterval] and never negative.
 //
-//	🔴 THE CEILING IS A CLAMP, AND AFTER POST /api/interval LOWERS THE INTERVAL IT
-//	FREEZES. SetInterval deliberately does not restart the running timer — it
-//	"takes effect on the next tick" — so a source armed for 3600 s is still 3600 s
-//	from firing after the interval is set to 30, and the clamp reports 30 for the
-//	next 59 minutes without moving. Measured on the real accessors; pinned by
-//	TestLoweringTheIntervalFreezesTheCountdownUntilTheTimerCatchesUp.
+//	🔴 THE CEILING IS A CLAMP, AND IT NO LONGER FREEZES AFTER POST /api/interval.
+//	This paragraph used to describe the freeze as an asserted property: SetInterval
+//	only stored the value — it "took effect on the next tick" — so a source armed
+//	for 3600 s was still 3600 s from firing after the interval was set to 30, and
+//	the clamp reported a stationary 30 for the next 59 minutes. That is fixed at
+//	the cause: SetInterval now retires the pending timer and arms a fresh one at
+//	the new interval, so the countdown restarts from the NEW value and decreases
+//	from there. A consumer that lowers the interval should see its next poll
+//	report at most the new interval, and fall from there towards 0.
 //
-//	It is reported this way because the [0, SlideInterval] bound is a fixed part
-//	of this wire contract and there is no honest small answer available: the true
-//	remaining is the large one the bound forbids. The defect is upstream — a
-//	countdown and an interval that can disagree at all — and the fix is for
-//	SetInterval to re-arm the timer, which is a change to an EXISTING endpoint's
-//	documented semantics and is deliberately not made here. Until it is, a
-//	consumer that lowers the interval should expect its own countdown to stall
-//	once, and should not read a stalled value as the Pi being wedged.
+//	⚠ That is a statement about the CURRENT cycle, and it is not a licence to
+//	assert monotonic decrease across polls. The countdown resets to SlideInterval
+//	on every advance, exactly as it always has, so any consumer watching long
+//	enough sees it jump back up — that is the timer working, not the freeze
+//	returning. The property this change buys is that the reset happens on the NEW
+//	interval starting immediately, instead of once the old timer finally expires.
+//
+//	The clamp itself stays, and stays load-bearing: SecondsUntilNext is still
+//	never above SlideInterval. What is gone is the state in which the two could
+//	disagree for the better part of an hour.
+//
+//	The re-arm is CONDITIONAL ON THE VALUE MOVING. Re-POSTing the interval the Pi
+//	is already on does not reset the countdown — deliberately, because a settings
+//	page that submits its whole form on every change would otherwise push the
+//	deadline out on every request and the slideshow would never advance at all.
 //
 //	🔴 Deliberately a DURATION and not an absolute timestamp. The consumer is a
 //	browser on a phone with its own clock, and a duration is immune to skew
@@ -276,8 +286,30 @@ type Viewer interface {
 	GotoKey(key string)
 	// GotoIndex selects the given index, clamped into range under the lock.
 	GotoIndex(index int)
-	// SetInterval sets the slide interval in seconds; it takes effect on the
-	// next tick without restarting the timer.
+	// SetInterval sets the slide interval in seconds and makes it take effect
+	// IMMEDIATELY: the implementation must cancel the timer that is pending and
+	// arm a fresh one at the new interval, so the next advance is one new
+	// interval away rather than whatever remained of the old one.
+	//
+	// 🔴 It must cancel, not merely re-arm. Arming a second source without
+	// retiring the first leaves two live timers, which advances the display twice
+	// per period and reads to a viewer as the slideshow skipping pages.
+	//
+	// Setting the interval it is ALREADY on must be a no-op, countdown included:
+	// a client that re-sends its current value on every poll must not be able to
+	// push the next advance out indefinitely.
+	//
+	// 🔴 An implementation MUST REFUSE a non-positive value outright — neither
+	// storing it nor arming anything — rather than trusting the handler's
+	// 1..3600 bound to have filtered it. The bound is this package's; the danger
+	// is the implementation's, and it is specific: a 0 interval arms a zero-delay
+	// timer that re-arms itself from its own callback, which on the comic-flex
+	// implementation wedges the GTK main loop and takes the display down with it.
+	// The requirement belongs here rather than only in that implementation,
+	// because a second implementer has no other way to learn it.
+	//
+	// It is an R1 write, so it runs inside an Enqueue closure — which is what
+	// makes arming a GLib source from it legal.
 	SetInterval(seconds int)
 	// Rescan starts a bucket listing in the background and reports whether one
 	// was STARTED. It reports false, having started nothing, when the

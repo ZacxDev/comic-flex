@@ -13,22 +13,50 @@ import (
 // DefaultAddr is the bind address required by the design: the cluster reaches
 // the Pi by LAN IP, so loopback is not an option.
 //
-// 🔴 THE BEARER TOKEN IS THE ONLY CONTROL ON THIS PORT TODAY. This comment used
-// to claim the compensating control was "the bearer token plus a host firewall
-// rule restricting :8790 to the LAN". That firewall does not exist. Measured on
-// the Pi (192.168.50.131) on 2026-08-30: `nft list ruleset` empty, no iptables
-// binary, no ufw, and `sudo -n id` returns uid=0 — so anything that reaches
-// this port and holds the token gets a root-adjacent host.
+// ✅ THE FIREWALL RULE THIS COMMENT WAS OWED HAS LANDED, and this paragraph is
+// the "say so here and name where it is defined" that the previous version asked
+// for. Measured on the Pi (192.168.50.131) on 2026-09-01:
 //
-// What that means for a reader: do NOT treat the network as a second layer, and
-// do not relax the token rules on the strength of one. STILL OWED, by an
-// operator on the Pi and not by this package:
+//	table inet filter { chain input {                 # policy accept
+//	  tcp dport 8790 ip saddr 192.168.50.{94,75,186,191} accept   # the 4 cluster nodes
+//	  tcp dport 8790 drop                                          # "not a cluster node"
+//	}}
 //
-//   - a host firewall rule restricting :8790 to the LAN (nftables on the Pi),
-//   - and, until it exists, keeping COMIC_FLEX_CONTROL_TOKEN out of anything
-//     that leaves the LAN.
+// Applied from /etc/nftables.conf ON THE PI by nftables.service (enabled;
+// ExecStart is `nft -f /etc/nftables.conf`). The ruleset is ALSO written out in
+// homelab-talos, at claudedocs/runbook-comic-flex-pwa-deploy.md §1a, with the
+// apply procedure and a rollback — that is where to rebuild it from.
 //
-// When that rule lands, say so here and name where it is defined.
+// 🔴 But NOTHING REASSERTS IT. The runbook is a human procedure, not a
+// reconciler; the rule is not in this repo, and no CI or GitOps applies it. It
+// survives exactly as long as that host file does, and a reimaged Pi comes back
+// without it — with no alert, and with the API still listening. (Checked: no
+// config-management agent on the Pi, no /etc/.git, no /etc/nftables.d, no cron
+// or timer referencing nftables.)
+//
+// Verified from both sides rather than by reading the ruleset alone. From a LAN
+// host outside the allow list, tcp/8790 HANGS INDEFINITELY — every observed
+// "timeout" was the prober's own ceiling, at 3 s and again at 20 s, not the
+// connection giving up — while tcp/22 connects in ~2 ms and a port with no
+// listener answers RST in ~2 ms. Three outcomes, so "filtered" is distinguished
+// from "closed" and from "host down". The attribution is tighter than that: the
+// DROP RULE'S OWN COUNTER advances by exactly the blocked attempts while the
+// four accept counters stay still, so it is THIS rule and not the router.
+//
+// The accept counters also settle the masquerade question /etc/nftables.conf
+// raises about itself. A bare counter names no originator, so this was checked
+// properly: the PWA pod is an ordinary pod-network pod (hostNetwork unset,
+// podIP 10.244.0.x) on talos-jkj-deb, and that node's rule carries an order of
+// magnitude more packets than the other three. Traffic leaving 10.244.0.x and
+// arriving with saddr 192.168.50.94 can only be SNAT.
+//
+// What that means for a reader: there are now two layers, not one. Do NOT relax
+// the token rules on the strength of it — the drop protects against other LAN
+// devices reaching a host with passwordless root, and nothing more. Anything
+// that reaches this port from a cluster node and holds the token still gets a
+// root-adjacent host, so keep COMIC_FLEX_CONTROL_TOKEN off anything leaving the
+// LAN. If the rule is ever removed or the Pi reimaged, the token is once again
+// the only control — re-measure rather than trusting this paragraph.
 const DefaultAddr = "0.0.0.0:8790"
 
 // maxBodyBytes caps request bodies. Every body this API accepts is a handful of

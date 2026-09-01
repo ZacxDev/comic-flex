@@ -182,11 +182,120 @@ func (g gtkViewer) GotoIndex(index int) {
 	}
 }
 
+// SetInterval changes the seconds between slides and makes the change take
+// effect NOW, by retiring the pending GLib timeout and arming a fresh one at the
+// new interval.
+//
+// 🔴 Storing the value alone was a defect, not a design. setSlideInterval used to
+// be the whole implementation and its own comment said "it takes effect on the
+// next tick": lower the interval from 3600 to 30 and the display kept waiting out
+// the remaining hour, while GET /api/state reported a stationary 30 the entire
+// time (the countdown is clamped to [0, slide_interval], and the real deadline
+// was an hour away). Both symptoms are the one cause — a live timer armed for a
+// duration nobody wants any more.
+//
+// It is an R1 write, so it runs inside an Enqueue closure on the GTK main loop,
+// which is the only place glib.SourceRemove and glib.TimeoutAdd may be called.
+// 🔴 Do NOT follow Rescan here. Rescan is the documented exception that runs on
+// the HTTP handler goroutine so it can answer 503 synchronously; this one arms
+// GLib sources and must not.
+//
+// The re-arm is conditional on the value MOVING. Re-arming resets the countdown,
+// so an unconditional re-arm would let a client that re-POSTs its current
+// interval on every poll push the deadline out forever and starve the advance —
+// a display that never turns the page, from an endpoint that "did nothing".
+//
+// ⚠ SCOPE OF THAT GUARD, stated because the sentence above is easy to read as
+// wider than it is: it blocks the IDENTICAL value, and nothing more. A client
+// alternating 1, 2, 1, 2 … faster than the armed interval re-arms on every
+// request and starves the advance completely.
+//
+// 🔴 And that is NOT only an abuse case. The client this API exists for is the
+// operator's own PWA, and an un-debounced slider or number input dragged across
+// a range emits exactly that sequence — an authorised client behaving NORMALLY.
+// Authentication bounds WHO can trigger it, not whether it happens by accident;
+// an earlier wording of this paragraph said "an authorised client behaving
+// pathologically", which reads as an accepted risk rather than a live one. If the
+// PWA's interval control is not debounced, this is reachable from a drag.
+//
+// Closing it properly means conditioning the re-arm on the REMAINING time rather
+// than on value equality — a different design with different edge cases. Do not
+// "tighten" the equality check and believe the wider sentence has become true.
+//
+// ⚠ The BIND ADDRESS is not an operational choice: controlAddr =
+// control.DefaultAddr = "0.0.0.0:8790" is pinned here at compile time and main
+// passes that constant, with no environment, flag or config override anywhere in
+// the repo. The listener is on ALL INTERFACES by construction.
+//
+// 🔴 WHAT NARROWS THAT LISTENER, IF ANYTHING, IS DOCUMENTED AT
+// control.DefaultAddr. Read it there. Do not restate or summarise it here.
+//
+// Successive versions of this paragraph got the network wrong, and the timeline
+// is the lesson, so it is recorded rather than smoothed over. The nftables rule
+// went live at 2026-08-31 22:17 UTC. The version that asserted a narrowing
+// firewall was written the next morning and was therefore TRUE — it was called an
+// over-claim on the strength of a measurement from 08-30 that had already been
+// overtaken. The version that replaced it, summarising DefaultAddr's comment as
+// recording the firewall absent, was FALSE AT THE INSTANT IT WAS WRITTEN, eight
+// hours after the rule landed.
+//
+// So the failure was never "the fact changed underneath me". Both errors came
+// from re-stating a fact sourced from a stale reading instead of from the thing
+// itself — once to assert it, once to deny it. A summary is a copy wearing a
+// citation. Point at DefaultAddr, which is measured and dated, and say nothing
+// about the network here.
+//
+// PAUSED: it re-arms anyway, and that is the decision rather than an oversight.
+// The slide timer runs while paused — startSlideshow re-arms on every tick and
+// only the ADVANCE is gated on !isPaused — so a pending source exists to retire
+// in that state exactly as in any other, and skipping the re-arm would leave the
+// old duration armed under the new interval: the same stale-timer defect, just
+// invisible until the operator resumes. Nothing is user-visible at the moment of
+// the change, because snapshotAt reports seconds_until_next as 0 while paused;
+// what it buys is that a resume finds the NEW interval already armed instead of
+// silently serving out the rest of the old one.
 func (g gtkViewer) SetInterval(seconds int) {
-	if seconds < 0 {
-		return // the handler already rejects this; belt for the direct caller
+	// 🔴 `<= 0`, not `< 0`, and the zero is the whole point — the belt was
+	// narrower than the hazard its own neighbour names. countdownFrom's comment
+	// in state.go says plainly which way the damage runs if a 0 ever arrives:
+	// "glib.TimeoutAdd(0, …) in startSlideshow spinning the main loop through S3
+	// GETs is the real one". Before the re-arm, a 0 that got past here sat in
+	// config until the next tick; now it is armed IMMEDIATELY, as a zero-delay
+	// timeout that re-arms itself from its own callback — a wedged Pi, not a slow
+	// one. POST /api/interval bounds to 1..3600 so this is unreachable from the
+	// network today, which is exactly why it has to be a real guard here rather
+	// than a comment pointing at the handler: this is the belt for the DIRECT
+	// caller, and 0 is the value that hurts.
+	if seconds <= 0 {
+		// Logged, not dropped in silence, and it has no other way to be seen: the
+		// closure runs after the handler has already answered 202, so there is
+		// nobody left to return an error to, and refusing means GET /api/state does
+		// not change either.
+		//
+		// It matches the two "<noun> refused:" log sites in the program —
+		// enqueueBounded's "mutation refused" and scanImagesAsyncVia's. 🔴 Those
+		// are the only two. An earlier version of this comment said "every other
+		// refusal in this program says so" and listed handleRescan as a third:
+		// FALSE, and falsifiable by grep — internal/control does not import log at
+		// all, and handleRescan refuses over HTTP via refuse(w, …). The refusal a
+		// caller sees from handleRescan IS scanImagesAsyncVia's, so the old list
+		// named one mechanism twice and one that does not exist.
+		//
+		// Uncoalesced, because handleInterval rejects anything outside 1..3600
+		// before enqueueing and no other caller of SetInterval exists, so this
+		// cannot be driven from the network. ⚠ That reasoning is exactly what
+		// Viewer.SetInterval's contract tells implementers NOT to rely on, and the
+		// tension is deliberate but narrow: if an in-process direct caller is ever
+		// added — the case this guard exists for — revisit the coalescing, because
+		// an uncoalesced line in a loop reaches journald.
+		log.Printf("interval refused: %d is not a positive number of seconds; "+
+			"the slide interval is unchanged", seconds)
+		return
 	}
-	g.iv.setSlideInterval(uint(seconds))
+	if !g.iv.setSlideInterval(uint(seconds)) {
+		return
+	}
+	g.iv.rearmSlideTimer()
 }
 
 // Rescan starts a bucket listing, or refuses when maxConcurrentScans scans are

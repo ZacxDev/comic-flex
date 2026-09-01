@@ -126,10 +126,18 @@ func (iv *ImageViewer) pairKeys() (leftIdx int, left string, rightIdx int, right
 // onScanComplete runs update when a freshly scanned gallery should be shown
 // immediately, i.e. nothing has been displayed yet.
 //
-// 🔴 The read lock is released BEFORE update runs. update re-enters these
-// accessors, and the recursive RLock that produces is a deadlock as soon as a
-// writer queues between the two acquisitions. Do not fold the call back inside
-// the critical section.
+// 🔴 The read lock is released BEFORE update runs, and folding the call back
+// inside the critical section is an UNCONDITIONAL deadlock on the ordinary path —
+// not, as this comment used to say, "a deadlock as soon as a writer queues
+// between the two acquisitions". That wording described only the early-return
+// failure paths, which take read locks; on the SUCCESS path update reaches
+// updateSingleImage, which calls noteLayoutBox and noteDisplayed, and both take
+// the WRITE lock. sync.RWMutex is not reentrant, so RLock-then-Lock in one
+// goroutine hangs with nothing else running.
+//
+// Corrected here, at the site, because the understated version was read as a
+// general rule and copied into rearmSlideTimer's comment — where the same audit
+// caught it. Both sites are one rule: RELEASE BEFORE YOU CALL OUT.
 func (iv *ImageViewer) onScanComplete(update func()) {
 	iv.mutex.RLock()
 	show := len(iv.images) > 0 && iv.currentIndex == 0
@@ -659,12 +667,92 @@ func (iv *ImageViewer) slideInterval() uint {
 	return iv.config.SlideInterval
 }
 
-// setSlideInterval changes the seconds between slides. It takes effect on the
-// next tick; the timer is not restarted.
-func (iv *ImageViewer) setSlideInterval(seconds uint) {
+// setSlideInterval changes the seconds between slides and reports whether the
+// value actually MOVED.
+//
+// 🔴 CORRECTED. This used to say "It takes effect on the next tick; the timer is
+// not restarted", which was an accurate description of a defect. Nothing
+// cancelled or re-armed the pending GLib timeout, so lowering the interval from
+// 3600 to 30 changed nothing on the display for up to an hour, and
+// GET /api/state's countdown — clamped to [0, slide_interval] against a deadline
+// an hour out — sat frozen on 30 for ~59 minutes. The store is still all THIS
+// function does; what changed is that its caller now re-arms (gtkViewer.
+// SetInterval in control_adapter.go), so a POST /api/interval takes effect
+// immediately. Keeping the store and the re-arm as two steps is deliberate: the
+// GLib calls must not happen under this lock, and they must not happen off the
+// GTK main loop.
+//
+// changed is why the return value exists, and it is not decoration. The caller
+// re-arms only when the value moved, because re-arming resets the countdown: a
+// client that POSTs the same interval on every poll — which a settings page that
+// submits its whole form is entitled to do — would otherwise push the deadline
+// out on every request and starve the advance completely. A no-op write stays a
+// no-op.
+func (iv *ImageViewer) setSlideInterval(seconds uint) (changed bool) {
 	iv.mutex.Lock()
 	defer iv.mutex.Unlock()
+	changed = iv.config.SlideInterval != seconds
 	iv.config.SlideInterval = seconds
+	return changed
+}
+
+// setArmTimer records the closure that arms the slide timer, so that a later
+// interval change can run it again.
+//
+// startSlideshow is the only caller and its startTimer closure is the only
+// value: that closure IS the single arming site — it retires the pending source
+// and calls glib.TimeoutAdd, writing the handle and the deadline through one
+// swapTimeout. Re-arming by calling it again is therefore not a second arming
+// site, which is exactly what TestTheSlideTimerHasExactlyOneArmingSite requires
+// and what keeps seconds_until_next honest.
+func (iv *ImageViewer) setArmTimer(fn func()) {
+	iv.mutex.Lock()
+	defer iv.mutex.Unlock()
+	iv.armTimer = fn
+}
+
+// rearmSlideTimer cancels the pending slide timeout and arms a fresh one at the
+// CURRENT interval, and reports whether it did.
+//
+// 🔴 IT MUST RUN ON THE GTK MAIN LOOP. It calls glib.SourceRemove and
+// glib.TimeoutAdd through the closure it invokes, and neither is safe from an
+// HTTP handler goroutine. Its one production caller is gtkViewer.SetInterval,
+// which is an R1 write and therefore only ever runs inside an Enqueue closure —
+// see the Viewer contract in internal/control/viewer.go. Do not call this from
+// gtkViewer.Rescan or from any other off-thread path.
+//
+// 🔴 The lock is RELEASED before the closure runs, and holding it would be an
+// UNCONDITIONAL deadlock — not a race that needs a competing writer to lose.
+// startTimer calls swapTimeout, which takes the WRITE lock, and sync.RWMutex is
+// not reentrant: RLock then Lock on the same mutex in the same goroutine hangs on
+// its own, with nothing else running. Measured, by holding it: a single-goroutine
+// test with no other party died on sync.runtime_SemacquireRWMutex.
+//
+// onScanComplete above releases for exactly the same reason, and its comment now
+// says so. Both sites are one rule, not two: RELEASE BEFORE YOU CALL OUT.
+//
+// 🔴 A paragraph here once claimed the sibling was the weaker case — that it
+// "only deadlocks when a writer queues between the two acquisitions". Measured
+// false, and worth recording HOW it got written: by reasoning from
+// onScanComplete's own (understated) comment instead of from what its callee
+// does. Correcting it only here would have left the source of the error intact,
+// ~590 lines from the correction, for the next person to copy again. That is why
+// the fix went to state.go's onScanComplete as well.
+//
+// false means nothing was armed because startSlideshow has not run yet. That is
+// reachable only during boot — main() calls startSlideshow before it starts the
+// control API — and it is harmless: the value is already stored, so the first
+// arm picks it up.
+func (iv *ImageViewer) rearmSlideTimer() (rearmed bool) {
+	iv.mutex.RLock()
+	arm := iv.armTimer
+	iv.mutex.RUnlock()
+
+	if arm == nil {
+		return false
+	}
+	arm()
+	return true
 }
 
 // indexOfKey reports the position of key in the gallery.
