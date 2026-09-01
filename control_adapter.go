@@ -207,14 +207,24 @@ func (g gtkViewer) GotoIndex(index int) {
 //
 // ⚠ SCOPE OF THAT GUARD, stated because the sentence above is easy to read as
 // wider than it is: it blocks the IDENTICAL value, and nothing more. A client
-// alternating 1, 2, 1, 2 … faster than one second still re-arms on every request
-// and still starves the advance completely. That is not closed here, and the
-// reason it is acceptable is authentication, not the guard: POST /api/interval
-// is bearer-gated and the LAN listener is firewalled, so the remaining case is
-// an authorised client behaving pathologically. Closing it properly means
-// conditioning the re-arm on the REMAINING time rather than on value equality,
-// which is a different design with different edge cases — do not "tighten" the
-// equality check and believe the wider sentence has become true.
+// alternating 1, 2, 1, 2 … faster than the armed interval re-arms on every
+// request and starves the advance completely.
+//
+// 🔴 And that is NOT only an abuse case. The client this API exists for is the
+// operator's own PWA, and an un-debounced slider or number input dragged across
+// a range emits exactly that sequence — an authorised client behaving NORMALLY.
+// Authentication bounds WHO can trigger it, not whether it happens by accident;
+// an earlier wording of this paragraph said "an authorised client behaving
+// pathologically", which reads as an accepted risk rather than a live one. If the
+// PWA's interval control is not debounced, this is reachable from a drag.
+//
+// Closing it properly means conditioning the re-arm on the REMAINING time rather
+// than on value equality — a different design with different edge cases. Do not
+// "tighten" the equality check and believe the wider sentence has become true.
+//
+// ⚠ Bind address and firewalling are OPERATIONAL assumptions, not properties of
+// this code: ListenAndServe takes whatever addr main passes, and nothing in this
+// repo pins a firewall rule. Do not cite them here as if the repo enforced them.
 //
 // PAUSED: it re-arms anyway, and that is the decision rather than an oversight.
 // The slide timer runs while paused — startSlideshow re-arms on every tick and
@@ -238,6 +248,16 @@ func (g gtkViewer) SetInterval(seconds int) {
 	// than a comment pointing at the handler: this is the belt for the DIRECT
 	// caller, and 0 is the value that hurts.
 	if seconds <= 0 {
+		// Logged, not dropped in silence. Every other refusal in this program says
+		// so — enqueueBounded's "mutation refused", scanImagesAsyncVia's, and
+		// handleRescan's — and this one has no other way to be seen: the closure
+		// runs after the handler has already answered 202, so there is nobody left
+		// to return an error to, and refusing means GET /api/state does not change
+		// either. Uncoalesced deliberately: the only caller that can reach it is a
+		// direct one inside this process, so it cannot be driven from the network
+		// and cannot become log spam.
+		log.Printf("interval refused: %d is not a positive number of seconds; "+
+			"the slide interval is unchanged", seconds)
 		return
 	}
 	if !g.iv.setSlideInterval(uint(seconds)) {

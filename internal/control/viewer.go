@@ -299,6 +299,15 @@ type Viewer interface {
 	// a client that re-sends its current value on every poll must not be able to
 	// push the next advance out indefinitely.
 	//
+	// 🔴 An implementation MUST REFUSE a non-positive value outright — neither
+	// storing it nor arming anything — rather than trusting the handler's
+	// 1..3600 bound to have filtered it. The bound is this package's; the danger
+	// is the implementation's, and it is specific: a 0 interval arms a zero-delay
+	// timer that re-arms itself from its own callback, which on the comic-flex
+	// implementation wedges the GTK main loop and takes the display down with it.
+	// The requirement belongs here rather than only in that implementation,
+	// because a second implementer has no other way to learn it.
+	//
 	// It is an R1 write, so it runs inside an Enqueue closure — which is what
 	// makes arming a GLib source from it legal.
 	SetInterval(seconds int)

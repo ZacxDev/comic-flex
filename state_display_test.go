@@ -1005,13 +1005,21 @@ func armedTimer(iv *ImageViewer) (glib.SourceHandle, time.Time) {
 //
 // 🔴 It is not tidiness, and the reason it is not yet a bug is worth writing
 // down. These tests arm REAL GLib timeouts on the default main context, some of
-// them seconds away from firing, and four tests elsewhere in this package
-// (lifecycle_test.go) ITERATE that same context. Nothing in package main calls
-// t.Parallel, so a test's sources are always retired before the next test runs
-// and no other test's Iteration can ever dispatch them. Add t.Parallel anywhere
-// in this package and that stops being true: an expired slide timeout could be
-// dispatched inside an unrelated test, running advance + updateImage — a real S3
-// GET — on that test's goroutine, and the failure would be attributed to it.
+// them seconds away from firing, and SIX tests in lifecycle_test.go ITERATE that
+// same context (four literal ctx.Iteration sites, one of which is the shared
+// drainMainContext helper with four callers — the site count is not the test
+// count, and it understates this). Nothing in package main calls t.Parallel, so a
+// test's sources are always retired before the next test runs and no other test's
+// Iteration can ever dispatch them.
+//
+// Add t.Parallel anywhere in this package and that stops being true: an expired
+// slide timeout would be dispatched inside an unrelated test. 🔴 What happens
+// then is a PANIC, not a slow test — measured, not assumed. newControlTestViewer
+// leaves the store field nil, so the closure reaches iv.store.LoadImage and
+// nil-dereferences, which aborts the whole test binary from inside a test that
+// never armed anything. (An earlier version of this note said "a real S3 GET",
+// which would have sent the next maintainer looking for a network problem in the
+// wrong test.)
 func retireArmedTimer(t *testing.T, iv *ImageViewer) {
 	t.Helper()
 	if previous := iv.swapTimeout(0, time.Time{}); previous != 0 {
@@ -1429,6 +1437,15 @@ func TestSetIntervalRefusesAZeroRatherThanArmingAZeroDelayTimeout(t *testing.T) 
 			if gotHandle != handle || !gotDeadline.Equal(deadline) {
 				t.Fatalf("SetInterval(%d) re-armed the timer: (handle %d, deadline %v) -> "+
 					"(handle %d, deadline %v)", seconds, handle, deadline, gotHandle, gotDeadline)
+			}
+			// And GLib agrees, not just this program's bookkeeping. The two probes
+			// answer different questions and this file has both for a reason: a
+			// refusal that somehow armed and retired a source would leave the
+			// struct fields identical and the registry changed.
+			if !sourceIsArmed(handle) {
+				t.Fatalf("SetInterval(%d) left source %d unregistered on the main context, "+
+					"even though the bookkeeping still names it: the refusal path touched "+
+					"GLib when it should have done nothing at all", seconds, handle)
 			}
 		})
 	}
