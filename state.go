@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ZacxDev/comic-flex/internal/layout"
 	"github.com/gotk3/gotk3/glib"
 )
 
@@ -435,24 +436,34 @@ func (iv *ImageViewer) queueDepth() int {
 
 // noteLayoutBox records the box the render that just completed scaled into.
 //
-// It is stored as two ints rather than a layout.Box so that this file keeps its
-// dependency set: state.go is the locking discipline and nothing else.
-func (iv *ImageViewer) noteLayoutBox(w, h int) {
+// 🔴 It takes a layout.Box, NOT a (w, h) pair, and that is a correctness choice
+// rather than a stylistic one. With two ints, `iv.noteLayoutBox(box.H, box.W)`
+// is a transposition that compiles, type-checks and reads fine — an audit
+// mutation did exactly that and SURVIVED the whole suite. A single struct
+// argument makes the mistake unrepresentable instead of relying on a test to
+// notice it.
+func (iv *ImageViewer) noteLayoutBox(b layout.Box) {
 	iv.mutex.Lock()
 	defer iv.mutex.Unlock()
-	iv.lastLayoutW, iv.lastLayoutH = w, h
+	iv.lastLayoutBox = b
 }
 
-// layoutBoxChanged reports whether w,h differs from the box the last completed
+// layoutBoxChanged reports whether b differs from the box the last completed
 // render used — i.e. whether a re-render would actually produce anything new.
 //
-// A render that has not completed leaves 0,0, which differs from every real
-// box, so the first geometry change after a failed load re-renders rather than
-// being suppressed.
-func (iv *ImageViewer) layoutBoxChanged(w, h int) bool {
+// 🔴 BOTH AXES. An audit mutation that compared width only survived the suite,
+// and that is the sharpest possible miss here: the latch this whole change
+// exists to prevent was measured as 3840x2160 -> 3840x3513, in which the WIDTH
+// IS IDENTICAL and only the height moves. A width-only comparator would decline
+// to re-render in precisely the case that matters.
+//
+// A render that has not completed leaves the zero Box, which differs from every
+// real box, so the first geometry change after a failed load re-renders rather
+// than being suppressed.
+func (iv *ImageViewer) layoutBoxChanged(b layout.Box) bool {
 	iv.mutex.RLock()
 	defer iv.mutex.RUnlock()
-	return w != iv.lastLayoutW || h != iv.lastLayoutH
+	return b != iv.lastLayoutBox
 }
 
 // beginRelayout reserves the single relayout slot, or reports false when one is
