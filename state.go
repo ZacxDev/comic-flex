@@ -378,8 +378,9 @@ func (iv *ImageViewer) scanCount() int {
 // code did not enforce. This bounds the closures enqueueBounded schedules — the
 // R1 mutation endpoints that go through Server.enqueue, which is POST
 // /api/{next,prev,pause,resume,toggle,viewmode,goto,interval} today. It does NOT
-// bound every closure on the main loop. Two others exist and are bounded
-// elsewhere:
+// bound every closure on the main loop. Three others exist and are bounded
+// elsewhere — count the bullets rather than trusting this number, which has
+// been wrong once already:
 //
 //   - scanImagesAsyncVia schedules its completion callback (the one that reaches
 //     updateSingleImage and a 30 s S3 GET) DIRECTLY, outside this accounting. It

@@ -235,9 +235,9 @@ func TestNothingOffTheGTKThreadCanReachAWidget(t *testing.T) {
 		}
 		if _, ok := g.reaches(must); !ok {
 			t.Fatalf("%s does NOT reach a widget call according to this graph, and it plainly "+
-				"does (updateSingleImage calls window.GetSize and image.SetFromPixbuf). The "+
-				"detector cannot observe the hazard, so its clean verdict below is worthless.",
-				must)
+				"does (updateSingleImage calls image.SetFromPixbuf, and reaches window.GetSize "+
+				"via iv.layoutBox). The detector cannot observe the hazard, so its clean verdict "+
+				"below is worthless.", must)
 		}
 	}
 

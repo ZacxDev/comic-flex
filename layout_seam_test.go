@@ -32,14 +32,26 @@ import (
 // callSite is one method call, with the function it appears in and the
 // expression it was called on.
 type callSite struct {
-	File string
-	Func string
-	Recv string
-	Line int
+	File   string
+	Func   string
+	Method string
+	Recv   string
+	Line   int
 }
 
+// Method is the name that was called. It is stored rather than implied so the
+// String below can actually name it — the first version fed a literal "" to its
+// own %s verb and printed `main.go:829 () in layoutBox`, dropping the one
+// identifier a maintainer reading a ledger failure needs.
 func (c callSite) String() string {
-	return fmt.Sprintf("%s:%d %s() in %s, on %q", c.File, c.Line, "", c.Func, c.Recv)
+	where := c.Recv
+	if where == "" {
+		where = "(package-level)"
+	}
+	if c.Line == 0 {
+		return fmt.Sprintf("%s %s() in %s, on %s", c.File, c.Method, c.Func, where)
+	}
+	return fmt.Sprintf("%s:%d %s() in %s, on %s", c.File, c.Line, c.Method, c.Func, where)
 }
 
 // callSitesIn walks one parsed file and reports every call to the named method.
@@ -73,19 +85,21 @@ func callSitesIn(fset *token.FileSet, file *ast.File, name, method string) []cal
 			case *ast.SelectorExpr:
 				if fun.Sel.Name == method {
 					sites = append(sites, callSite{
-						File: name,
-						Func: currentFunc,
-						Recv: types.ExprString(fun.X),
-						Line: fset.Position(fun.Sel.Pos()).Line,
+						File:   name,
+						Func:   currentFunc,
+						Method: method,
+						Recv:   types.ExprString(fun.X),
+						Line:   fset.Position(fun.Sel.Pos()).Line,
 					})
 				}
 			case *ast.Ident:
 				if fun.Name == method {
 					sites = append(sites, callSite{
-						File: name,
-						Func: currentFunc,
-						Recv: "", // a package-level call has no receiver
-						Line: fset.Position(fun.Pos()).Line,
+						File:   name,
+						Func:   currentFunc,
+						Method: method,
+						Recv:   "", // a package-level call has no receiver
+						Line:   fset.Position(fun.Pos()).Line,
 					})
 				}
 			}
@@ -200,8 +214,8 @@ func TestOnlyLayoutBoxReadsTheWindowSizeForLayout(t *testing.T) {
 	}
 
 	want := []callSite{
-		{File: "main.go", Func: "layoutBox", Recv: "iv.window"},
-		{File: "main.go", Func: "setupUI", Recv: "iv.window"},
+		{File: "main.go", Func: "layoutBox", Method: "GetSize", Recv: "iv.window"},
+		{File: "main.go", Func: "setupUI", Method: "GetSize", Recv: "iv.window"},
 	}
 	if len(sites) != len(want) {
 		t.Fatalf("GetSize() is called from %d site(s), want %d.\n"+
@@ -521,6 +535,38 @@ func TestDisplaySizeConsultsTheFallbackChain(t *testing.T) {
 	if !found {
 		t.Error("displaySize does not call firstUsableSize; a hand-rolled fallback chain is " +
 			"how round 1's unreachable-fallback defect happened")
+	}
+}
+
+// TestAnUnreadableDisplayIsAnnounced pins the ANTI-INERTNESS half of round 1's
+// finding 1, which shipped with no coverage at all: deleting both
+// noteDisplayUnknown call sites left the entire suite green, restoring exactly
+// the silence the finding objected to.
+//
+// It matters because of what the silence hides. With no display reading,
+// SelectBox falls back entirely to the window size — the policy that latched —
+// so the operator sees the ORIGINAL BUG from a build whose whole purpose is to
+// fix it. The log line is the only thing that distinguishes "the fix is working"
+// from "the fix went inert", and an unobserved failure mode on an appliance in
+// someone's house is one nobody will ever diagnose.
+//
+// 🔴 STRUCTURAL, and labelled as one: both call sites sit on GDK failure paths
+// that cannot be reached without a display. It pins that the announcement
+// EXISTS on both of them, not what it says.
+func TestAnUnreadableDisplayIsAnnounced(t *testing.T) {
+	var inDisplaySize int
+	for _, s := range packageCallSites(t, "noteDisplayUnknown") {
+		t.Logf("  %s", s)
+		if s.Func == "displaySize" {
+			inDisplaySize++
+		}
+	}
+	// Two: the no-default-display path and the no-usable-geometry path. Both
+	// end with layout falling back to the window size, and both must say so.
+	if inDisplaySize != 2 {
+		t.Errorf("displaySize announces an unreadable display on %d path(s), want 2 "+
+			"(no default display, and no usable monitor geometry). Without the announcement the "+
+			"fix reverts to the latching policy silently.", inDisplaySize)
 	}
 }
 
