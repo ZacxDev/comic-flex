@@ -126,10 +126,18 @@ func (iv *ImageViewer) pairKeys() (leftIdx int, left string, rightIdx int, right
 // onScanComplete runs update when a freshly scanned gallery should be shown
 // immediately, i.e. nothing has been displayed yet.
 //
-// 🔴 The read lock is released BEFORE update runs. update re-enters these
-// accessors, and the recursive RLock that produces is a deadlock as soon as a
-// writer queues between the two acquisitions. Do not fold the call back inside
-// the critical section.
+// 🔴 The read lock is released BEFORE update runs, and folding the call back
+// inside the critical section is an UNCONDITIONAL deadlock on the ordinary path —
+// not, as this comment used to say, "a deadlock as soon as a writer queues
+// between the two acquisitions". That wording described only the early-return
+// failure paths, which take read locks; on the SUCCESS path update reaches
+// updateSingleImage, which calls noteLayoutBox and noteDisplayed, and both take
+// the WRITE lock. sync.RWMutex is not reentrant, so RLock-then-Lock in one
+// goroutine hangs with nothing else running.
+//
+// Corrected here, at the site, because the understated version was read as a
+// general rule and copied into rearmSlideTimer's comment — where the same audit
+// caught it. Both sites are one rule: RELEASE BEFORE YOU CALL OUT.
 func (iv *ImageViewer) onScanComplete(update func()) {
 	iv.mutex.RLock()
 	show := len(iv.images) > 0 && iv.currentIndex == 0
@@ -720,21 +728,16 @@ func (iv *ImageViewer) setArmTimer(fn func()) {
 // its own, with nothing else running. Measured, by holding it: a single-goroutine
 // test with no other party died on sync.runtime_SemacquireRWMutex.
 //
-// 🔴 CORRECTED, one audit round after being written. This paragraph said
-// onScanComplete above releases for a "related-but-different reason … which only
-// deadlocks when a writer queues between the two acquisitions", making that
-// sibling's early unlock sound merely defensive next to this one. MEASURED FALSE.
-// onScanComplete's callee is updateImage, and on the SUCCESS path
-// updateSingleImage calls noteLayoutBox and noteDisplayed — both of which take
-// the WRITE lock. So holding the read lock across it deadlocks unconditionally
-// too, on the ordinary path. The "only if a writer queues" reading is true just
-// of its early-return failure paths, which is where that wording came from.
+// onScanComplete above releases for exactly the same reason, and its comment now
+// says so. Both sites are one rule, not two: RELEASE BEFORE YOU CALL OUT.
 //
-// Both sites are therefore the same rule, not two: RELEASE BEFORE YOU CALL OUT.
-// It is written here because the correction is the kind that regenerates —
-// onScanComplete's own comment describes a recursive-RLock hazard, and reasoning
-// from that description rather than from what its callee does is exactly how the
-// wrong sentence got written the first time.
+// 🔴 A paragraph here once claimed the sibling was the weaker case — that it
+// "only deadlocks when a writer queues between the two acquisitions". Measured
+// false, and worth recording HOW it got written: by reasoning from
+// onScanComplete's own (understated) comment instead of from what its callee
+// does. Correcting it only here would have left the source of the error intact,
+// ~590 lines from the correction, for the next person to copy again. That is why
+// the fix went to state.go's onScanComplete as well.
 //
 // false means nothing was armed because startSlideshow has not run yet. That is
 // reachable only during boot — main() calls startSlideshow before it starts the

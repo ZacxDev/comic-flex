@@ -222,9 +222,16 @@ func (g gtkViewer) GotoIndex(index int) {
 // than on value equality — a different design with different edge cases. Do not
 // "tighten" the equality check and believe the wider sentence has become true.
 //
-// ⚠ Bind address and firewalling are OPERATIONAL assumptions, not properties of
-// this code: ListenAndServe takes whatever addr main passes, and nothing in this
-// repo pins a firewall rule. Do not cite them here as if the repo enforced them.
+// ⚠ CORRECTED — and it was wrong in the REASSURING direction, which is why it is
+// spelled out rather than quietly reworded. This said "bind address and
+// firewalling are OPERATIONAL assumptions, not properties of this code". Only the
+// firewall half is true. The bind address is pinned IN THIS REPO AT COMPILE TIME,
+// and to the most permissive value there is: controlAddr = control.DefaultAddr =
+// "0.0.0.0:8790", passed by main with no environment override anywhere. So the
+// listener is on ALL INTERFACES by construction, and the only thing narrowing it
+// is a firewall rule that lives outside this repo and that nothing here checks.
+// Read the old wording and you would think the deployment chose the address; it
+// does not.
 //
 // PAUSED: it re-arms anyway, and that is the decision rather than an oversight.
 // The slide timer runs while paused — startSlideshow re-arms on every tick and
@@ -248,14 +255,27 @@ func (g gtkViewer) SetInterval(seconds int) {
 	// than a comment pointing at the handler: this is the belt for the DIRECT
 	// caller, and 0 is the value that hurts.
 	if seconds <= 0 {
-		// Logged, not dropped in silence. Every other refusal in this program says
-		// so — enqueueBounded's "mutation refused", scanImagesAsyncVia's, and
-		// handleRescan's — and this one has no other way to be seen: the closure
-		// runs after the handler has already answered 202, so there is nobody left
-		// to return an error to, and refusing means GET /api/state does not change
-		// either. Uncoalesced deliberately: the only caller that can reach it is a
-		// direct one inside this process, so it cannot be driven from the network
-		// and cannot become log spam.
+		// Logged, not dropped in silence, and it has no other way to be seen: the
+		// closure runs after the handler has already answered 202, so there is
+		// nobody left to return an error to, and refusing means GET /api/state does
+		// not change either.
+		//
+		// It matches the two "<noun> refused:" log sites in the program —
+		// enqueueBounded's "mutation refused" and scanImagesAsyncVia's. 🔴 Those
+		// are the only two. An earlier version of this comment said "every other
+		// refusal in this program says so" and listed handleRescan as a third:
+		// FALSE, and falsifiable by grep — internal/control does not import log at
+		// all, and handleRescan refuses over HTTP via refuse(w, …). The refusal a
+		// caller sees from handleRescan IS scanImagesAsyncVia's, so the old list
+		// named one mechanism twice and one that does not exist.
+		//
+		// Uncoalesced, because handleInterval rejects anything outside 1..3600
+		// before enqueueing and no other caller of SetInterval exists, so this
+		// cannot be driven from the network. ⚠ That reasoning is exactly what
+		// Viewer.SetInterval's contract tells implementers NOT to rely on, and the
+		// tension is deliberate but narrow: if an in-process direct caller is ever
+		// added — the case this guard exists for — revisit the coalescing, because
+		// an uncoalesced line in a loop reaches journald.
 		log.Printf("interval refused: %d is not a positive number of seconds; "+
 			"the slide interval is unchanged", seconds)
 		return

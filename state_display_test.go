@@ -1005,21 +1005,31 @@ func armedTimer(iv *ImageViewer) (glib.SourceHandle, time.Time) {
 //
 // 🔴 It is not tidiness, and the reason it is not yet a bug is worth writing
 // down. These tests arm REAL GLib timeouts on the default main context, some of
-// them seconds away from firing, and SIX tests in lifecycle_test.go ITERATE that
-// same context (four literal ctx.Iteration sites, one of which is the shared
-// drainMainContext helper with four callers — the site count is not the test
-// count, and it understates this). Nothing in package main calls t.Parallel, so a
+// them seconds away from firing, and a number of tests in lifecycle_test.go
+// ITERATE that same context. Nothing in package main calls t.Parallel, so a
 // test's sources are always retired before the next test runs and no other test's
 // Iteration can ever dispatch them.
 //
-// Add t.Parallel anywhere in this package and that stops being true: an expired
-// slide timeout would be dispatched inside an unrelated test. 🔴 What happens
-// then is a PANIC, not a slow test — measured, not assumed. newControlTestViewer
-// leaves the store field nil, so the closure reaches iv.store.LoadImage and
-// nil-dereferences, which aborts the whole test binary from inside a test that
-// never armed anything. (An earlier version of this note said "a real S3 GET",
-// which would have sent the next maintainer looking for a network problem in the
-// wrong test.)
+// 🔴 NO COUNT IS GIVEN HERE, deliberately, and that is the second correction to
+// this paragraph. It said "four tests", was corrected to "six", and six was ALSO
+// wrong — the real figure was seven, because ctx.Iteration is reached both
+// directly and through drainMainContext AND through waitScanCount, which calls
+// drainMainContext in turn. A count of call SITES is not a count of tests, the
+// version of this sentence that said so out loud still undercounted by stopping
+// one helper level short, and any number written here rots the next time a helper
+// gains a caller. What matters is the relationship — some tests iterate the
+// shared default main context, transitively — so that is what is written.
+//
+// Add t.Parallel anywhere in this package and the invariant stops holding: an
+// expired slide timeout would be dispatched inside an unrelated test. What
+// happens then is usually a PANIC, not a slow test — measured, not assumed.
+// newControlTestViewer leaves the store field nil, so the closure reaches
+// iv.store.LoadImage and nil-dereferences, aborting the whole test binary from
+// inside a test that never armed anything. ("Usually": a fixture that is PAUSED
+// when its source expires re-arms silently instead, because the closure gates the
+// render on !isPaused — still a stray source in a foreign test, just a quiet one.
+// An earlier version of this note said "a real S3 GET", which would have sent the
+// next maintainer hunting a network problem in the wrong test.)
 func retireArmedTimer(t *testing.T, iv *ImageViewer) {
 	t.Helper()
 	if previous := iv.swapTimeout(0, time.Time{}); previous != 0 {
