@@ -230,13 +230,20 @@ func (g gtkViewer) GotoIndex(index int) {
 // 🔴 WHAT NARROWS THAT LISTENER, IF ANYTHING, IS DOCUMENTED AT
 // control.DefaultAddr. Read it there. Do not restate or summarise it here.
 //
-// Three successive versions of this paragraph got the network wrong, each in the
-// reassuring direction: the first called the bind address an operational
-// assumption (it is not — see above); the second asserted a narrowing firewall
-// that was, at the time, measured absent; the third replaced that with a summary
-// of what DefaultAddr's comment SAID — and the rule landed days later, making the
-// summary false while the pointer around it stayed correct. A summary is a copy
-// wearing a citation, and it goes stale on the target's schedule, not yours.
+// Successive versions of this paragraph got the network wrong, and the timeline
+// is the lesson, so it is recorded rather than smoothed over. The nftables rule
+// went live at 2026-08-31 22:17 UTC. The version that asserted a narrowing
+// firewall was written the next morning and was therefore TRUE — it was called an
+// over-claim on the strength of a measurement from 08-30 that had already been
+// overtaken. The version that replaced it, summarising DefaultAddr's comment as
+// recording the firewall absent, was FALSE AT THE INSTANT IT WAS WRITTEN, eight
+// hours after the rule landed.
+//
+// So the failure was never "the fact changed underneath me". Both errors came
+// from re-stating a fact sourced from a stale reading instead of from the thing
+// itself — once to assert it, once to deny it. A summary is a copy wearing a
+// citation. Point at DefaultAddr, which is measured and dated, and say nothing
+// about the network here.
 //
 // PAUSED: it re-arms anyway, and that is the decision rather than an oversight.
 // The slide timer runs while paused — startSlideshow re-arms on every tick and

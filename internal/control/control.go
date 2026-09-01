@@ -22,18 +22,33 @@ import (
 //	  tcp dport 8790 drop                                          # "not a cluster node"
 //	}}
 //
-// Defined in /etc/nftables.conf ON THE PI — a host file, applied by
-// nftables.service (enabled + active). 🔴 It is NOT in this repo and NOT in
-// homelab-talos, so nothing in CI or GitOps reasserts it: it survives exactly as
-// long as that file does, and a reimaged Pi comes back without it.
+// Applied from /etc/nftables.conf ON THE PI by nftables.service (enabled;
+// ExecStart is `nft -f /etc/nftables.conf`). The ruleset is ALSO written out in
+// homelab-talos, at claudedocs/runbook-comic-flex-pwa-deploy.md §1a, with the
+// apply procedure and a rollback — that is where to rebuild it from.
 //
-// Verified from both sides rather than by reading the ruleset alone. From a
-// non-cluster LAN host, tcp/8790 HANGS (~3.1 s, silent drop) while tcp/22
-// connects normally and a port with no listener answers RST instantly — three
-// outcomes, so "filtered" is distinguished from "closed" and from "host down".
-// From inside, the per-rule counters on the four accept lines are non-zero,
-// which also settles the masquerade question /etc/nftables.conf raises: pod
-// traffic does arrive bearing a cluster NODE's source address.
+// 🔴 But NOTHING REASSERTS IT. The runbook is a human procedure, not a
+// reconciler; the rule is not in this repo, and no CI or GitOps applies it. It
+// survives exactly as long as that host file does, and a reimaged Pi comes back
+// without it — with no alert, and with the API still listening. (Checked: no
+// config-management agent on the Pi, no /etc/.git, no /etc/nftables.d, no cron
+// or timer referencing nftables.)
+//
+// Verified from both sides rather than by reading the ruleset alone. From a LAN
+// host outside the allow list, tcp/8790 HANGS INDEFINITELY — every observed
+// "timeout" was the prober's own ceiling, at 3 s and again at 20 s, not the
+// connection giving up — while tcp/22 connects in ~2 ms and a port with no
+// listener answers RST in ~2 ms. Three outcomes, so "filtered" is distinguished
+// from "closed" and from "host down". The attribution is tighter than that: the
+// DROP RULE'S OWN COUNTER advances by exactly the blocked attempts while the
+// four accept counters stay still, so it is THIS rule and not the router.
+//
+// The accept counters also settle the masquerade question /etc/nftables.conf
+// raises about itself. A bare counter names no originator, so this was checked
+// properly: the PWA pod is an ordinary pod-network pod (hostNetwork unset,
+// podIP 10.244.0.x) on talos-jkj-deb, and that node's rule carries an order of
+// magnitude more packets than the other three. Traffic leaving 10.244.0.x and
+// arriving with saddr 192.168.50.94 can only be SNAT.
 //
 // What that means for a reader: there are now two layers, not one. Do NOT relax
 // the token rules on the strength of it — the drop protects against other LAN
