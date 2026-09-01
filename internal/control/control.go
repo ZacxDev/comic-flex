@@ -13,22 +13,35 @@ import (
 // DefaultAddr is the bind address required by the design: the cluster reaches
 // the Pi by LAN IP, so loopback is not an option.
 //
-// 🔴 THE BEARER TOKEN IS THE ONLY CONTROL ON THIS PORT TODAY. This comment used
-// to claim the compensating control was "the bearer token plus a host firewall
-// rule restricting :8790 to the LAN". That firewall does not exist. Measured on
-// the Pi (192.168.50.131) on 2026-08-30: `nft list ruleset` empty, no iptables
-// binary, no ufw, and `sudo -n id` returns uid=0 — so anything that reaches
-// this port and holds the token gets a root-adjacent host.
+// ✅ THE FIREWALL RULE THIS COMMENT WAS OWED HAS LANDED, and this paragraph is
+// the "say so here and name where it is defined" that the previous version asked
+// for. Measured on the Pi (192.168.50.131) on 2026-09-01:
 //
-// What that means for a reader: do NOT treat the network as a second layer, and
-// do not relax the token rules on the strength of one. STILL OWED, by an
-// operator on the Pi and not by this package:
+//	table inet filter { chain input {                 # policy accept
+//	  tcp dport 8790 ip saddr 192.168.50.{94,75,186,191} accept   # the 4 cluster nodes
+//	  tcp dport 8790 drop                                          # "not a cluster node"
+//	}}
 //
-//   - a host firewall rule restricting :8790 to the LAN (nftables on the Pi),
-//   - and, until it exists, keeping COMIC_FLEX_CONTROL_TOKEN out of anything
-//     that leaves the LAN.
+// Defined in /etc/nftables.conf ON THE PI — a host file, applied by
+// nftables.service (enabled + active). 🔴 It is NOT in this repo and NOT in
+// homelab-talos, so nothing in CI or GitOps reasserts it: it survives exactly as
+// long as that file does, and a reimaged Pi comes back without it.
 //
-// When that rule lands, say so here and name where it is defined.
+// Verified from both sides rather than by reading the ruleset alone. From a
+// non-cluster LAN host, tcp/8790 HANGS (~3.1 s, silent drop) while tcp/22
+// connects normally and a port with no listener answers RST instantly — three
+// outcomes, so "filtered" is distinguished from "closed" and from "host down".
+// From inside, the per-rule counters on the four accept lines are non-zero,
+// which also settles the masquerade question /etc/nftables.conf raises: pod
+// traffic does arrive bearing a cluster NODE's source address.
+//
+// What that means for a reader: there are now two layers, not one. Do NOT relax
+// the token rules on the strength of it — the drop protects against other LAN
+// devices reaching a host with passwordless root, and nothing more. Anything
+// that reaches this port from a cluster node and holds the token still gets a
+// root-adjacent host, so keep COMIC_FLEX_CONTROL_TOKEN off anything leaving the
+// LAN. If the rule is ever removed or the Pi reimaged, the token is once again
+// the only control — re-measure rather than trusting this paragraph.
 const DefaultAddr = "0.0.0.0:8790"
 
 // maxBodyBytes caps request bodies. Every body this API accepts is a handful of

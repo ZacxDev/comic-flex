@@ -227,14 +227,16 @@ func (g gtkViewer) GotoIndex(index int) {
 // passes that constant, with no environment, flag or config override anywhere in
 // the repo. The listener is on ALL INTERFACES by construction.
 //
-// 🔴 DO NOT RESTATE THE NETWORK SITUATION HERE — read control.DefaultAddr's own
-// comment, which MEASURED it. Two successive versions of this paragraph got it
-// wrong in the reassuring direction: the first called the bind address an
-// operational assumption (it is not), and the second said the listener is
-// narrowed by "a firewall rule that lives outside this repo" — asserting, in the
-// present tense, a control that DefaultAddr's comment records as measured ABSENT
-// on the Pi and still owed. Restating a fact that lives somewhere else is what
-// generated both errors; pointing at it cannot.
+// 🔴 WHAT NARROWS THAT LISTENER, IF ANYTHING, IS DOCUMENTED AT
+// control.DefaultAddr. Read it there. Do not restate or summarise it here.
+//
+// Three successive versions of this paragraph got the network wrong, each in the
+// reassuring direction: the first called the bind address an operational
+// assumption (it is not — see above); the second asserted a narrowing firewall
+// that was, at the time, measured absent; the third replaced that with a summary
+// of what DefaultAddr's comment SAID — and the rule landed days later, making the
+// summary false while the pointer around it stayed correct. A summary is a copy
+// wearing a citation, and it goes stale on the target's schedule, not yours.
 //
 // PAUSED: it re-arms anyway, and that is the decision rather than an oversight.
 // The slide timer runs while paused — startSlideshow re-arms on every tick and
