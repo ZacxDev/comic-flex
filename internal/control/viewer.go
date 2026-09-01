@@ -68,10 +68,23 @@ func ParseViewMode(s string) (ViewMode, bool) {
 // with Keys POPULATED: a rescan that returns an empty bucket empties the gallery,
 // but the last frame is still lit on the glass. Measured: `total 0, key "",
 // keys ["a.jpg"], scanning false`. A client following the two-field rule alone
-// paints "0 comics" over a comic the operator can see. The full rule is:
-// `Scanning && Total == 0` is indexing; `Total == 0 && len(Keys) > 0` is "the
-// bucket is empty but the display still holds the last page"; `Total == 0 &&
-// len(Keys) == 0` is the only genuine "no comics".
+// paints "0 comics" over a comic the operator can see.
+//
+// 🔴 The rule below is a PARTITION and the guard order is load-bearing. An
+// earlier wording of it dropped the `!Scanning` from the last two arms, which
+// made cold start — Scanning true, Total 0, Keys empty — match BOTH the first
+// arm and the last, and they say opposite things. A client implementing the last
+// arm literally would paint "0 comics" during indexing: the exact defect the
+// first paragraph of this comment exists to prevent, reintroduced by the
+// clarification meant to close a different blindness in it. Test Scanning FIRST:
+//
+//	Scanning && Total == 0                → "indexing…"
+//	!Scanning && Total == 0 && len(Keys)>0 → the bucket is empty but the display
+//	                                         still holds the last page it rendered
+//	!Scanning && Total == 0 && len(Keys)==0 → the only genuine "no comics"
+//
+// TestTheEmptiedGalleryStatesAreReachableAndDistinct pins the two Total == 0
+// states apart, so neither can quietly stop being reachable.
 // 🔴 Keys and SecondsUntilNext are the two fields the companion PWA reads, and
 // each answers a question the client provably CANNOT answer for itself. Both are
 // filled from the SAME lock acquisition as every field above them, so they never
@@ -114,10 +127,11 @@ func ParseViewMode(s string) (ViewMode, bool) {
 //	A consumer must therefore treat Keys as the display's own answer and never
 //	assert it against Key.
 //
-//	Lengths, IN A SETTLED STATE — i.e. once a render has completed in the CURRENT
-//	view mode: 1 in either single view; 2 in landscape_two when two DISTINCT
-//	positions are on screen; 1 in landscape_two when both halves are the same
-//	position (a one-image gallery); empty when nothing has been rendered yet.
+//	Lengths. Empty until the first render completes — that is the boot state and
+//	it is not covered by the list below. THEREAFTER, and only in a SETTLED state
+//	(a render has completed in the CURRENT view mode): 1 in either single view;
+//	2 in landscape_two when two DISTINCT positions are on screen; 1 in
+//	landscape_two when both halves are the same position (a one-image gallery).
 //	🔴 "Settled" is load-bearing and is not decoration: a view-mode switch whose
 //	re-render then fails leaves the PREVIOUS mode's frame lit, so
 //	`view_mode: "portrait_single"` with two Keys is reachable and legal. A client

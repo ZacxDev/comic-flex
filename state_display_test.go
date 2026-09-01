@@ -135,6 +135,100 @@ func TestKeysIsEmptyBeforeAnythingHasBeenRendered(t *testing.T) {
 	}
 }
 
+// TestTheEmptiedGalleryStatesAreReachableAndDistinct pins the two wire states
+// that Snapshot's contract describes as MEASURED but that nothing asserted.
+//
+// 🔴 An unpinned "Measured:" line in a comment is a claim with no guard behind
+// it, and this one is load-bearing: the contract tells a PWA author to branch on
+// `!Scanning && Total == 0 && len(Keys) > 0` — "the bucket is empty but the
+// display still holds the last page". A plausible future tidy-up — clearing
+// displayedKeys inside setImages, which looks like obvious hygiene — would make
+// that state UNREACHABLE, turn the client's branch into dead code, and leave all
+// 384 tests green. Nothing else in the suite reaches Total == 0 with keys
+// populated.
+//
+// It also pins the two states APART, which is the property the partition in the
+// contract turns on: "no comics" and "empty bucket, last page still lit" must not
+// serialize identically, exactly as scanning-vs-empty must not.
+func TestTheEmptiedGalleryStatesAreReachableAndDistinct(t *testing.T) {
+	iv := newControlTestViewer(30, "a.jpg", "b.jpg")
+	iv.noteDisplayed([]string{"a.jpg"}) // a render completed and lit a page
+
+	// A rescan returns an empty bucket. setImages must NOT touch what is on the
+	// glass — nothing cleared the screen, so the last page is still there.
+	iv.setImages(nil)
+
+	lit := iv.snapshot()
+	if lit.total != 0 || lit.key != "" {
+		t.Fatalf("snapshot = %+v, want total 0 and no key after the gallery emptied", lit)
+	}
+	if !reflect.DeepEqual(lit.keys, []string{"a.jpg"}) {
+		t.Fatalf("keys = %v after the gallery emptied, want [a.jpg] — the last rendered page "+
+			"is still on the display, and the contract tells a client to branch on exactly "+
+			"this state; if setImages now clears displayedKeys, that branch is dead code",
+			lit.keys)
+	}
+
+	// The genuine "no comics": nothing listed AND nothing ever rendered.
+	dark := newControlTestViewer(30).snapshot()
+	if dark.total != 0 || len(dark.keys) != 0 {
+		t.Fatalf("snapshot = %+v, want total 0 and no keys", dark)
+	}
+	if reflect.DeepEqual(lit.keys, dark.keys) {
+		t.Fatal("'the bucket is empty but a page is still lit' and 'no comics' produce " +
+			"identical keys — a client cannot tell them apart, and one of them has a comic " +
+			"on the screen")
+	}
+}
+
+// TestAPausedRescanLeavesKeyAndKeysDisagreeingIndefinitely pins the other
+// measured claim: the divergence window between Key and Keys is UNBOUNDED, not
+// "up to a 30 s image load" as an earlier version of the contract said.
+//
+// 🔴 Two independent gates conspire, and the comment is only true because BOTH
+// hold: startSlideshow re-renders only `if !iv.isPaused()`, and onScanComplete
+// re-renders only when `currentIndex == 0`. So a rescan that lands while paused
+// at a non-zero index leaves a key on the wire that is no longer in the gallery
+// at all, until an operator does something. If either gate changes, this test
+// fails and the contract paragraph has to be rewritten — which is the point.
+func TestAPausedRescanLeavesKeyAndKeysDisagreeingIndefinitely(t *testing.T) {
+	iv := newControlTestViewer(30, "a.jpg", "b.jpg")
+	iv.setPausedState(true)
+	if !iv.gotoIndex(1) {
+		t.Fatal("gotoIndex failed")
+	}
+	iv.noteDisplayed([]string{"b.jpg"}) // the render that is on the glass
+
+	// A rescan replaces the gallery wholesale; b.jpg is gone from it.
+	iv.setImages([]string{"x.jpg", "y.jpg"})
+
+	got := iv.snapshot()
+	if got.total != 2 || got.index != 1 || got.key != "y.jpg" {
+		t.Fatalf("snapshot = %+v, want total 2, index 1, key y.jpg", got)
+	}
+	if !reflect.DeepEqual(got.keys, []string{"b.jpg"}) {
+		t.Fatalf("keys = %v, want [b.jpg] — the frame on the glass is the pre-rescan one",
+			got.keys)
+	}
+
+	// The state the contract warns a consumer about: keys names an object that is
+	// not in the gallery any more, so presigning it can 404.
+	if _, ok := iv.indexOfKey(got.keys[0]); ok {
+		t.Fatal("the fixture no longer exercises the case where keys names an object that " +
+			"has left the gallery")
+	}
+
+	// And nothing corrects it: the two gates the contract names are both shut.
+	iv.onScanComplete(func() {
+		t.Fatal("onScanComplete re-rendered at a non-zero index — the contract's claim that " +
+			"the divergence is unbounded rests on it NOT doing that")
+	})
+	if !iv.isPaused() {
+		t.Fatal("the viewer is no longer paused; the slide timer would paper over the " +
+			"divergence and this test would stop pinning what it claims")
+	}
+}
+
 // TestKeysReflectTheSettledStateAfterARender is the other half of the guard
 // above: once the render HAS completed, key is keys[0] and the two agree. Without
 // it, an implementation that simply never updated keys would pass the
@@ -404,9 +498,19 @@ func noteDisplayedCallSites(t *testing.T) []noteDisplayedArg {
 // TestEachRenderPathRecordsTheKeysItActuallyLoaded closes the seam that
 // TestBothRenderPathsRecordWhatTheyDisplayedAfterTheWidgetTakesIt leaves open.
 //
-// 🔴 THIS IS THE GUARD FOR THE FIELD'S WHOLE PURPOSE, and it is here because an
-// adversarial audit found the suite blind to it. Two mutants passed all 381 tests
-// with 0 FAIL:
+// 🔴 SCOPE FIRST, because the NAME overclaims and a later round measured that it
+// does. This pins the ARGUMENT EXPRESSION each render path records. It does NOT
+// bind what was LOADED to what is RECORDED, and two mutants prove the gap:
+// making updateTwoImages load leftKey for BOTH halves while still recording
+// displayedPair(...), and reassigning imageKey immediately before the record,
+// each leave the argument text identical and each SURVIVE this guard and the
+// whole suite. Both are unreachable through the AST — they are about values at
+// run time, and neither render path can be run without a display. Read the name
+// as "records the keys it NAMED", not "verified against the pixels".
+//
+// 🔴 It is still the guard for the field's central failure, and it is here
+// because an adversarial audit found the suite blind to it. Two mutants passed
+// all 381 tests with 0 FAIL:
 //
 //	updateSingleImage: iv.noteDisplayed([]string{"WRONG-KEY-NOT-ON-SCREEN.jpg"})
 //	updateTwoImages:   iv.noteDisplayed([]string{leftKey})   // drops the right half
