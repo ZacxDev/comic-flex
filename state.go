@@ -590,9 +590,17 @@ func displayedPair(leftIdx int, left string, rightIdx int, right string) []strin
 // worse than none — it reads as coverage and stops anyone looking — so there
 // isn't one.
 //
-// interval genuinely reaches 0: the HTTP handler bounds POST /api/interval to
-// 1..3600, but gtkViewer.SetInterval only rejects NEGATIVES, so SetInterval(0)
-// lands a zero and every countdown is then correctly pinned at 0.
+// ⚠ CORRECTED, and said plainly because the previous wording made a reachability
+// claim that is FALSE. It read "interval genuinely reaches 0 … so SetInterval(0)
+// lands a zero", which was wrong on both halves: loadConfig rewrites a 0 config
+// to 30 (main.go), the handler bounds POST /api/interval to 1..3600, and
+// gtkViewer.SetInterval has no caller but that handler's closure — so 0 does NOT
+// reach here in production. countdownFrom is a pure function and its interval==0
+// row is a TOTALITY test of that function, an invariant guard; it is not
+// regression coverage for a bug that has happened, and must not be counted as
+// any. Note also which way the damage would run if a 0 ever did arrive: the
+// countdown reading 0 is the harmless part, and glib.TimeoutAdd(0, …) in
+// startSlideshow spinning the main loop through S3 GETs is the real one.
 func countdownFrom(remaining time.Duration, interval uint) int {
 	if remaining <= 0 {
 		return 0
@@ -773,7 +781,12 @@ func (iv *ImageViewer) snapshotAt(now time.Time) viewerSnapshot {
 	// that will not happen would be showing a lie. A retired timer (handle 0)
 	// has no scheduled advance at all.
 	if !s.paused && iv.timeoutID != 0 {
-		s.secondsUntilNext = countdownFrom(iv.nextAdvanceAt.Sub(now), iv.config.SlideInterval)
+		// s.slideInterval, NOT a second read of iv.config.SlideInterval. They are
+		// the same value under this lock today, but clamping against the field
+		// that is REPORTED makes "seconds_until_next is never above
+		// slide_interval" true of this response by construction, rather than true
+		// of two reads a later edit could separate.
+		s.secondsUntilNext = countdownFrom(iv.nextAdvanceAt.Sub(now), s.slideInterval)
 	}
 	return s
 }

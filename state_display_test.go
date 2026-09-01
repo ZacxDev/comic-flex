@@ -1,7 +1,13 @@
 package main
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/printer"
+	"go/token"
+	"os"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -246,17 +252,29 @@ func TestNoteDisplayedDoesNotAliasTheCallersSlice(t *testing.T) {
 	}
 }
 
-// TestBothRenderPathsRecordWhatTheyDisplayedAfterTheWidgetTakesIt is a STRUCTURAL
-// guard, labelled as one: it proves where the recording happens, not that the
-// pixels are right.
+// TestBothRenderPathsRecordWhatTheyDisplayedAfterTheWidgetTakesIt pins WHERE and
+// WHEN the recording happens. It says nothing about WHAT is recorded — that is
+// TestEachRenderPathRecordsTheKeysItActuallyLoaded, and the two are only adequate
+// together.
 //
-// It earns its place because neither render path can be unit-tested at all — both
-// end in gtk.Image.SetFromPixbuf, which needs a display — so the ORDERING rule
-// they must obey has no behavioural guard available. The rule is the same one
+// 🔴 SCOPE, narrowed to match the body. The name reads like full coverage of the
+// recording, and an audit measured that it is not: with this guard green, both
+// `noteDisplayed([]string{"WRONG-KEY-NOT-ON-SCREEN.jpg"})` and a two-up path
+// recording only its left half passed the ENTIRE suite. It checks the SET of
+// calling functions and the LINE ORDER against SetFromPixbuf; it never looks at
+// the argument.
+//
+// What it does pin earns its place, because neither render path can be
+// unit-tested at all — both end in gtk.Image.SetFromPixbuf, which needs a display
+// — so the ORDERING rule has no behavioural guard available. The rule is the one
 // noteLayoutBox lives by: record only after the pixbuf is on the widget. Recorded
 // BEFORE the load, `keys` would name a frame that never appeared, and a failed
 // 30 s S3 GET would leave that claim standing while the previous comic is still
 // lit — silently, forever.
+//
+// ⚠ And it is walkable by SHAPE rather than by ordering: a noteDisplayed wrapped
+// in a never-true condition, placed textually after SetFromPixbuf, survives. That
+// is inherent to a line-number guard. Said here so it is not read as more.
 func TestBothRenderPathsRecordWhatTheyDisplayedAfterTheWidgetTakesIt(t *testing.T) {
 	renders := []string{"updateSingleImage", "updateTwoImages"}
 
@@ -297,6 +315,196 @@ func TestBothRenderPathsRecordWhatTheyDisplayedAfterTheWidgetTakesIt(t *testing.
 				"%d — a render that bails out between them claims a frame that never "+
 				"appeared", fn, note, set)
 		}
+	}
+}
+
+// noteDisplayedArg is one `iv.noteDisplayed(...)` call site with its argument
+// rendered back to source text.
+type noteDisplayedArg struct {
+	File string
+	Func string
+	Line int
+	Arg  string
+}
+
+// exprSource prints an expression back to source text, in full.
+//
+// 🔴 NOT types.ExprString, and this is a measured correction rather than a
+// preference. types.ExprString ELIDES the elements of a composite literal: it
+// renders both `[]string{imageKey}` and `[]string{"WRONG-KEY-NOT-ON-SCREEN.jpg"}`
+// as the identical string `[]string{…}`. A ledger built on it compares equal for
+// the correct code and for the exact mutant it exists to catch — a guard that
+// reads as coverage and provides none. Caught before it shipped only because
+// TestTheNoteDisplayedArgumentFinderCanSeeAWrongArgument checks the finder
+// against a wrong argument rather than trusting it.
+//
+// go/printer emits the whole expression. Whitespace is normalised so that
+// gofmt's line-breaking decisions are not part of the contract.
+func exprSource(fset *token.FileSet, e ast.Expr) string {
+	var b strings.Builder
+	if err := printer.Fprint(&b, fset, e); err != nil {
+		return "<unprintable: " + err.Error() + ">"
+	}
+	return strings.Join(strings.Fields(b.String()), " ")
+}
+
+// noteDisplayedCallSites walks every non-test file of package main and reports
+// each noteDisplayed call together with the EXPRESSION it passes.
+//
+// packageCallSites deliberately does not carry arguments — it answers "who calls
+// this", which is the question the ledgers above it ask. This one answers "with
+// what", and that turned out to be the question that mattered.
+func noteDisplayedCallSites(t *testing.T) []noteDisplayedArg {
+	t.Helper()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("reading the package directory: %v", err)
+	}
+	fset := token.NewFileSet()
+	var out []noteDisplayedArg
+	scanned := 0
+	for _, e := range entries {
+		n := e.Name()
+		if !strings.HasSuffix(n, ".go") || strings.HasSuffix(n, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, n, nil, 0)
+		if err != nil {
+			t.Fatalf("parsing %s: %v", n, err)
+		}
+		scanned++
+		var currentFunc string
+		ast.Inspect(f, func(node ast.Node) bool {
+			switch x := node.(type) {
+			case *ast.FuncDecl:
+				currentFunc = x.Name.Name
+			case *ast.CallExpr:
+				sel, ok := x.Fun.(*ast.SelectorExpr)
+				if !ok || sel.Sel.Name != "noteDisplayed" {
+					return true
+				}
+				arg := "<no argument>"
+				if len(x.Args) == 1 {
+					arg = exprSource(fset, x.Args[0])
+				}
+				out = append(out, noteDisplayedArg{
+					File: n, Func: currentFunc, Arg: arg,
+					Line: fset.Position(sel.Sel.Pos()).Line,
+				})
+			}
+			return true
+		})
+	}
+	if scanned == 0 {
+		t.Fatal("scanned no source files at all — this guard is inspecting nothing")
+	}
+	return out
+}
+
+// TestEachRenderPathRecordsTheKeysItActuallyLoaded closes the seam that
+// TestBothRenderPathsRecordWhatTheyDisplayedAfterTheWidgetTakesIt leaves open.
+//
+// 🔴 THIS IS THE GUARD FOR THE FIELD'S WHOLE PURPOSE, and it is here because an
+// adversarial audit found the suite blind to it. Two mutants passed all 381 tests
+// with 0 FAIL:
+//
+//	updateSingleImage: iv.noteDisplayed([]string{"WRONG-KEY-NOT-ON-SCREEN.jpg"})
+//	updateTwoImages:   iv.noteDisplayed([]string{leftKey})   // drops the right half
+//
+// The second is the PR's own motivating case — the two-up view reporting one key
+// is exactly the state `keys` exists to end — and every guard walked past it.
+// Each side was tested in isolation: displayedPair has its own table, and
+// TestTheTwoUpRenderReportsThePairPairKeysGaveIt hand-assembles the call. Nothing
+// bound the CALL SITE to the helper, so a render path that bypassed displayedPair
+// entirely was invisible. Isolation-seam, exactly.
+//
+// Neither render path can be executed without a display (both end in
+// gtk.Image.SetFromPixbuf), so the argument cannot be observed behaviourally at
+// all. What can be pinned is the expression, WHOLE and normalised rather than by
+// substring — a partial match ("mentions leftKey") is satisfied by the mutant
+// that passes only leftKey.
+//
+// The cost is real and accepted: renaming a local in either render path fails
+// this test. That is the price of a machine-readable claim about a value no test
+// can otherwise reach, and the fix is one line in the ledger.
+func TestEachRenderPathRecordsTheKeysItActuallyLoaded(t *testing.T) {
+	want := map[string]string{
+		// The key currentKey() resolved and LoadImage was called with — not a
+		// re-read of the index, which a queued page turn may already have moved.
+		"updateSingleImage": "[]string{imageKey}",
+		// Both halves, from the one pairKeys read the two loads used, through the
+		// helper that collapses a one-image gallery. A mutant that passes
+		// []string{leftKey} — or that inlines the pair and skips the collapse —
+		// fails here.
+		"updateTwoImages": "displayedPair(idx, leftKey, rightIdx, rightKey)",
+	}
+
+	sites := noteDisplayedCallSites(t)
+	for _, s := range sites {
+		t.Logf("  %s:%d  %s() <- %s", s.File, s.Line, s.Func, s.Arg)
+	}
+	if len(sites) != len(want) {
+		t.Fatalf("noteDisplayed is called from %d site(s), want %d.\nAnything that puts a "+
+			"pixbuf on the widget must record the keys IT loaded; anything that records "+
+			"without displaying is lying about the glass.\ngot: %+v", len(sites), len(want), sites)
+	}
+	for _, s := range sites {
+		w, ok := want[s.Func]
+		if !ok {
+			t.Errorf("%s:%d records displayed keys from %s(), which is not a render path",
+				s.File, s.Line, s.Func)
+			continue
+		}
+		if s.Arg != w {
+			t.Errorf("%s:%d %s() records `%s`, want exactly `%s` — GET /api/state would report "+
+				"keys that are not the ones this render put on the screen, which is the whole "+
+				"defect the field exists to close",
+				s.File, s.Line, s.Func, s.Arg, w)
+		}
+	}
+}
+
+// TestTheNoteDisplayedArgumentFinderCanSeeAWrongArgument is the instrument
+// control for the guard above: an extractor that silently matched nothing, or
+// that returned the same string for every call, would make that ledger vacuously
+// clean. Both failure modes are checked against source built to defeat them — a
+// literal argument, a bare identifier, and a call with no argument at all.
+func TestTheNoteDisplayedArgumentFinderCanSeeAWrongArgument(t *testing.T) {
+	const src = `package main
+func a() { iv.noteDisplayed([]string{"WRONG-KEY-NOT-ON-SCREEN.jpg"}) }
+func b() { iv.noteDisplayed([]string{leftKey}) }
+func c() { iv.noteDisplayed() }
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "synthetic.go", src, 0)
+	if err != nil {
+		t.Fatalf("parsing the control source: %v", err)
+	}
+	var got []string
+	var currentFunc string
+	ast.Inspect(f, func(node ast.Node) bool {
+		switch x := node.(type) {
+		case *ast.FuncDecl:
+			currentFunc = x.Name.Name
+		case *ast.CallExpr:
+			if sel, ok := x.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "noteDisplayed" {
+				arg := "<no argument>"
+				if len(x.Args) == 1 {
+					arg = exprSource(fset, x.Args[0])
+				}
+				got = append(got, currentFunc+":"+arg)
+			}
+		}
+		return true
+	})
+	want := []string{
+		`a:[]string{"WRONG-KEY-NOT-ON-SCREEN.jpg"}`,
+		"b:[]string{leftKey}",
+		"c:<no argument>",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("the argument finder reported %#v, want %#v — the ledger above cannot see "+
+			"the mutants it exists to catch", got, want)
 	}
 }
 
@@ -535,6 +743,82 @@ func TestTheSlideTimerHasExactlyOneArmingSite(t *testing.T) {
 	if inStart != 2 {
 		t.Errorf("startSlideshow calls swapTimeout %d time(s), want 2 (retire, then arm)", inStart)
 	}
+
+	// 🔴 ONE interval read, and it took an audit to notice nothing pinned it.
+	// startSlideshow's own comment claims reading the interval twice "would let
+	// POST /api/interval land between them and produce a countdown for a duration
+	// no timer was ever armed for", and
+	// TestStartSlideshowArmsTheCountdownFromTheTimersOwnInterval's docstring says
+	// it pins ONE read at ONE instant — but its body cannot tell one read from
+	// two, because a test that never moves the interval mid-call gets the same
+	// answer either way. Splitting the local back into two iv.slideInterval()
+	// calls SURVIVED the whole suite. A docstring claiming a relationship while
+	// the body checks one side of it is worse than no guard: it stops the next
+	// person looking.
+	reads := 0
+	for _, s := range packageCallSites(t, "slideInterval") {
+		if s.File == "main.go" && s.Func == "startSlideshow" {
+			reads++
+		}
+	}
+	if reads != 1 {
+		t.Errorf("startSlideshow reads slideInterval() %d time(s), want exactly 1 — the GLib "+
+			"timeout and the deadline it is counted down from must come from the SAME read, "+
+			"or POST /api/interval landing between them arms one duration and reports another",
+			reads)
+	}
+}
+
+// TestLoweringTheIntervalFreezesTheCountdownUntilTheTimerCatchesUp pins a KNOWN
+// WRONG-LOOKING behaviour so that it is an asserted property rather than a
+// surprise, and so that anyone who fixes it has to come here and say so.
+//
+// 🔴 SetInterval deliberately does not restart the running timer — "it takes
+// effect on the next tick" — so after lowering the interval the armed source is
+// still the OLD duration away, while the contract clamps the report to the NEW
+// interval. The result is a countdown that sits still. Found by audit; measured
+// here rather than described.
+//
+// There is no honest small answer available inside the [0, slide_interval] bound:
+// the true remaining is the large number the bound forbids reporting. The real
+// fix is for SetInterval to re-arm, which changes an existing endpoint's
+// documented semantics and is a separate decision — see the contract note on
+// Snapshot.SecondsUntilNext. This test exists so that decision is made
+// deliberately.
+func TestLoweringTheIntervalFreezesTheCountdownUntilTheTimerCatchesUp(t *testing.T) {
+	iv := newControlTestViewer(600, "a.jpg")
+	armed := time.Now()
+	iv.swapTimeout(glib.SourceHandle(3), armed.Add(600*time.Second))
+
+	// POST /api/interval lands. 11 is neither a factor nor a multiple of 600.
+	iv.setSlideInterval(11)
+
+	for _, tc := range []struct {
+		elapsed time.Duration
+		want    int
+		note    string
+	}{
+		{0, 11, "clamped down from 600 the instant the interval changed"},
+		{5 * time.Minute, 11, "still frozen: the armed source is 5 minutes from firing"},
+		{589 * time.Second, 11, "frozen right up to the point the truth drops below 11"},
+		{594 * time.Second, 6, "and only now does it start to move"},
+		{600 * time.Second, 0, "the armed source is finally due"},
+	} {
+		got := iv.snapshotAt(armed.Add(tc.elapsed)).secondsUntilNext
+		if got != tc.want {
+			t.Errorf("%v after arming: seconds_until_next = %d, want %d (%s)",
+				tc.elapsed, got, tc.want, tc.note)
+		}
+		if got > int(iv.slideInterval()) {
+			t.Errorf("%v after arming: seconds_until_next = %d exceeds slide_interval %d — "+
+				"the clamp that causes the freeze is also the contract, and it broke",
+				tc.elapsed, got, iv.slideInterval())
+		}
+	}
+
+	if previous := iv.swapTimeout(0, time.Time{}); previous != 3 {
+		t.Fatalf("swapTimeout returned %d, want 3", previous)
+	}
 }
 
 // TestSnapshotReadsKeysAndTheCountdownUnderTheSameLock is a -race detection, not
@@ -580,8 +864,8 @@ func TestSnapshotReadsKeysAndTheCountdownUnderTheSameLock(t *testing.T) {
 	}
 	close(stop)
 	wg.Wait()
-
-	if previous := iv.swapTimeout(0, time.Time{}); previous != 0 {
-		_ = previous // no real GLib source was ever created here; nothing to remove
-	}
+	// No cleanup: the handles above are bare integers, not real GLib sources —
+	// nothing was registered on the main context, so there is nothing to remove.
+	// An earlier version ended with a swapTimeout(0, …) that read as cleanup and
+	// cleaned nothing up.
 }

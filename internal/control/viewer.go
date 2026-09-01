@@ -61,6 +61,17 @@ func ParseViewMode(s string) (ViewMode, bool) {
 // A client that renders a spinner on Scanning ALONE will therefore cover a
 // fully populated gallery: the "indexing…" condition is `Scanning && Total == 0`.
 // Scanning on its own means "a rescan is not finished with the display yet".
+//
+// 🔴 SINCE Keys EXISTS THERE IS A FOURTH STATE, and this paragraph did not
+// mention it until Keys was added — the addition staled it. `Total == 0 &&
+// !Scanning` was described above as flatly "no comics", and it is now reachable
+// with Keys POPULATED: a rescan that returns an empty bucket empties the gallery,
+// but the last frame is still lit on the glass. Measured: `total 0, key "",
+// keys ["a.jpg"], scanning false`. A client following the two-field rule alone
+// paints "0 comics" over a comic the operator can see. The full rule is:
+// `Scanning && Total == 0` is indexing; `Total == 0 && len(Keys) > 0` is "the
+// bucket is empty but the display still holds the last page"; `Total == 0 &&
+// len(Keys) == 0` is the only genuine "no comics".
 // 🔴 Keys and SecondsUntilNext are the two fields the companion PWA reads, and
 // each answers a question the client provably CANNOT answer for itself. Both are
 // filled from the SAME lock acquisition as every field above them, so they never
@@ -84,22 +95,56 @@ func ParseViewMode(s string) (ViewMode, bool) {
 //	  - a render that FAILED (a 30 s S3 GET that timed out) leaves the previous
 //	    keys here, because those are the ones still on the screen;
 //	  - between a page turn and the render completing, Key/Index describe the new
-//	    SELECTION while Keys still describes the old FRAME. That window is a real
-//	    image load — up to 30 s. It is deliberate: Key is where the slideshow is,
-//	    Keys is what the panel is showing, and collapsing them would mean lying
-//	    about one of the two;
+//	    SELECTION while Keys still describes the old FRAME. It is deliberate: Key
+//	    is where the slideshow is, Keys is what the panel is showing, and
+//	    collapsing them would mean lying about one of the two;
 //	  - a rescan that empties the gallery leaves Total 0 with Keys still
-//	    populated, because the last frame is still lit.
+//	    populated, because the last frame is still lit. Keys can likewise name an
+//	    object that has LEFT the bucket, so a consumer presigning them must treat
+//	    a 404 as ordinary rather than as an error.
 //
-//	Lengths: 1 in either single view; 2 in landscape_two when two DISTINCT
+//	🔴 THAT DIVERGENCE WINDOW IS UNBOUNDED. This paragraph used to bound it at
+//	"a real image load — up to 30 s", which is FALSE and was measured false:
+//	nothing re-renders while PAUSED (startSlideshow gates on !isPaused), and
+//	onScanComplete only re-renders when currentIndex == 0, so a rescan arriving
+//	while paused at a non-zero index leaves Key and Keys disagreeing until an
+//	operator does something — total 2, index 1, key "y.jpg", keys ["b.jpg"],
+//	where b.jpg is no longer in the gallery at all. Even while PLAYING the
+//	ceiling is slide_interval, which POST /api/interval allows up to 3600.
+//	A consumer must therefore treat Keys as the display's own answer and never
+//	assert it against Key.
+//
+//	Lengths, IN A SETTLED STATE — i.e. once a render has completed in the CURRENT
+//	view mode: 1 in either single view; 2 in landscape_two when two DISTINCT
 //	positions are on screen; 1 in landscape_two when both halves are the same
 //	position (a one-image gallery); empty when nothing has been rendered yet.
+//	🔴 "Settled" is load-bearing and is not decoration: a view-mode switch whose
+//	re-render then fails leaves the PREVIOUS mode's frame lit, so
+//	`view_mode: "portrait_single"` with two Keys is reachable and legal. A client
+//	that lays out from len(Keys) is correct; one that derives the layout from
+//	ViewMode and then indexes Keys to match it will be wrong in exactly that case.
 //	It is never null on the wire — see MarshalJSON.
 //
 // SecondsUntilNext — whole seconds until the next AUTOMATIC advance.
 //
 //	0 when paused (no countdown is running), and 0 when no slide timer is armed.
 //	Always within [0, SlideInterval] and never negative.
+//
+//	🔴 THE CEILING IS A CLAMP, AND AFTER POST /api/interval LOWERS THE INTERVAL IT
+//	FREEZES. SetInterval deliberately does not restart the running timer — it
+//	"takes effect on the next tick" — so a source armed for 3600 s is still 3600 s
+//	from firing after the interval is set to 30, and the clamp reports 30 for the
+//	next 59 minutes without moving. Measured on the real accessors; pinned by
+//	TestLoweringTheIntervalFreezesTheCountdownUntilTheTimerCatchesUp.
+//
+//	It is reported this way because the [0, SlideInterval] bound is a fixed part
+//	of this wire contract and there is no honest small answer available: the true
+//	remaining is the large one the bound forbids. The defect is upstream — a
+//	countdown and an interval that can disagree at all — and the fix is for
+//	SetInterval to re-arm the timer, which is a change to an EXISTING endpoint's
+//	documented semantics and is deliberately not made here. Until it is, a
+//	consumer that lowers the interval should expect its own countdown to stall
+//	once, and should not read a stalled value as the Pi being wedged.
 //
 //	🔴 Deliberately a DURATION and not an absolute timestamp. The consumer is a
 //	browser on a phone with its own clock, and a duration is immune to skew
