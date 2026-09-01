@@ -984,55 +984,446 @@ func TestTheSlideTimerHasExactlyOneArmingSite(t *testing.T) {
 	}
 }
 
-// TestLoweringTheIntervalFreezesTheCountdownUntilTheTimerCatchesUp pins a KNOWN
-// WRONG-LOOKING behaviour so that it is an asserted property rather than a
-// surprise, and so that anyone who fixes it has to come here and say so.
+// ---------------------------------------------------------------------------
+// POST /api/interval re-arms the timer
+// ---------------------------------------------------------------------------
+
+// armedTimer reads the handle/deadline PAIR under one lock acquisition, which is
+// the only way to observe that the two agree. Reading them separately would let
+// a writer land between the reads and could report a pair the viewer was never
+// in — which is the exact defect swapTimeout exists to prevent, reintroduced in
+// the instrument that checks for it.
+func armedTimer(iv *ImageViewer) (glib.SourceHandle, time.Time) {
+	iv.mutex.RLock()
+	defer iv.mutex.RUnlock()
+	return iv.timeoutID, iv.nextAdvanceAt
+}
+
+// retireArmedTimer leaves no callback registered in the shared default main
+// context, which every test that drives the real startSlideshow must do.
+func retireArmedTimer(t *testing.T, iv *ImageViewer) {
+	t.Helper()
+	if previous := iv.swapTimeout(0, time.Time{}); previous != 0 {
+		glib.SourceRemove(previous)
+	}
+}
+
+// sourceIsArmed asks GLIB — not this program's own bookkeeping — whether a
+// source id is still registered on the default main context.
 //
-// 🔴 SetInterval deliberately does not restart the running timer — "it takes
-// effect on the next tick" — so after lowering the interval the armed source is
-// still the OLD duration away, while the contract clamps the report to the NEW
-// interval. The result is a countdown that sits still. Found by audit; measured
-// here rather than described.
+// That distinction is the whole point of using it. Every other assertion in this
+// file reads iv.timeoutID, which is what the code BELIEVES; an implementation
+// that arms a replacement and forgets to remove the old source updates that
+// belief perfectly while leaving two live timeouts behind it. This reads the
+// registry the timeouts actually fire from.
+func sourceIsArmed(h glib.SourceHandle) bool {
+	if h == 0 {
+		return false
+	}
+	return glib.MainContextDefault().FindSourceById(h) != nil
+}
+
+// TestLoweringTheIntervalReArmsTheTimerImmediately is the motivating case, and
+// it REPLACES TestLoweringTheIntervalFreezesTheCountdownUntilTheTimerCatchesUp.
 //
-// There is no honest small answer available inside the [0, slide_interval] bound:
-// the true remaining is the large number the bound forbids reporting. The real
-// fix is for SetInterval to re-arm, which changes an existing endpoint's
-// documented semantics and is a separate decision — see the contract note on
-// Snapshot.SecondsUntilNext. This test exists so that decision is made
-// deliberately.
-func TestLoweringTheIntervalFreezesTheCountdownUntilTheTimerCatchesUp(t *testing.T) {
+// 🔴 WHY IT CHANGED. The old test pinned the opposite behaviour, deliberately:
+// SetInterval only stored the value ("it takes effect on the next tick"), so a
+// source armed for 600 s was still 600 s from firing after the interval dropped
+// to 11, and the [0, slide_interval] clamp reported a stationary 11 for the next
+// nine and a half minutes. Its own docstring said it existed "so that decision is
+// made deliberately" and that "the real fix is for SetInterval to re-arm". That
+// decision has now been made — the operator's call — and the fix is in
+// gtkViewer.SetInterval, so the property that test asserted is no longer true and
+// asserting it would pin the defect back in. It is updated rather than deleted so
+// the freeze stays on the record as something that was measured, and so the
+// replacement is visibly the same scenario with the answer changed.
+//
+// It drives the ADAPTER, not the raw accessor. setSlideInterval on its own still
+// only stores — the re-arm is its caller's job, because the GLib calls must not
+// happen under the viewer's lock — so a test that called it directly would still
+// observe the freeze and would be testing a path POST /api/interval never takes.
+//
+// glib.TimeoutAdd registers a source without gtk.Init or a running main loop, so
+// this drives the REAL startSlideshow and the REAL re-arm.
+func TestLoweringTheIntervalReArmsTheTimerImmediately(t *testing.T) {
+	// 600 and 11: 11 is neither a factor nor a multiple of 600, and neither is
+	// the 30 default, so no constant in the implementation can stand in for
+	// either one.
 	iv := newControlTestViewer(600, "a.jpg")
-	armed := time.Now()
-	iv.swapTimeout(glib.SourceHandle(3), armed.Add(600*time.Second))
+	iv.startSlideshow()
+	t.Cleanup(func() { retireArmedTimer(t, iv) })
 
-	// POST /api/interval lands. 11 is neither a factor nor a multiple of 600.
-	iv.setSlideInterval(11)
+	oldHandle, oldDeadline := armedTimer(iv)
+	if oldHandle == 0 {
+		t.Fatal("startSlideshow armed nothing — this test cannot observe a re-arm")
+	}
 
-	for _, tc := range []struct {
+	// The pre-change symptom, so the fix is measured against the failure and not
+	// merely against an expectation: at this instant the countdown is 600.
+	if got := iv.snapshotAt(oldDeadline.Add(-600 * time.Second)).secondsUntilNext; got != 600 {
+		t.Fatalf("armed at 600 s the countdown reads %d, want 600 — the fixture is not what "+
+			"this test claims", got)
+	}
+
+	// POST /api/interval lands, through the closure the handler enqueues.
+	before := time.Now()
+	gtkViewer{iv: iv}.SetInterval(11)
+	after := time.Now()
+
+	newHandle, newDeadline := armedTimer(iv)
+	if newHandle == 0 {
+		t.Fatal("no timer is armed after the interval change — the slideshow has stopped")
+	}
+	if newHandle == oldHandle {
+		t.Fatalf("the armed handle is still %d after the interval changed from 600 s to 11 s: "+
+			"the pending timeout was never replaced, so the display waits out the remaining "+
+			"~10 minutes and the countdown sits frozen on 11", oldHandle)
+	}
+
+	// The deadline is one NEW interval out, and it was written by the same call
+	// that stored the handle above — the pair, read under one lock.
+	if newDeadline.Before(before.Add(11*time.Second)) || newDeadline.After(after.Add(11*time.Second)) {
+		t.Fatalf("the new deadline is %v; want within [%v, %v] — one 11 s interval from the "+
+			"instant of the re-arm. It is %v from the old 600 s deadline.",
+			newDeadline, before.Add(11*time.Second), after.Add(11*time.Second),
+			newDeadline.Sub(oldDeadline))
+	}
+	if !newDeadline.Before(oldDeadline) {
+		t.Fatalf("the deadline did not move IN: %v -> %v. Lowering the interval must bring the "+
+			"next advance closer, not leave it where it was.", oldDeadline, newDeadline)
+	}
+
+	// And the countdown a polling client reads starts from the NEW interval and
+	// DECREASES. Measured from `after`, so every bound below is exact for any
+	// re-arm that took under a second: at `after` the remaining is in
+	// (11 s - δ, 11 s], at after+5 s it is in (5 s, 6 s], and at after+11 s it is
+	// already past due.
+	var previous int
+	for i, tc := range []struct {
 		elapsed time.Duration
 		want    int
 		note    string
 	}{
-		{0, 11, "clamped down from 600 the instant the interval changed"},
-		{5 * time.Minute, 11, "still frozen: the armed source is 5 minutes from firing"},
-		{589 * time.Second, 11, "frozen right up to the point the truth drops below 11"},
-		{594 * time.Second, 6, "and only now does it start to move"},
-		{600 * time.Second, 0, "the armed source is finally due"},
+		{0, 11, "the countdown restarts from the NEW interval"},
+		{5 * time.Second, 6, "and it moves — it did not for ~9 minutes before this fix"},
+		{10 * time.Second, 1, "still moving"},
+		{11 * time.Second, 0, "the re-armed source is due"},
+		{5 * time.Minute, 0, "the main loop fired late; still not negative"},
 	} {
-		got := iv.snapshotAt(armed.Add(tc.elapsed)).secondsUntilNext
+		got := iv.snapshotAt(after.Add(tc.elapsed)).secondsUntilNext
 		if got != tc.want {
-			t.Errorf("%v after arming: seconds_until_next = %d, want %d (%s)",
-				tc.elapsed, got, tc.want, tc.note)
+			t.Errorf("%v after the re-arm: seconds_until_next = %d, want %d (%s); the re-arm "+
+				"took %v", tc.elapsed, got, tc.want, tc.note, after.Sub(before))
 		}
 		if got > int(iv.slideInterval()) {
-			t.Errorf("%v after arming: seconds_until_next = %d exceeds slide_interval %d — "+
-				"the clamp that causes the freeze is also the contract, and it broke",
+			t.Errorf("%v after the re-arm: seconds_until_next = %d exceeds slide_interval %d — "+
+				"the [0, slide_interval] clamp is part of the wire contract and it broke",
 				tc.elapsed, got, iv.slideInterval())
 		}
+		if i > 0 && previous > 0 && got >= previous {
+			t.Errorf("seconds_until_next went %d -> %d as time advanced: it is not counting down, "+
+				"which is the freeze this change exists to remove", previous, got)
+		}
+		previous = got
+	}
+}
+
+// TestRaisingTheIntervalReArmsFromTheNewInterval is the other direction, and it
+// is not symmetric with lowering: raising it moves the next advance OUT, and the
+// countdown has to be able to report a number ABOVE the old interval.
+//
+// A "clamp harder" non-fix — leave the timer alone and report min(remaining,
+// interval) — passes the lowering case and fails here, because the honest answer
+// is 53 and the old timer can only ever produce something ≤ 7.
+func TestRaisingTheIntervalReArmsFromTheNewInterval(t *testing.T) {
+	iv := newControlTestViewer(7, "a.jpg")
+	iv.startSlideshow()
+	t.Cleanup(func() { retireArmedTimer(t, iv) })
+
+	oldHandle, oldDeadline := armedTimer(iv)
+
+	before := time.Now()
+	gtkViewer{iv: iv}.SetInterval(53) // neither 7, nor the 30 default, nor a power of two
+	after := time.Now()
+
+	newHandle, newDeadline := armedTimer(iv)
+	if newHandle == oldHandle {
+		t.Fatalf("the armed handle is still %d after the interval changed from 7 s to 53 s: "+
+			"the display will keep turning the page every 7 seconds", oldHandle)
+	}
+	if !newDeadline.After(oldDeadline) {
+		t.Fatalf("the deadline did not move OUT: %v -> %v", oldDeadline, newDeadline)
+	}
+	if newDeadline.Before(before.Add(53*time.Second)) || newDeadline.After(after.Add(53*time.Second)) {
+		t.Fatalf("the new deadline is %v, want one 53 s interval from the re-arm "+
+			"(within [%v, %v])", newDeadline, before.Add(53*time.Second), after.Add(53*time.Second))
+	}
+	if got := iv.snapshotAt(after).secondsUntilNext; got != 53 {
+		t.Fatalf("seconds_until_next = %d immediately after raising the interval to 53, want 53 — "+
+			"a countdown that cannot exceed the OLD interval is a timer that was never re-armed",
+			got)
+	}
+	if got := iv.snapshotAt(after.Add(30 * time.Second)).secondsUntilNext; got != 23 {
+		t.Fatalf("30 s after the re-arm: seconds_until_next = %d, want 23", got)
+	}
+}
+
+// TestReArmingRetiresTheOldGLibSourceSoOnlyOneTimerIsArmed is the leak guard,
+// and it is the one assertion in this section that a "the deadline moved"
+// implementation cannot satisfy.
+//
+// 🔴 THE MUTANT IT EXISTS FOR: arm the replacement, do not remove the old source
+// — i.e. drop `glib.SourceRemove(previous)` from startSlideshow's startTimer.
+// Every other test here still passes against that: iv.timeoutID holds the new
+// handle, nextAdvanceAt holds the new deadline, the countdown counts down from
+// the new interval. The bookkeeping is perfect and there are TWO live timeouts,
+// each of which advances the display and each of which re-arms its own successor
+// on every tick. On the Pi that is a slideshow that skips pages, at a rate that
+// doubles again on every interval change.
+//
+// So this asks GLib, not the struct: the old source id must no longer resolve on
+// the default main context, and the new one must.
+//
+// PAIRED CONTROL, both directions, from the same probe: the old handle is
+// asserted PRESENT before the re-arm (so a probe wired to nothing cannot pass by
+// always answering "gone") and the new handle is asserted PRESENT after (so a
+// probe that answers "gone" for everything cannot pass either).
+//
+// Scope, stated: this proves the OLD source is retired and the NEW one is armed.
+// It does not enumerate the whole main context, so it cannot see a third source
+// armed by some unrelated code path — TestTheSlideTimerHasExactlyOneArmingSite
+// is what closes that, by pinning the number of glib.TimeoutAdd call sites in
+// the package at one.
+func TestReArmingRetiresTheOldGLibSourceSoOnlyOneTimerIsArmed(t *testing.T) {
+	iv := newControlTestViewer(600, "a.jpg")
+	iv.startSlideshow()
+	t.Cleanup(func() { retireArmedTimer(t, iv) })
+
+	oldHandle, _ := armedTimer(iv)
+	if oldHandle == 0 {
+		t.Fatal("startSlideshow armed nothing")
+	}
+	// Positive control: the probe CAN see a live source. Without this, the
+	// assertion below is indistinguishable from a probe that never finds anything.
+	if !sourceIsArmed(oldHandle) {
+		t.Fatalf("GLib does not know about source %d, which startSlideshow just armed. The probe "+
+			"is not observing the registry the timeouts fire from, so its verdict below would be "+
+			"worthless.", oldHandle)
 	}
 
-	if previous := iv.swapTimeout(0, time.Time{}); previous != 3 {
-		t.Fatalf("swapTimeout returned %d, want 3", previous)
+	gtkViewer{iv: iv}.SetInterval(11)
+
+	newHandle, _ := armedTimer(iv)
+	if newHandle == 0 {
+		t.Fatal("no timer armed after the re-arm")
+	}
+	if newHandle == oldHandle {
+		t.Fatalf("the handle did not change (%d): nothing was re-armed", oldHandle)
+	}
+	// The other half of the control: the probe answers YES for a source that is
+	// genuinely armed, so a NO below is about the old source and not about the
+	// probe.
+	if !sourceIsArmed(newHandle) {
+		t.Fatalf("GLib does not know about the newly armed source %d — the re-arm recorded a "+
+			"handle for a timeout that is not registered", newHandle)
+	}
+	if sourceIsArmed(oldHandle) {
+		t.Fatalf("the 600 s source %d is STILL armed on the default main context after the "+
+			"interval changed to 11 s, alongside the new source %d. TWO live slide timeouts: the "+
+			"display advances twice per period and each tick re-arms its own successor, so the "+
+			"leak compounds. The re-arm must RETIRE the pending source "+
+			"(glib.SourceRemove of the handle swapTimeout returns), not just arm another one.",
+			oldHandle, newHandle)
+	}
+}
+
+// TestSettingTheIntervalItIsAlreadyOnDoesNotResetTheCountdown pins the starvation
+// guard.
+//
+// Re-arming resets the countdown. An unconditional re-arm therefore means a
+// client that re-POSTs the interval it already has — a settings page that
+// submits its whole form, a PWA that pushes its state on every poll — pushes the
+// next advance out on every request, and the display never turns the page again.
+// The endpoint would report 202 the whole time and "did nothing" would be the
+// symptom.
+//
+// setSlideInterval reports whether the value MOVED and SetInterval re-arms only
+// then. Mutants killed here: `changed = true` unconditionally, and dropping the
+// `if !changed { return }` in the adapter.
+func TestSettingTheIntervalItIsAlreadyOnDoesNotResetTheCountdown(t *testing.T) {
+	iv := newControlTestViewer(23, "a.jpg")
+	iv.startSlideshow()
+	t.Cleanup(func() { retireArmedTimer(t, iv) })
+
+	handle, deadline := armedTimer(iv)
+
+	for i := 0; i < 3; i++ {
+		gtkViewer{iv: iv}.SetInterval(23)
+	}
+
+	gotHandle, gotDeadline := armedTimer(iv)
+	if gotHandle != handle || !gotDeadline.Equal(deadline) {
+		t.Fatalf("three no-op interval writes moved the armed timer from (handle %d, deadline %v) "+
+			"to (handle %d, deadline %v). A client that re-sends its current interval on every "+
+			"poll would push the next advance out forever and the slideshow would never advance.",
+			handle, deadline, gotHandle, gotDeadline)
+	}
+
+	// Positive control on the same viewer and the same probe: a REAL change does
+	// move it. Without this the assertion above passes for an implementation that
+	// never re-arms at all — which is the defect this whole change removes.
+	gtkViewer{iv: iv}.SetInterval(24)
+	movedHandle, movedDeadline := armedTimer(iv)
+	if movedHandle == handle || !movedDeadline.After(deadline) {
+		t.Fatalf("a genuine change from 23 s to 24 s did not re-arm: handle %d -> %d, deadline "+
+			"%v -> %v. This test cannot tell a no-op from a re-arm, so its assertion above is "+
+			"vacuous.", handle, movedHandle, deadline, movedDeadline)
+	}
+	if sourceIsArmed(handle) {
+		t.Fatalf("source %d survived the real change to 24 s", handle)
+	}
+}
+
+// TestTheIntervalChangeReArmsWhilePaused pins the paused DECISION.
+//
+// The slide timer runs while paused — startSlideshow re-arms on every tick and
+// only the ADVANCE is gated on !isPaused — so there is a pending source to
+// retire in this state exactly as in any other, and the choice is to re-arm it.
+//
+// The alternative (skip the re-arm while paused, on the ground that nothing is
+// counting down) leaves the OLD duration armed under the NEW interval, so a
+// resume serves out the remainder of an interval the operator already replaced:
+// the same stale-timer defect, made invisible until the moment someone presses
+// play. Nothing is user-visible at the instant of the change, because
+// seconds_until_next is 0 while paused by contract; what the re-arm buys is that
+// the resume is honest.
+func TestTheIntervalChangeReArmsWhilePaused(t *testing.T) {
+	iv := newControlTestViewer(600, "a.jpg")
+	iv.startSlideshow()
+	t.Cleanup(func() { retireArmedTimer(t, iv) })
+	iv.setPausedState(true)
+
+	oldHandle, oldDeadline := armedTimer(iv)
+	if oldHandle == 0 {
+		t.Fatal("no timer armed while paused — the fixture contradicts the premise of this test, " +
+			"which is that the slide timer keeps running and only the advance is gated")
+	}
+
+	before := time.Now()
+	gtkViewer{iv: iv}.SetInterval(11)
+	after := time.Now()
+
+	newHandle, newDeadline := armedTimer(iv)
+	if newHandle == oldHandle {
+		t.Fatalf("the interval change did not re-arm while paused (handle still %d): a resume "+
+			"would then serve out the rest of the OLD 600 s interval before the first advance",
+			oldHandle)
+	}
+	if sourceIsArmed(oldHandle) {
+		t.Fatalf("the old source %d is still armed: pausing must not exempt the re-arm from "+
+			"retiring the pending timeout", oldHandle)
+	}
+	if newDeadline.Before(before.Add(11*time.Second)) || newDeadline.After(after.Add(11*time.Second)) {
+		t.Fatalf("the new deadline is %v, want one 11 s interval from the re-arm", newDeadline)
+	}
+	if !newDeadline.Before(oldDeadline) {
+		t.Fatalf("the deadline did not move in while paused: %v -> %v", oldDeadline, newDeadline)
+	}
+
+	// The contract while paused is unchanged: no countdown is running.
+	if got := iv.snapshotAt(after).secondsUntilNext; got != 0 {
+		t.Fatalf("paused: seconds_until_next = %d, want 0 — re-arming must not start a countdown "+
+			"to a page turn that will not happen", got)
+	}
+	// And the resume finds the NEW interval, not the remains of the old one.
+	iv.setPausedState(false)
+	if got := iv.snapshotAt(after).secondsUntilNext; got != 11 {
+		t.Fatalf("resumed: seconds_until_next = %d, want 11 — the timer armed while paused is "+
+			"the one the resume counts down", got)
+	}
+}
+
+// TestSetIntervalBeforeTheSlideshowStartsStoresWithoutArming covers the state in
+// which there is no arming closure to run.
+//
+// It is reachable only during boot — main() calls startSlideshow before it starts
+// the control API, so no request can land in the window — and the answer is that
+// the value is STORED and nothing is armed, because the first arm will read it.
+// Arming here instead would be the second arming site the whole design forbids.
+//
+// It is an invariant guard, not regression coverage: no bug of this shape has
+// happened. It is here because a nil func value is a panic and the panic would
+// be on the GTK main loop.
+func TestSetIntervalBeforeTheSlideshowStartsStoresWithoutArming(t *testing.T) {
+	iv := newControlTestViewer(30, "a.jpg")
+
+	gtkViewer{iv: iv}.SetInterval(11) // must not panic
+
+	if got := iv.slideInterval(); got != 11 {
+		t.Fatalf("slide_interval = %d after SetInterval(11) with no slideshow running, want 11", got)
+	}
+	if handle, deadline := armedTimer(iv); handle != 0 || !deadline.IsZero() {
+		t.Fatalf("SetInterval armed a timer (handle %d, deadline %v) before startSlideshow ran; "+
+			"arming from anywhere but startSlideshow's own closure is the second arming site "+
+			"seconds_until_next's honesty depends on there not being", handle, deadline)
+	}
+	if iv.rearmSlideTimer() {
+		t.Fatal("rearmSlideTimer reported that it re-armed with no arming closure registered")
+	}
+
+	// Positive control: once the slideshow starts, the stored value is what gets
+	// armed — so the "stores without arming" answer above is correct rather than
+	// merely quiet.
+	iv.startSlideshow()
+	t.Cleanup(func() { retireArmedTimer(t, iv) })
+	armedAt := time.Now()
+	if got := iv.snapshotAt(armedAt).secondsUntilNext; got != 11 {
+		t.Fatalf("seconds_until_next = %d once the slideshow starts, want 11 — the interval set "+
+			"before it started was not the one it armed", got)
+	}
+}
+
+// TestTheReArmHasOneRegistrationAndOneCaller is the ledger for the new seam, and
+// it is the companion to TestTheSlideTimerHasExactlyOneArmingSite.
+//
+// That test pins the number of glib.TimeoutAdd sites at one. This one pins the
+// two ends of the indirection that reaches it: exactly one place publishes the
+// arming closure (startSlideshow, so the closure that gets re-run is the one that
+// does retire-then-arm from a single interval read), and exactly one place runs
+// it (gtkViewer.SetInterval, which is an R1 write and therefore on the GTK main
+// loop).
+//
+// 🔴 The CALLER half is a thread-affinity guard wearing a ledger. A second call
+// to rearmSlideTimer from gtkViewer.Rescan — the one write that runs on the HTTP
+// handler goroutine — would call glib.SourceRemove and glib.TimeoutAdd off the
+// GTK main loop. TestNothingOffTheGTKThreadCanReachAWidget cannot see it: its
+// graph is about gtk widget calls, glib is not gtk, and it says in its own
+// docstring that a func value in a STRUCT FIELD is a blind spot it does not
+// close. This is the guard for that.
+func TestTheReArmHasOneRegistrationAndOneCaller(t *testing.T) {
+	registrations := packageCallSites(t, "setArmTimer")
+	for _, s := range registrations {
+		t.Logf("  %s:%d  setArmTimer() in %s()", s.File, s.Line, s.Func)
+	}
+	if len(registrations) != 1 || registrations[0].File != "main.go" ||
+		registrations[0].Func != "startSlideshow" {
+		t.Errorf("setArmTimer is called from %+v, want exactly one site in main.go "+
+			"startSlideshow. The closure it publishes is what POST /api/interval re-runs, and it "+
+			"is the only one that retires the pending source and arms its replacement from a "+
+			"single interval read through a single swapTimeout.", registrations)
+	}
+
+	callers := packageCallSites(t, "rearmSlideTimer")
+	for _, s := range callers {
+		t.Logf("  %s:%d  rearmSlideTimer() in %s()", s.File, s.Line, s.Func)
+	}
+	if len(callers) != 1 || callers[0].File != "control_adapter.go" ||
+		callers[0].Func != "SetInterval" {
+		t.Errorf("rearmSlideTimer is called from %+v, want exactly one site in "+
+			"control_adapter.go SetInterval. It calls glib.SourceRemove and glib.TimeoutAdd, so "+
+			"every caller must be an R1 write running inside an Enqueue closure on the GTK main "+
+			"loop — gtkViewer.Rescan in particular is NOT, and calling it from there would arm "+
+			"GLib sources from an HTTP handler goroutine.", callers)
 	}
 }
 

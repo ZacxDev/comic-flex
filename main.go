@@ -296,6 +296,21 @@ type ImageViewer struct {
 	// countdown GET /api/state reports cannot drift away from the timer that
 	// drives it. Zero means nothing is armed. Guarded by mutex like the rest.
 	nextAdvanceAt time.Time
+	// armTimer is startSlideshow's own startTimer closure, kept so that
+	// POST /api/interval can run it AGAIN — retiring the pending GLib source and
+	// arming a fresh one at the new interval — instead of leaving the display
+	// waiting out the OLD interval and the countdown frozen against it.
+	//
+	// 🔴 It is a handle on the SINGLE arming site, not a second one. Everything
+	// seconds_until_next's honesty rests on — one interval read feeding both the
+	// GLib source and the deadline, one atomic swapTimeout writing the handle and
+	// the deadline together — lives in that closure, so the re-arm inherits it by
+	// construction. A field holding a "arm a timer" convenience written anywhere
+	// else would be the two-clocks defect wearing a struct field.
+	//
+	// The FIELD is guarded by mutex like the rest; what it points at must run on
+	// the GTK main loop. See setArmTimer and rearmSlideTimer in state.go.
+	armTimer func()
 }
 
 // injectedVersion is set at link time by a release build:
@@ -1192,6 +1207,17 @@ func (iv *ImageViewer) startSlideshow() {
 			return false
 		}), firesAt)
 	}
+	// Publish the arming closure BEFORE the first arm, so there is no window in
+	// which a timer is armed and nothing can re-arm it. (main() calls this before
+	// it starts the control API, so no request can land in that window anyway —
+	// belt and braces, in the cheap direction.)
+	//
+	// 🔴 This is what POST /api/interval re-runs. It is deliberately the same
+	// closure and not a copy: the retire-then-arm pair, the one interval read and
+	// the one swapTimeout that writes the handle with its deadline are all in
+	// here, and a second implementation of them is the two-clocks defect this
+	// whole mechanism exists to prevent.
+	iv.setArmTimer(startTimer)
 	startTimer()
 }
 

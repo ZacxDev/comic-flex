@@ -659,12 +659,79 @@ func (iv *ImageViewer) slideInterval() uint {
 	return iv.config.SlideInterval
 }
 
-// setSlideInterval changes the seconds between slides. It takes effect on the
-// next tick; the timer is not restarted.
-func (iv *ImageViewer) setSlideInterval(seconds uint) {
+// setSlideInterval changes the seconds between slides and reports whether the
+// value actually MOVED.
+//
+// 🔴 CORRECTED. This used to say "It takes effect on the next tick; the timer is
+// not restarted", which was an accurate description of a defect. Nothing
+// cancelled or re-armed the pending GLib timeout, so lowering the interval from
+// 3600 to 30 changed nothing on the display for up to an hour, and
+// GET /api/state's countdown — clamped to [0, slide_interval] against a deadline
+// an hour out — sat frozen on 30 for ~59 minutes. The store is still all THIS
+// function does; what changed is that its caller now re-arms (gtkViewer.
+// SetInterval in control_adapter.go), so a POST /api/interval takes effect
+// immediately. Keeping the store and the re-arm as two steps is deliberate: the
+// GLib calls must not happen under this lock, and they must not happen off the
+// GTK main loop.
+//
+// changed is why the return value exists, and it is not decoration. The caller
+// re-arms only when the value moved, because re-arming resets the countdown: a
+// client that POSTs the same interval on every poll — which a settings page that
+// submits its whole form is entitled to do — would otherwise push the deadline
+// out on every request and starve the advance completely. A no-op write stays a
+// no-op.
+func (iv *ImageViewer) setSlideInterval(seconds uint) (changed bool) {
 	iv.mutex.Lock()
 	defer iv.mutex.Unlock()
+	changed = iv.config.SlideInterval != seconds
 	iv.config.SlideInterval = seconds
+	return changed
+}
+
+// setArmTimer records the closure that arms the slide timer, so that a later
+// interval change can run it again.
+//
+// startSlideshow is the only caller and its startTimer closure is the only
+// value: that closure IS the single arming site — it retires the pending source
+// and calls glib.TimeoutAdd, writing the handle and the deadline through one
+// swapTimeout. Re-arming by calling it again is therefore not a second arming
+// site, which is exactly what TestTheSlideTimerHasExactlyOneArmingSite requires
+// and what keeps seconds_until_next honest.
+func (iv *ImageViewer) setArmTimer(fn func()) {
+	iv.mutex.Lock()
+	defer iv.mutex.Unlock()
+	iv.armTimer = fn
+}
+
+// rearmSlideTimer cancels the pending slide timeout and arms a fresh one at the
+// CURRENT interval, and reports whether it did.
+//
+// 🔴 IT MUST RUN ON THE GTK MAIN LOOP. It calls glib.SourceRemove and
+// glib.TimeoutAdd through the closure it invokes, and neither is safe from an
+// HTTP handler goroutine. Its one production caller is gtkViewer.SetInterval,
+// which is an R1 write and therefore only ever runs inside an Enqueue closure —
+// see the Viewer contract in internal/control/viewer.go. Do not call this from
+// gtkViewer.Rescan or from any other off-thread path.
+//
+// 🔴 The lock is RELEASED before the closure runs. startTimer calls swapTimeout,
+// which takes the WRITE lock; holding the read lock across it is a deadlock the
+// moment a writer queues between the two acquisitions. Same shape, same reason,
+// as onScanComplete above.
+//
+// false means nothing was armed because startSlideshow has not run yet. That is
+// reachable only during boot — main() calls startSlideshow before it starts the
+// control API — and it is harmless: the value is already stored, so the first
+// arm picks it up.
+func (iv *ImageViewer) rearmSlideTimer() (rearmed bool) {
+	iv.mutex.RLock()
+	arm := iv.armTimer
+	iv.mutex.RUnlock()
+
+	if arm == nil {
+		return false
+	}
+	arm()
+	return true
 }
 
 // indexOfKey reports the position of key in the gallery.

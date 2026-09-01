@@ -182,11 +182,46 @@ func (g gtkViewer) GotoIndex(index int) {
 	}
 }
 
+// SetInterval changes the seconds between slides and makes the change take
+// effect NOW, by retiring the pending GLib timeout and arming a fresh one at the
+// new interval.
+//
+// 🔴 Storing the value alone was a defect, not a design. setSlideInterval used to
+// be the whole implementation and its own comment said "it takes effect on the
+// next tick": lower the interval from 3600 to 30 and the display kept waiting out
+// the remaining hour, while GET /api/state reported a stationary 30 the entire
+// time (the countdown is clamped to [0, slide_interval], and the real deadline
+// was an hour away). Both symptoms are the one cause — a live timer armed for a
+// duration nobody wants any more.
+//
+// It is an R1 write, so it runs inside an Enqueue closure on the GTK main loop,
+// which is the only place glib.SourceRemove and glib.TimeoutAdd may be called.
+// 🔴 Do NOT follow Rescan here. Rescan is the documented exception that runs on
+// the HTTP handler goroutine so it can answer 503 synchronously; this one arms
+// GLib sources and must not.
+//
+// The re-arm is conditional on the value MOVING. Re-arming resets the countdown,
+// so an unconditional re-arm would let a client that re-POSTs its current
+// interval on every poll push the deadline out forever and starve the advance —
+// a display that never turns the page, from an endpoint that "did nothing".
+//
+// PAUSED: it re-arms anyway, and that is the decision rather than an oversight.
+// The slide timer runs while paused — startSlideshow re-arms on every tick and
+// only the ADVANCE is gated on !isPaused — so a pending source exists to retire
+// in that state exactly as in any other, and skipping the re-arm would leave the
+// old duration armed under the new interval: the same stale-timer defect, just
+// invisible until the operator resumes. Nothing is user-visible at the moment of
+// the change, because snapshotAt reports seconds_until_next as 0 while paused;
+// what it buys is that a resume finds the NEW interval already armed instead of
+// silently serving out the rest of the old one.
 func (g gtkViewer) SetInterval(seconds int) {
 	if seconds < 0 {
 		return // the handler already rejects this; belt for the direct caller
 	}
-	g.iv.setSlideInterval(uint(seconds))
+	if !g.iv.setSlideInterval(uint(seconds)) {
+		return
+	}
+	g.iv.rearmSlideTimer()
 }
 
 // Rescan starts a bucket listing, or refuses when maxConcurrentScans scans are
