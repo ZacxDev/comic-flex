@@ -189,8 +189,19 @@ func TestTheEmptiedGalleryStatesAreReachableAndDistinct(t *testing.T) {
 // hold: startSlideshow re-renders only `if !iv.isPaused()`, and onScanComplete
 // re-renders only when `currentIndex == 0`. So a rescan that lands while paused
 // at a non-zero index leaves a key on the wire that is no longer in the gallery
-// at all, until an operator does something. If either gate changes, this test
-// fails and the contract paragraph has to be rewritten — which is the point.
+// at all, until an operator does something.
+//
+// 🔴 SCOPE — THIS TEST PINS ONE OF THE TWO GATES, NOT BOTH. An earlier version
+// of this docstring said "if either gate changes, this test fails", and that was
+// measured FALSE: replacing startSlideshow's `if !iv.isPaused()` with `if true`
+// leaves the whole suite at 386 PASS / 0 FAIL. This test never runs
+// startSlideshow — it checks the paused FLAG, which is not the branch that reads
+// it. The pause gate lives inside a glib.TimeoutAdd closure and cannot be reached
+// headlessly at all, so it is pinned structurally instead, by
+// TestTheSlideshowTimerStillHonoursThePauseFlag below. Whichever way it is
+// pinned, do not restate the wider claim here.
+//
+// What THIS test pins is the onScanComplete gate, behaviourally.
 func TestAPausedRescanLeavesKeyAndKeysDisagreeingIndefinitely(t *testing.T) {
 	iv := newControlTestViewer(30, "a.jpg", "b.jpg")
 	iv.setPausedState(true)
@@ -226,6 +237,43 @@ func TestAPausedRescanLeavesKeyAndKeysDisagreeingIndefinitely(t *testing.T) {
 	if !iv.isPaused() {
 		t.Fatal("the viewer is no longer paused; the slide timer would paper over the " +
 			"divergence and this test would stop pinning what it claims")
+	}
+}
+
+// TestTheSlideshowTimerStillHonoursThePauseFlag pins the gate that
+// TestAPausedRescanLeavesKeyAndKeysDisagreeingIndefinitely cannot reach.
+//
+// 🔴 It exists because a mutant proved the gap rather than because a comment
+// looked thin: replacing startSlideshow's `if !iv.isPaused()` with `if true`
+// left the ENTIRE suite at 386 PASS / 0 FAIL. Two separate claims rest on that
+// gate — Snapshot.SecondsUntilNext's "0 when paused", and the contract's
+// "the divergence between Key and Keys is UNBOUNDED", which is only true because
+// a paused slideshow never re-renders. Delete the gate and a paused Pi resumes
+// turning pages: the countdown claim goes stale, the divergence becomes bounded
+// by slide_interval, and the operator's pause button stops working. None of that
+// was observable.
+//
+// It is STRUCTURAL because the gate is genuinely unreachable from a test: it
+// lives inside the closure handed to glib.TimeoutAdd, which only a running GTK
+// main loop executes. Same precedent as TestTheSlideTimerHasExactlyOneArmingSite.
+//
+// 🔴 What it does NOT pin, said plainly so the next reader does not take it for
+// more: it counts the isPaused() CALL, so `_ = iv.isPaused(); if true { … }`
+// walks it. It kills the mutation that actually happens — deleting or inverting
+// the condition — and it is not a proof that the branch is wired correctly.
+func TestTheSlideshowTimerStillHonoursThePauseFlag(t *testing.T) {
+	reads := 0
+	for _, s := range packageCallSites(t, "isPaused") {
+		t.Logf("  %s:%d  %s()", s.File, s.Line, s.Func)
+		if s.File == "main.go" && s.Func == "startSlideshow" {
+			reads++
+		}
+	}
+	if reads != 1 {
+		t.Fatalf("startSlideshow consults isPaused() %d time(s), want exactly 1 — the slide "+
+			"timer must not advance a PAUSED slideshow. Removing that gate makes the pause "+
+			"button inert, makes seconds_until_next's \"0 when paused\" a lie, and bounds the "+
+			"Key/Keys divergence the contract documents as unbounded.", reads)
 	}
 }
 
