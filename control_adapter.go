@@ -205,6 +205,17 @@ func (g gtkViewer) GotoIndex(index int) {
 // interval on every poll push the deadline out forever and starve the advance —
 // a display that never turns the page, from an endpoint that "did nothing".
 //
+// ⚠ SCOPE OF THAT GUARD, stated because the sentence above is easy to read as
+// wider than it is: it blocks the IDENTICAL value, and nothing more. A client
+// alternating 1, 2, 1, 2 … faster than one second still re-arms on every request
+// and still starves the advance completely. That is not closed here, and the
+// reason it is acceptable is authentication, not the guard: POST /api/interval
+// is bearer-gated and the LAN listener is firewalled, so the remaining case is
+// an authorised client behaving pathologically. Closing it properly means
+// conditioning the re-arm on the REMAINING time rather than on value equality,
+// which is a different design with different edge cases — do not "tighten" the
+// equality check and believe the wider sentence has become true.
+//
 // PAUSED: it re-arms anyway, and that is the decision rather than an oversight.
 // The slide timer runs while paused — startSlideshow re-arms on every tick and
 // only the ADVANCE is gated on !isPaused — so a pending source exists to retire
@@ -215,8 +226,19 @@ func (g gtkViewer) GotoIndex(index int) {
 // what it buys is that a resume finds the NEW interval already armed instead of
 // silently serving out the rest of the old one.
 func (g gtkViewer) SetInterval(seconds int) {
-	if seconds < 0 {
-		return // the handler already rejects this; belt for the direct caller
+	// 🔴 `<= 0`, not `< 0`, and the zero is the whole point — the belt was
+	// narrower than the hazard its own neighbour names. countdownFrom's comment
+	// in state.go says plainly which way the damage runs if a 0 ever arrives:
+	// "glib.TimeoutAdd(0, …) in startSlideshow spinning the main loop through S3
+	// GETs is the real one". Before the re-arm, a 0 that got past here sat in
+	// config until the next tick; now it is armed IMMEDIATELY, as a zero-delay
+	// timeout that re-arms itself from its own callback — a wedged Pi, not a slow
+	// one. POST /api/interval bounds to 1..3600 so this is unreachable from the
+	// network today, which is exactly why it has to be a real guard here rather
+	// than a comment pointing at the handler: this is the belt for the DIRECT
+	// caller, and 0 is the value that hurts.
+	if seconds <= 0 {
+		return
 	}
 	if !g.iv.setSlideInterval(uint(seconds)) {
 		return

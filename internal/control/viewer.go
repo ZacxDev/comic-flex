@@ -152,7 +152,14 @@ func ParseViewMode(s string) (ViewMode, bool) {
 //	the cause: SetInterval now retires the pending timer and arms a fresh one at
 //	the new interval, so the countdown restarts from the NEW value and decreases
 //	from there. A consumer that lowers the interval should see its next poll
-//	report at most the new interval and every poll after that report less.
+//	report at most the new interval, and fall from there towards 0.
+//
+//	⚠ That is a statement about the CURRENT cycle, and it is not a licence to
+//	assert monotonic decrease across polls. The countdown resets to SlideInterval
+//	on every advance, exactly as it always has, so any consumer watching long
+//	enough sees it jump back up — that is the timer working, not the freeze
+//	returning. The property this change buys is that the reset happens on the NEW
+//	interval starting immediately, instead of once the old timer finally expires.
 //
 //	The clamp itself stays, and stays load-bearing: SecondsUntilNext is still
 //	never above SlideInterval. What is gone is the state in which the two could

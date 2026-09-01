@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/printer"
@@ -1001,6 +1002,16 @@ func armedTimer(iv *ImageViewer) (glib.SourceHandle, time.Time) {
 
 // retireArmedTimer leaves no callback registered in the shared default main
 // context, which every test that drives the real startSlideshow must do.
+//
+// 🔴 It is not tidiness, and the reason it is not yet a bug is worth writing
+// down. These tests arm REAL GLib timeouts on the default main context, some of
+// them seconds away from firing, and four tests elsewhere in this package
+// (lifecycle_test.go) ITERATE that same context. Nothing in package main calls
+// t.Parallel, so a test's sources are always retired before the next test runs
+// and no other test's Iteration can ever dispatch them. Add t.Parallel anywhere
+// in this package and that stops being true: an expired slide timeout could be
+// dispatched inside an unrelated test, running advance + updateImage — a real S3
+// GET — on that test's goroutine, and the failure would be attributed to it.
 func retireArmedTimer(t *testing.T, iv *ImageViewer) {
 	t.Helper()
 	if previous := iv.swapTimeout(0, time.Time{}); previous != 0 {
@@ -1380,6 +1391,62 @@ func TestSetIntervalBeforeTheSlideshowStartsStoresWithoutArming(t *testing.T) {
 	if got := iv.snapshotAt(armedAt).secondsUntilNext; got != 11 {
 		t.Fatalf("seconds_until_next = %d once the slideshow starts, want 11 — the interval set "+
 			"before it started was not the one it armed", got)
+	}
+}
+
+// TestSetIntervalRefusesAZeroRatherThanArmingAZeroDelayTimeout guards the belt
+// on the direct caller, and it is a REGRESSION guard for a hazard the re-arm
+// promoted, not an invariant guard.
+//
+// countdownFrom's comment in state.go names the damage: "glib.TimeoutAdd(0, …) in
+// startSlideshow spinning the main loop through S3 GETs is the real one". Before
+// this change a 0 that reached SetInterval was merely stored, and did its damage
+// at the next tick. Now it would be armed IMMEDIATELY — a zero-delay timeout
+// re-arming itself from its own callback, i.e. a wedged main loop and a display
+// that stops responding to anything, including the control API that would let you
+// fix it.
+//
+// POST /api/interval bounds to 1..3600 (pinned in internal/control), so this is
+// not reachable over the network. That is exactly why the guard belongs here: the
+// handler's bound is a second component's property, and this adapter is called
+// directly by tests and by anything added later.
+func TestSetIntervalRefusesAZeroRatherThanArmingAZeroDelayTimeout(t *testing.T) {
+	for _, seconds := range []int{0, -1} {
+		t.Run(fmt.Sprint(seconds), func(t *testing.T) {
+			iv := newControlTestViewer(30, "a.jpg")
+			iv.startSlideshow()
+			t.Cleanup(func() { retireArmedTimer(t, iv) })
+			handle, deadline := armedTimer(iv)
+
+			gtkViewer{iv: iv}.SetInterval(seconds)
+
+			if got := iv.slideInterval(); got != 30 {
+				t.Fatalf("SetInterval(%d) stored slide_interval = %d; it must refuse, not store. "+
+					"A 0 here arms glib.TimeoutAdd(0, …), which spins the GTK main loop through "+
+					"S3 GETs and wedges the display.", seconds, got)
+			}
+			gotHandle, gotDeadline := armedTimer(iv)
+			if gotHandle != handle || !gotDeadline.Equal(deadline) {
+				t.Fatalf("SetInterval(%d) re-armed the timer: (handle %d, deadline %v) -> "+
+					"(handle %d, deadline %v)", seconds, handle, deadline, gotHandle, gotDeadline)
+			}
+		})
+	}
+
+	// Positive control, same viewer shape and same probe: a LEGAL value does get
+	// through and does re-arm. Without it, `if true { return }` at the top of
+	// SetInterval — the whole endpoint inert — passes both rows above.
+	iv := newControlTestViewer(30, "a.jpg")
+	iv.startSlideshow()
+	t.Cleanup(func() { retireArmedTimer(t, iv) })
+	handle, _ := armedTimer(iv)
+	gtkViewer{iv: iv}.SetInterval(1) // the smallest value the handler accepts
+	if got := iv.slideInterval(); got != 1 {
+		t.Fatalf("SetInterval(1) stored %d, want 1 — this test cannot tell a refusal from an "+
+			"implementation that refuses everything", got)
+	}
+	if gotHandle, _ := armedTimer(iv); gotHandle == handle {
+		t.Fatal("SetInterval(1) did not re-arm; the refusals above are vacuous")
 	}
 }
 

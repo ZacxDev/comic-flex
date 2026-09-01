@@ -713,10 +713,19 @@ func (iv *ImageViewer) setArmTimer(fn func()) {
 // see the Viewer contract in internal/control/viewer.go. Do not call this from
 // gtkViewer.Rescan or from any other off-thread path.
 //
-// 🔴 The lock is RELEASED before the closure runs. startTimer calls swapTimeout,
-// which takes the WRITE lock; holding the read lock across it is a deadlock the
-// moment a writer queues between the two acquisitions. Same shape, same reason,
-// as onScanComplete above.
+// 🔴 The lock is RELEASED before the closure runs, and holding it would be an
+// UNCONDITIONAL deadlock — not a race that needs a competing writer to lose.
+// startTimer calls swapTimeout, which takes the WRITE lock, and sync.RWMutex is
+// not reentrant: RLock then Lock on the same mutex in the same goroutine hangs on
+// its own, with nothing else running. Measured, by holding it: a single-goroutine
+// test with no other party died on sync.runtime_SemacquireRWMutex.
+//
+// The distinction is worth the sentence. onScanComplete above releases for the
+// related-but-different reason that its callee re-enters the READ lock, which
+// only deadlocks when a writer queues between the two acquisitions — a hazard
+// that can hide for a long time. This one cannot hide at all, so a maintainer who
+// reads "only if a writer queues" here and decides the early unlock is
+// defensive would wedge the GTK main loop on the first POST /api/interval.
 //
 // false means nothing was armed because startSlideshow has not run yet. That is
 // reachable only during boot — main() calls startSlideshow before it starts the
