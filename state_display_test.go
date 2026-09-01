@@ -194,7 +194,11 @@ func TestTheEmptiedGalleryStatesAreReachableAndDistinct(t *testing.T) {
 // 🔴 SCOPE — THIS TEST PINS ONE OF THE TWO GATES, NOT BOTH. An earlier version
 // of this docstring said "if either gate changes, this test fails", and that was
 // measured FALSE: replacing startSlideshow's `if !iv.isPaused()` with `if true`
-// leaves the whole suite at 386 PASS / 0 FAIL. This test never runs
+// LEFT the whole suite at 386 PASS / 0 FAIL — past tense, because that mutant is
+// killed now and a reader re-running it today sees 386 PASS / 1 FAIL. The PASS
+// count is unchanged between the two, so only the FAIL distinguishes them; state
+// historical measurements in the past tense, as the rest of this repo does.
+// This test never runs
 // startSlideshow — it checks the paused FLAG, which is not the branch that reads
 // it. The pause gate lives inside a glib.TimeoutAdd closure and cannot be reached
 // headlessly at all, so it is pinned structurally instead, by
@@ -244,37 +248,96 @@ func TestAPausedRescanLeavesKeyAndKeysDisagreeingIndefinitely(t *testing.T) {
 // TestAPausedRescanLeavesKeyAndKeysDisagreeingIndefinitely cannot reach.
 //
 // 🔴 It exists because a mutant proved the gap rather than because a comment
-// looked thin: replacing startSlideshow's `if !iv.isPaused()` with `if true`
-// left the ENTIRE suite at 386 PASS / 0 FAIL. Two separate claims rest on that
-// gate — Snapshot.SecondsUntilNext's "0 when paused", and the contract's
-// "the divergence between Key and Keys is UNBOUNDED", which is only true because
-// a paused slideshow never re-renders. Delete the gate and a paused Pi resumes
-// turning pages: the countdown claim goes stale, the divergence becomes bounded
-// by slide_interval, and the operator's pause button stops working. None of that
-// was observable.
+// looked thin: replacing startSlideshow's `if !iv.isPaused()` with `if true` was
+// measured to leave the ENTIRE suite at 386 PASS / 0 FAIL. Two separate claims
+// rest on that gate — Snapshot.SecondsUntilNext's "0 when paused", and the
+// contract's "the divergence between Key and Keys is UNBOUNDED", which is only
+// true because a paused slideshow never re-renders. Delete the gate and a paused
+// Pi resumes turning pages: the countdown keeps reporting 0 while pages actually
+// turn, the divergence becomes bounded by slide_interval, and the operator's
+// pause button stops working. None of that was observable.
 //
 // It is STRUCTURAL because the gate is genuinely unreachable from a test: it
 // lives inside the closure handed to glib.TimeoutAdd, which only a running GTK
 // main loop executes. Same precedent as TestTheSlideTimerHasExactlyOneArmingSite.
 //
-// 🔴 What it does NOT pin, said plainly so the next reader does not take it for
-// more: it counts the isPaused() CALL, so `_ = iv.isPaused(); if true { … }`
-// walks it. It kills the mutation that actually happens — deleting or inverting
-// the condition — and it is not a proof that the branch is wired correctly.
+// 🔴 IT REQUIRES THE `!`, AND COUNTING THE CALL WAS NOT ENOUGH. The first version
+// of this guard counted isPaused() call sites, and its own disclosure claimed
+// that killed "deleting or inverting the condition". The inversion half was
+// measured FALSE: `if iv.isPaused()` — a slideshow that advances ONLY while
+// paused — is still exactly one call in startSlideshow, so it produced a
+// byte-identical 387 PASS / 0 FAIL. The guard now matches the negated expression
+// `!iv.isPaused()`, which is the thing the code must actually contain. A count
+// of DECLARATIONS is not a count of what they cover, one level down.
+//
+// 🔴 What it still does NOT pin, so nobody reads it for more than it is: it
+// asserts the EXPRESSION exists in this function, not that the branch it guards
+// is the one that advances the slideshow. `x := !iv.isPaused(); if true { … }`
+// walks it, and so does keeping the condition while swapping the if/else bodies.
+// Those are deliberate walks rather than plausible refactors; the three
+// mutations that plausibly happen — deleting the condition, inverting it, and
+// hoisting the read out of the closure so the flag is sampled once at startup —
+// are all killed.
 func TestTheSlideshowTimerStillHonoursThePauseFlag(t *testing.T) {
-	reads := 0
-	for _, s := range packageCallSites(t, "isPaused") {
-		t.Logf("  %s:%d  %s()", s.File, s.Line, s.Func)
-		if s.File == "main.go" && s.Func == "startSlideshow" {
-			reads++
+	negated := negatedIsPausedSites(t, "startSlideshow")
+	for _, line := range negated {
+		t.Logf("  main.go:%d  !iv.isPaused() inside startSlideshow()", line)
+	}
+	if len(negated) != 1 {
+		t.Fatalf("startSlideshow contains %d `!iv.isPaused()` guard(s), want exactly 1 — the "+
+			"slide timer must advance ONLY when the slideshow is not paused. Deleting that "+
+			"condition, inverting it, or hoisting the read out of the timer closure all land "+
+			"here: each makes the pause button inert, makes seconds_until_next's \"0 when "+
+			"paused\" a lie while pages turn, and bounds the Key/Keys divergence the contract "+
+			"documents as unbounded.", len(negated))
+	}
+}
+
+// negatedIsPausedSites reports the lines inside the named function that hold a
+// `!<something>.isPaused()` expression.
+//
+// 🔴 It matches the UnaryExpr, not the CallExpr, and that is the whole point —
+// see the guard above. It also deliberately reports every match rather than
+// stopping at the first, so the ledger fails when the set GROWS as well as when
+// it shrinks: a second pause check in the timer is a second place for the rule to
+// drift, which is the defect this repo consolidates against.
+func negatedIsPausedSites(t *testing.T, fn string) []int {
+	t.Helper()
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "main.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parsing main.go: %v", err)
+	}
+	var lines []int
+	var found bool
+	ast.Inspect(f, func(n ast.Node) bool {
+		decl, ok := n.(*ast.FuncDecl)
+		if !ok || decl.Name.Name != fn {
+			return true
 		}
+		found = true
+		ast.Inspect(decl, func(inner ast.Node) bool {
+			u, ok := inner.(*ast.UnaryExpr)
+			if !ok || u.Op != token.NOT {
+				return true
+			}
+			call, ok := u.X.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "isPaused" {
+				lines = append(lines, fset.Position(u.Pos()).Line)
+			}
+			return true
+		})
+		return false
+	})
+	// Instrument control: a finder that cannot locate the function at all would
+	// report zero matches and read as a real failure of the code under test.
+	if !found {
+		t.Fatalf("no func %s in main.go — this guard is inspecting nothing", fn)
 	}
-	if reads != 1 {
-		t.Fatalf("startSlideshow consults isPaused() %d time(s), want exactly 1 — the slide "+
-			"timer must not advance a PAUSED slideshow. Removing that gate makes the pause "+
-			"button inert, makes seconds_until_next's \"0 when paused\" a lie, and bounds the "+
-			"Key/Keys divergence the contract documents as unbounded.", reads)
-	}
+	return lines
 }
 
 // TestKeysReflectTheSettledStateAfterARender is the other half of the guard
