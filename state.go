@@ -175,14 +175,35 @@ func (iv *ImageViewer) togglePaused() bool {
 	return iv.paused
 }
 
-// swapTimeout stores the new GLib timeout handle and returns the one it
-// replaced, so the caller can remove the old source. Returning the old handle
-// rather than removing it here keeps the GLib call out of the critical section.
-func (iv *ImageViewer) swapTimeout(next glib.SourceHandle) (previous glib.SourceHandle) {
+// swapTimeout stores the new GLib timeout handle AND the instant that timer will
+// fire, and returns the handle it replaced so the caller can remove the old
+// source. Returning the old handle rather than removing it here keeps the GLib
+// call out of the critical section.
+//
+// 🔴 The deadline is a PARAMETER OF THIS CALL, not a second setter, and that is
+// the whole mechanism behind GET /api/state's seconds_until_next. Two clocks
+// that can disagree is a defect, not an implementation detail: an independent
+// "when does the next slide land" field, written anywhere other than where the
+// timer is armed, drifts the moment someone adds a third arming site or reorders
+// the two writes. Here the handle and the deadline are one atomic write, from
+// one interval read, at the one place that calls glib.TimeoutAdd
+// (startSlideshow). Retiring a timer passes the zero Time, which countdownFrom
+// reads as "nothing armed".
+//
+// ⚠ It is still not the GLib source's OWN clock, because there is not one to
+// read: at the pinned gotk3 v0.6.2 SourceHandle is a bare uint and *Source
+// exposes only Destroy/IsDestroyed/Ref/Unref — g_source_get_ready_time is not
+// wrapped. So this is the same INSTANT and the same DURATION as the GLib
+// timeout, measured on Go's monotonic clock instead of GLib's. The one way they
+// diverge is a main loop that fires late — an image load holding it for up to
+// 30 s — and that shows up as the countdown sitting at 0, which is the honest
+// answer while an advance is overdue.
+func (iv *ImageViewer) swapTimeout(next glib.SourceHandle, firesAt time.Time) (previous glib.SourceHandle) {
 	iv.mutex.Lock()
 	defer iv.mutex.Unlock()
 	previous = iv.timeoutID
 	iv.timeoutID = next
+	iv.nextAdvanceAt = firesAt
 	return previous
 }
 
@@ -505,6 +526,87 @@ func (iv *ImageViewer) relayoutIsPending() bool {
 	return iv.relayoutPending
 }
 
+// ---------------------------------------------------------------------------
+// What is on the display, and when the next slide lands.
+// ---------------------------------------------------------------------------
+
+// noteDisplayed records the object keys the render that just completed put on
+// the screen, left to right. It is what GET /api/state's `keys` reports.
+//
+// 🔴 CALL IT AFTER SetFromPixbuf, NOT BEFORE THE LOAD — the same rule
+// noteLayoutBox lives by, and for the same reason. Between selecting a page and
+// the pixbuf reaching the widget there is an S3 GET that is allowed to take 30 s
+// and allowed to fail. Recording the intent up front would make this field claim
+// a frame that never appeared, and a failed load would leave that claim standing
+// forever with the PREVIOUS comic still lit.
+//
+// 🔴 It COPIES, and that is not defensive habit. The two-up path builds its slice
+// from pairKeys under one lock and hands it here under another; retaining the
+// caller's backing array would let a later render alias into state the HTTP
+// goroutine is reading, which is a data race -race would find only sometimes.
+func (iv *ImageViewer) noteDisplayed(keys []string) {
+	stored := make([]string, len(keys))
+	copy(stored, keys)
+	iv.mutex.Lock()
+	defer iv.mutex.Unlock()
+	iv.displayedKeys = stored
+}
+
+// displayedPair reports the keys a two-up render actually put on the display.
+//
+// 🔴 The two halves are the SAME POSITION on a one-image gallery — pairKeys wraps
+// (right = left + 1 mod n), so with n == 1 both halves load images[0] and the
+// screen shows one comic twice. Reporting it twice would tell the PWA two
+// different comics are up, which is the exact class of wrongness `keys` exists to
+// remove. The test is on the INDEX, not on the key string: two distinct positions
+// holding an identical key is a duplicated object in the bucket, and those really
+// are two comics on the screen.
+func displayedPair(leftIdx int, left string, rightIdx int, right string) []string {
+	if leftIdx == rightIdx {
+		return []string{left}
+	}
+	return []string{left, right}
+}
+
+// countdownFrom renders the time left before the next automatic advance as whole
+// seconds, clamped into [0, interval].
+//
+// It takes the remaining duration rather than reading a clock so the boundaries
+// are exercisable: the caller has already subtracted under the lock.
+//
+// Ceiling, not truncation: a countdown that has 0.4 s to run has not reached
+// zero, and a client that renders "0" while the slide is still up is describing
+// a state that has not happened. The ceiling means the value walks 30, 29 … 1, 0
+// and reaches 0 only when the advance is actually due or overdue.
+//
+// 🔴 The ceiling comparison is done in uint64 rather than by converting interval
+// to int, and that is what makes "never negative" true BY CONSTRUCTION instead of
+// by a third clamp nothing could ever reach. interval is a uint straight out of
+// config.yaml, so `int(interval)` is negative for a pathological value, and a
+// high clamp against a negative ceiling returns a negative number for a field
+// documented as never negative. In uint64 there is no such value: secs starts at
+// 1 or more, only ever shrinks to interval, and a Duration caps at ~292 years so
+// it cannot exceed the int range on the way back. A guard that cannot fire is
+// worse than none — it reads as coverage and stops anyone looking — so there
+// isn't one.
+//
+// interval genuinely reaches 0: the HTTP handler bounds POST /api/interval to
+// 1..3600, but gtkViewer.SetInterval only rejects NEGATIVES, so SetInterval(0)
+// lands a zero and every countdown is then correctly pinned at 0.
+func countdownFrom(remaining time.Duration, interval uint) int {
+	if remaining <= 0 {
+		return 0
+	}
+	// Integer ceiling of remaining/1s: 0.4 s left has not reached zero, and a
+	// client rendering "0" while the slide is still up describes a state that
+	// has not happened. Truncation would show 0 for a whole second.
+	secs := uint64((remaining + time.Second - 1) / time.Second)
+	if secs > uint64(interval) {
+		secs = uint64(interval)
+	}
+	return int(secs)
+}
+
 // enqueueBounded reserves a slot, hands fn to schedule, and releases the slot
 // once fn has run. It reports false, having scheduled nothing, when the queue is
 // full.
@@ -608,22 +710,46 @@ func (iv *ImageViewer) gotoIndex(index int) bool {
 }
 
 // viewerSnapshot is one consistent read of everything GET /api/state reports.
+//
+// 🔴 It is NOT comparable with == any more, because keys is a slice. Tests
+// compare it with reflect.DeepEqual — deliberately, rather than a hand-written
+// field-by-field helper, because a helper is a second copy of the field list and
+// the field it forgets is invisible. That is the price of reporting what is on
+// the display rather than a scalar the handler could recompute, and recomputing
+// it is precisely the defect this field exists to close.
 type viewerSnapshot struct {
-	total         int
-	index         int
-	key           string
-	viewMode      ViewMode
-	paused        bool
-	slideInterval uint
-	scanning      bool
+	total            int
+	index            int
+	key              string
+	keys             []string
+	viewMode         ViewMode
+	paused           bool
+	slideInterval    uint
+	scanning         bool
+	secondsUntilNext int
 }
 
-// snapshot reads every exported field under a SINGLE read lock.
+// snapshot reads every reported field under a SINGLE read lock, as of now.
+func (iv *ImageViewer) snapshot() viewerSnapshot { return iv.snapshotAt(time.Now()) }
+
+// snapshotAt reads every reported field under a SINGLE read lock.
 //
 // Composing it from the individual accessors instead would take and release the
-// lock seven times, and the result could describe a state the viewer was never
-// in — a key from before a page turn beside an index from after it.
-func (iv *ImageViewer) snapshot() viewerSnapshot {
+// lock nine times, and the result could describe a state the viewer was never
+// in — a key from before a page turn beside an index from after it, or a
+// countdown measured against an interval that had already been replaced.
+//
+// 🔴 keys is READ, not DERIVED. It is whatever the last completed render put on
+// the screen (see noteDisplayed); it is deliberately NOT rebuilt here from
+// currentIndex and viewMode, because the client's whole reason for asking is
+// that it cannot do that arithmetic itself — the gallery is shuffled per process
+// and its second two-up key is not "the one after mine". Rebuilding it here
+// would move that guess from the browser into the Pi and call it truth.
+// TestKeysComeFromTheRendererNotFromTheIndex kills exactly that mutant.
+//
+// now is a parameter so the countdown's boundaries — armed, mid-flight, overdue,
+// paused — are exercisable without sleeping through a 30 s slide interval.
+func (iv *ImageViewer) snapshotAt(now time.Time) viewerSnapshot {
 	iv.mutex.RLock()
 	defer iv.mutex.RUnlock()
 
@@ -637,6 +763,17 @@ func (iv *ImageViewer) snapshot() viewerSnapshot {
 	if s.total > 0 {
 		s.index = wrapIndex(iv.currentIndex, 0, s.total)
 		s.key = iv.images[s.index]
+	}
+	if len(iv.displayedKeys) > 0 {
+		s.keys = make([]string, len(iv.displayedKeys))
+		copy(s.keys, iv.displayedKeys)
+	}
+	// Paused means the countdown is not running: the timer still ticks and
+	// re-arms, but it advances nothing, so a client counting down to a page turn
+	// that will not happen would be showing a lie. A retired timer (handle 0)
+	// has no scheduled advance at all.
+	if !s.paused && iv.timeoutID != 0 {
+		s.secondsUntilNext = countdownFrom(iv.nextAdvanceAt.Sub(now), iv.config.SlideInterval)
 	}
 	return s
 }

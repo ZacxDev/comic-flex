@@ -232,13 +232,20 @@ func TestStateJSONShape(t *testing.T) {
 	// Every field distinct from every other, and from any constant the handler
 	// names, so a mutant that hardcodes or crosses two fields cannot survive.
 	f.snap = Snapshot{
-		Total:         7544,
-		Index:         412,
-		Key:           "batman/issue-04/page-012.jpg",
-		ViewMode:      string(ViewLandscapeTwo),
-		Paused:        true,
-		SlideInterval: 37,
-		Scanning:      false,
+		Total: 7544,
+		Index: 412,
+		Key:   "batman/issue-04/page-012.jpg",
+		// 🔴 The second key is deliberately UNRELATED to the first — not the next
+		// page, not the next index, not the same issue. If the handler (or a
+		// future middleware) ever derived it from Key or Index, no arithmetic on
+		// this fixture can produce "swamp-thing/…", so the mutant cannot pass by
+		// accident of a fixture whose fields are one apart.
+		Keys:             []string{"batman/issue-04/page-012.jpg", "swamp-thing/issue-21/page-003.jpg"},
+		ViewMode:         string(ViewLandscapeTwo),
+		Paused:           true,
+		SlideInterval:    37,
+		Scanning:         false,
+		SecondsUntilNext: 19,
 	}
 	s := newTestServer(t, f)
 
@@ -248,16 +255,152 @@ func TestStateJSONShape(t *testing.T) {
 		t.Fatalf("body is not JSON: %v (%s)", err, w.Body.String())
 	}
 	want := map[string]any{
-		"total":          float64(7544),
-		"index":          float64(412),
-		"key":            "batman/issue-04/page-012.jpg",
-		"view_mode":      "landscape_two",
-		"paused":         true,
-		"slide_interval": float64(37),
-		"scanning":       false,
+		"total": float64(7544),
+		"index": float64(412),
+		"key":   "batman/issue-04/page-012.jpg",
+		"keys": []any{
+			"batman/issue-04/page-012.jpg",
+			"swamp-thing/issue-21/page-003.jpg",
+		},
+		"view_mode":          "landscape_two",
+		"paused":             true,
+		"slide_interval":     float64(37),
+		"scanning":           false,
+		"seconds_until_next": float64(19),
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("state body = %#v\nwant %#v", got, want)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The two fields added for the companion PWA: `keys` and `seconds_until_next`.
+//
+// These are wire-contract guards. The BEHAVIOUR behind `keys` — that it is the
+// renderer's record and not a recomputation from the index — cannot be pinned
+// from this package, because this package has no gallery and no renderer; it is
+// pinned by TestKeysComeFromTheRendererNotFromTheIndex in package main. What
+// this package can and must pin is that the handler passes both fields through
+// UNCHANGED and that neither can reach a consumer as `null` or as an absence.
+// ---------------------------------------------------------------------------
+
+// TestStateKeysAndCountdownArePassedThroughUnchanged drives every documented
+// shape of `keys` — nothing displayed, one key, two keys — through the real
+// handler and asserts the body carries exactly what the viewer reported.
+//
+// 🔴 `key` is asserted to equal `keys[0]` in the two populated rows. That is the
+// additive contract: existing consumers keep reading `key` and get the leading
+// displayed key, unchanged. (It is a SETTLED-state relationship. Package main's
+// tests cover the transient in which a page turn has moved `key` while the frame
+// on the glass — and therefore `keys` — is still the previous one.)
+func TestStateKeysAndCountdownArePassedThroughUnchanged(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		snap     Snapshot
+		wantKeys []any
+	}{
+		{
+			name: "nothing displayed yet",
+			snap: Snapshot{Total: 0, ViewMode: string(ViewLandscapeSingle),
+				SlideInterval: 30, Scanning: true},
+			wantKeys: []any{},
+		},
+		{
+			name: "one key in a single view",
+			snap: Snapshot{Total: 88, Index: 41, Key: "sandman/vol-2/p-07.jpg",
+				Keys:     []string{"sandman/vol-2/p-07.jpg"},
+				ViewMode: string(ViewPortraitSingle), SlideInterval: 45, SecondsUntilNext: 44},
+			wantKeys: []any{"sandman/vol-2/p-07.jpg"},
+		},
+		{
+			name: "two keys in the two-up view",
+			snap: Snapshot{Total: 88, Index: 41, Key: "sandman/vol-2/p-07.jpg",
+				Keys:     []string{"sandman/vol-2/p-07.jpg", "hellboy/vol-9/p-63.jpg"},
+				ViewMode: string(ViewLandscapeTwo), SlideInterval: 45, SecondsUntilNext: 3},
+			wantKeys: []any{"sandman/vol-2/p-07.jpg", "hellboy/vol-9/p-63.jpg"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeViewer()
+			f.snap = tc.snap
+			s := newTestServer(t, f)
+
+			w := do(t, s, "GET", "/api/state", "")
+			var got map[string]any
+			if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+				t.Fatalf("body is not JSON: %v (%s)", err, w.Body.String())
+			}
+
+			if !reflect.DeepEqual(got["keys"], tc.wantKeys) {
+				t.Fatalf("keys = %#v, want %#v — the handler did not pass the viewer's "+
+					"displayed keys through verbatim", got["keys"], tc.wantKeys)
+			}
+			if got, want := got["seconds_until_next"], float64(tc.snap.SecondsUntilNext); got != want {
+				t.Fatalf("seconds_until_next = %v, want %v", got, want)
+			}
+			if len(tc.wantKeys) > 0 && got["key"] != tc.wantKeys[0] {
+				t.Fatalf("key = %v but keys[0] = %v — `key` is no longer the leading "+
+					"displayed key and every existing consumer just changed meaning",
+					got["key"], tc.wantKeys[0])
+			}
+		})
+	}
+}
+
+// TestStateKeysIsNeverNullOnTheWire pins the one thing a consumer cannot code
+// around after the fact.
+//
+// A nil []string marshals to `null`, and the empty gallery — Keys nil — is the
+// state the Pi is in at every single boot, before the first listing returns. A
+// client that wrote `state.keys.length` would therefore crash on startup, every
+// time, and pass every test written against a populated fixture. The guard is on
+// the RAW BYTES rather than on an unmarshalled value, because `null` and `[]`
+// both decode into a nil/empty Go slice and the distinction would vanish.
+func TestStateKeysIsNeverNullOnTheWire(t *testing.T) {
+	f := newFakeViewer() // Total 0, Keys nil — the state at boot
+	if f.snap.Keys != nil {
+		t.Fatal("the fixture already has a non-nil Keys; this test cannot see the null")
+	}
+	s := newTestServer(t, f)
+
+	body := do(t, s, "GET", "/api/state", "").Body.String()
+	if !strings.Contains(body, `"keys":[]`) {
+		t.Fatalf("body %s does not contain `\"keys\":[]` — an empty gallery is serializing "+
+			"as null or as an absent field", body)
+	}
+	if strings.Contains(body, `"keys":null`) {
+		t.Fatalf("body %s serializes keys as null", body)
+	}
+	// Both fields are ALWAYS present, so a consumer branches on value rather than
+	// on existence. A `,omitempty` on either would delete them from exactly this
+	// response — the zero-valued one nobody writes a fixture for.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(body), &raw); err != nil {
+		t.Fatalf("body is not JSON: %v", err)
+	}
+	for _, field := range []string{"keys", "seconds_until_next"} {
+		if _, ok := raw[field]; !ok {
+			t.Fatalf("%q is absent from %s; both new fields must always be present", field, body)
+		}
+	}
+}
+
+// TestSnapshotMarshalsKeysAsAnArrayFromAnyCaller is the positive control for the
+// normalisation living on the TYPE rather than in the handler.
+//
+// TestStateKeysIsNeverNullOnTheWire proves the endpoint is safe. It does not
+// prove the endpoint is safe FOR THE RIGHT REASON: a normalisation written into
+// handleState would pass it and would leave the next marshaller of a Snapshot —
+// a second endpoint, a log line, a test fixture — emitting null again. This
+// marshals the bare value with no server in the picture at all.
+func TestSnapshotMarshalsKeysAsAnArrayFromAnyCaller(t *testing.T) {
+	b, err := json.Marshal(Snapshot{Total: 0})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(b), `"keys":[]`) {
+		t.Fatalf("Snapshot{}.MarshalJSON produced %s; a caller outside the handler still "+
+			"emits null for keys", b)
 	}
 }
 

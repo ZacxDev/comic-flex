@@ -1,5 +1,7 @@
 package control
 
+import "encoding/json"
+
 // This package is the Pi-side control API for comic-flex (clawgate #442 phase 3a).
 //
 // 🔴 It MUST NOT import gotk3 or glib, and there is a test that fails if it ever
@@ -59,14 +61,82 @@ func ParseViewMode(s string) (ViewMode, bool) {
 // A client that renders a spinner on Scanning ALONE will therefore cover a
 // fully populated gallery: the "indexing…" condition is `Scanning && Total == 0`.
 // Scanning on its own means "a rescan is not finished with the display yet".
+// 🔴 Keys and SecondsUntilNext are the two fields the companion PWA reads, and
+// each answers a question the client provably CANNOT answer for itself. Both are
+// filled from the SAME lock acquisition as every field above them, so they never
+// describe a state the viewer was not in.
+//
+// Keys — every object key CURRENTLY ON THE DISPLAY, left to right.
+//
+//	Key is retained unchanged and is Keys[0] in a settled state; this is purely
+//	additive and no existing consumer has to move.
+//
+//	🔴 It comes from THE RENDERER, not from Index. In the two-up view the second
+//	image is the one the render loaded, and the client has no way to derive it:
+//	the Pi's gallery order is a per-process SHUFFLE (config is_random_order), so
+//	the PWA's own list is not the Pi's list and "Index+1" is a guess. Deriving it
+//	client-side is the bug this field exists to remove, and an implementation
+//	that recomputes it here from Index would reintroduce that bug one hop closer
+//	to the data. TestKeysComeFromTheRendererNotFromTheIndex is the guard.
+//
+//	Consequences of it being the RENDERER's record, stated rather than implied:
+//
+//	  - a render that FAILED (a 30 s S3 GET that timed out) leaves the previous
+//	    keys here, because those are the ones still on the screen;
+//	  - between a page turn and the render completing, Key/Index describe the new
+//	    SELECTION while Keys still describes the old FRAME. That window is a real
+//	    image load — up to 30 s. It is deliberate: Key is where the slideshow is,
+//	    Keys is what the panel is showing, and collapsing them would mean lying
+//	    about one of the two;
+//	  - a rescan that empties the gallery leaves Total 0 with Keys still
+//	    populated, because the last frame is still lit.
+//
+//	Lengths: 1 in either single view; 2 in landscape_two when two DISTINCT
+//	positions are on screen; 1 in landscape_two when both halves are the same
+//	position (a one-image gallery); empty when nothing has been rendered yet.
+//	It is never null on the wire — see MarshalJSON.
+//
+// SecondsUntilNext — whole seconds until the next AUTOMATIC advance.
+//
+//	0 when paused (no countdown is running), and 0 when no slide timer is armed.
+//	Always within [0, SlideInterval] and never negative.
+//
+//	🔴 Deliberately a DURATION and not an absolute timestamp. The consumer is a
+//	browser on a phone with its own clock, and a duration is immune to skew
+//	between the Pi, the pod and the handset. The client decrements locally
+//	between polls and re-syncs on each one.
 type Snapshot struct {
-	Total         int    `json:"total"`
-	Index         int    `json:"index"`
-	Key           string `json:"key"`
-	ViewMode      string `json:"view_mode"`
-	Paused        bool   `json:"paused"`
-	SlideInterval int    `json:"slide_interval"`
-	Scanning      bool   `json:"scanning"`
+	Total            int      `json:"total"`
+	Index            int      `json:"index"`
+	Key              string   `json:"key"`
+	Keys             []string `json:"keys"`
+	ViewMode         string   `json:"view_mode"`
+	Paused           bool     `json:"paused"`
+	SlideInterval    int      `json:"slide_interval"`
+	Scanning         bool     `json:"scanning"`
+	SecondsUntilNext int      `json:"seconds_until_next"`
+}
+
+// MarshalJSON renders a Snapshot with Keys guaranteed to be an ARRAY.
+//
+// 🔴 It exists for one reason: a nil []string marshals to `null`, and the
+// contract is that both new fields are ALWAYS PRESENT with a value a consumer
+// can branch on. `keys: null` forces every client to write
+// `(s.keys || []).length`, and the one that forgets crashes on the empty-gallery
+// state — which is the state the Pi is in at every boot.
+//
+// It is done HERE, on the type, rather than in the handler, so it holds for
+// every marshaller of a Snapshot including a future second endpoint. One rule,
+// one place: normalising at each call site is how the second call site gets it
+// wrong. TestStateKeysIsNeverNullOnTheWire is the guard.
+func (s Snapshot) MarshalJSON() ([]byte, error) {
+	// alias drops the methods, so json.Marshal below cannot recurse into this one.
+	type alias Snapshot
+	a := alias(s)
+	if a.Keys == nil {
+		a.Keys = []string{}
+	}
+	return json.Marshal(a)
 }
 
 // Viewer is everything this package needs from the slideshow.

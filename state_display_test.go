@@ -1,0 +1,587 @@
+package main
+
+import (
+	"reflect"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/gotk3/gotk3/glib"
+)
+
+// These cover the two fields GET /api/state grew for the companion PWA:
+//
+//	keys                — every object key CURRENTLY ON THE DISPLAY, left to
+//	                      right, read from the renderer's own record.
+//	seconds_until_next  — whole seconds to the next automatic advance, derived
+//	                      from the instant the slide timer was armed.
+//
+// They live in package main because that is where both facts are produced: the
+// render paths write one, startSlideshow writes the other, and snapshot() reads
+// both under the single lock the API contract depends on. internal/control's own
+// tests can only see the wire shape — it has no gallery and no renderer — so
+// pinning the SOURCE of `keys` has to happen here.
+
+// ---------------------------------------------------------------------------
+// keys — the renderer's record, not the handler's arithmetic
+// ---------------------------------------------------------------------------
+
+// TestKeysComeFromTheRendererNotFromTheIndex is THE guard for this field, and it
+// is the one to run a mutant against before believing any of the others.
+//
+// 🔴 The whole reason `keys` exists is that a consumer cannot compute it. The Pi
+// shuffles its gallery per process (config is_random_order), so the PWA's
+// ordering is not the Pi's, and "the image after the one at index N" is a guess
+// the browser is explicitly forbidden from making. An implementation of snapshot()
+// that rebuilt keys from currentIndex and viewMode —
+//
+//	s.keys = []string{iv.images[s.index]}
+//	if iv.viewMode == ViewLandscapeTwo && s.total > 1 {
+//	    s.keys = append(s.keys, iv.images[wrapIndex(s.index, 1, s.total)])
+//	}
+//
+// — would satisfy every plausible-looking assertion ("keys is non-empty", "keys
+// has two elements in two-up mode", "keys[0] == key") while moving the guessed
+// answer from the browser into the Pi and stamping it as truth. So the fixture
+// below puts the RENDERER's record and the INDEX's arithmetic deliberately far
+// apart: the selection is at the front of the gallery, the frame on the glass is
+// from the middle, and the two share no element.
+//
+// That state is not contrived. It is what every page turn passes through — the
+// index moves first and the render completes up to 30 s later, or never, if the
+// S3 GET fails — and it is the state in which a consumer most needs the truth.
+func TestKeysComeFromTheRendererNotFromTheIndex(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mode ViewMode
+		// rendered is what the render path recorded when its pixbuf landed.
+		rendered []string
+		// recomputed is what a snapshot() that derived keys from the index would
+		// produce for this fixture. Naming it makes the mutant's answer explicit
+		// rather than leaving "not equal to rendered" to cover everything.
+		recomputed []string
+	}{
+		{
+			name:       "single view",
+			mode:       ViewLandscapeSingle,
+			rendered:   []string{"c.jpg"},
+			recomputed: []string{"a.jpg"},
+		},
+		{
+			name:       "two-up view",
+			mode:       ViewLandscapeTwo,
+			rendered:   []string{"c.jpg", "d.jpg"},
+			recomputed: []string{"a.jpg", "b.jpg"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			iv := newControlTestViewer(30, "a.jpg", "b.jpg", "c.jpg", "d.jpg", "e.jpg")
+			iv.setViewModeState(tc.mode)
+
+			// The render that completed put these on the screen.
+			iv.noteDisplayed(tc.rendered)
+			// A page turn then moved the SELECTION, and no render has completed
+			// since: the image load is still in flight, or it failed.
+			if !iv.gotoIndex(0) {
+				t.Fatal("gotoIndex reported nothing to show on a five-image gallery")
+			}
+
+			got := iv.snapshot()
+
+			if reflect.DeepEqual(got.keys, tc.recomputed) {
+				t.Fatalf("keys = %v, which is exactly what recomputing from index %d would "+
+					"produce — snapshot() is deriving the displayed keys instead of reading "+
+					"the renderer's record, which reintroduces the client-side guess this "+
+					"field exists to remove", got.keys, got.index)
+			}
+			if !reflect.DeepEqual(got.keys, tc.rendered) {
+				t.Fatalf("keys = %v, want %v — snapshot() is not reporting what the renderer "+
+					"recorded", got.keys, tc.rendered)
+			}
+			// The transient this fixture builds, stated so nobody "fixes" it: the
+			// selection has moved ahead of the frame, so key is NOT keys[0] here.
+			// key is where the slideshow is; keys is what is lit.
+			if got.key != "a.jpg" {
+				t.Fatalf("key = %q, want a.jpg — the selection is not being reported", got.key)
+			}
+		})
+	}
+}
+
+// TestKeysIsEmptyBeforeAnythingHasBeenRendered pins the boot state, which is the
+// one every client meets first and the one no populated fixture exercises.
+func TestKeysIsEmptyBeforeAnythingHasBeenRendered(t *testing.T) {
+	// A gallery that has been LISTED but not yet rendered: total is non-zero and
+	// a key is selected, and still nothing is on the glass.
+	iv := newControlTestViewer(30, "a.jpg", "b.jpg")
+	got := iv.snapshot()
+	if len(got.keys) != 0 {
+		t.Fatalf("keys = %v before any render completed, want empty — a client would draw a "+
+			"comic that is not on the display", got.keys)
+	}
+	if got.key != "a.jpg" || got.total != 2 {
+		t.Fatalf("snapshot = %+v; the fixture no longer distinguishes 'listed' from 'rendered'", got)
+	}
+
+	// And an entirely empty viewer likewise.
+	if got := newControlTestViewer(30).snapshot(); len(got.keys) != 0 {
+		t.Fatalf("keys = %v on an empty gallery, want empty", got.keys)
+	}
+}
+
+// TestKeysReflectTheSettledStateAfterARender is the other half of the guard
+// above: once the render HAS completed, key is keys[0] and the two agree. Without
+// it, an implementation that simply never updated keys would pass the
+// not-recomputed test forever.
+func TestKeysReflectTheSettledStateAfterARender(t *testing.T) {
+	iv := newControlTestViewer(30, "a.jpg", "b.jpg", "c.jpg")
+	if !iv.gotoKey("b.jpg") {
+		t.Fatal("gotoKey failed")
+	}
+	// What updateSingleImage records once its pixbuf is on the widget.
+	idx, key, ok := iv.currentKey()
+	if !ok {
+		t.Fatal("currentKey reported an empty gallery")
+	}
+	iv.noteDisplayed([]string{key})
+
+	got := iv.snapshot()
+	if len(got.keys) != 1 || got.keys[0] != got.key {
+		t.Fatalf("keys = %v, key = %q — in a settled state key must be the leading displayed "+
+			"key, which is the additive contract every existing consumer relies on",
+			got.keys, got.key)
+	}
+	if got.index != idx {
+		t.Fatalf("index = %d, want %d", got.index, idx)
+	}
+}
+
+// TestDisplayedPairReportsBothPositionsAndCollapsesTheOneImageGallery covers the
+// length rule for the two-up view, at the seam the render path actually calls.
+//
+// The odd case is not hypothetical: pairKeys WRAPS (right = left + 1 mod n), so a
+// one-image gallery loads images[0] into both halves and the screen shows one
+// comic twice. Reporting it as two keys would tell the PWA two different comics
+// are up. The test is on the INDEX rather than the key string, because two
+// distinct positions holding an identical key means the bucket has a duplicated
+// object — and those really are two comics on the glass.
+func TestDisplayedPairReportsBothPositionsAndCollapsesTheOneImageGallery(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		leftIdx, rightIdx int
+		left, right       string
+		want              []string
+	}{
+		{"two distinct positions", 2, 3, "c.jpg", "d.jpg", []string{"c.jpg", "d.jpg"}},
+		{"wrapped onto the front", 4, 0, "e.jpg", "a.jpg", []string{"e.jpg", "a.jpg"}},
+		{"one-image gallery", 0, 0, "a.jpg", "a.jpg", []string{"a.jpg"}},
+		{"duplicate key, two positions", 1, 2, "dup.jpg", "dup.jpg",
+			[]string{"dup.jpg", "dup.jpg"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := displayedPair(tc.leftIdx, tc.left, tc.rightIdx, tc.right)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("displayedPair(%d,%q,%d,%q) = %v, want %v",
+					tc.leftIdx, tc.left, tc.rightIdx, tc.right, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTheTwoUpRenderReportsThePairPairKeysGaveIt joins displayedPair back to the
+// accessor the renderer reads, so the ORDER is pinned end to end rather than only
+// inside the helper. A helper that returned {right, left} passes the table above
+// if the table's expectations were derived from it; this one derives them from
+// pairKeys, which is where left and right are defined.
+func TestTheTwoUpRenderReportsThePairPairKeysGaveIt(t *testing.T) {
+	iv := newControlTestViewer(30, "a.jpg", "b.jpg", "c.jpg")
+	iv.setViewModeState(ViewLandscapeTwo)
+	if !iv.gotoIndex(1) {
+		t.Fatal("gotoIndex failed")
+	}
+
+	leftIdx, left, rightIdx, right, ok := iv.pairKeys()
+	if !ok {
+		t.Fatal("pairKeys reported an empty gallery")
+	}
+	if left != "b.jpg" || right != "c.jpg" {
+		t.Fatalf("pairKeys = (%q, %q); the fixture no longer exercises a real pair", left, right)
+	}
+	iv.noteDisplayed(displayedPair(leftIdx, left, rightIdx, right))
+
+	got := iv.snapshot()
+	if !reflect.DeepEqual(got.keys, []string{"b.jpg", "c.jpg"}) {
+		t.Fatalf("keys = %v, want [b.jpg c.jpg] — left to right, in the order the render "+
+			"composited them", got.keys)
+	}
+	if got.key != got.keys[0] {
+		t.Fatalf("key = %q but keys[0] = %q", got.key, got.keys[0])
+	}
+}
+
+// TestNoteDisplayedDoesNotAliasTheCallersSlice: the render path builds its slice
+// and hands it over under a different lock acquisition than the one that stores
+// it. Retaining the caller's backing array would let a later render mutate state
+// the HTTP goroutine is reading — a data race -race only catches when the timing
+// lands. Copying on the way in and on the way out closes it deterministically.
+func TestNoteDisplayedDoesNotAliasTheCallersSlice(t *testing.T) {
+	iv := newControlTestViewer(30, "a.jpg", "b.jpg")
+
+	caller := []string{"a.jpg", "b.jpg"}
+	iv.noteDisplayed(caller)
+	caller[0] = "clobbered.jpg"
+
+	got := iv.snapshot()
+	if !reflect.DeepEqual(got.keys, []string{"a.jpg", "b.jpg"}) {
+		t.Fatalf("keys = %v after the caller mutated its own slice — noteDisplayed retained "+
+			"the caller's array", got.keys)
+	}
+
+	// And the other direction: a consumer of the snapshot must not be able to
+	// reach back into viewer state.
+	got.keys[0] = "clobbered.jpg"
+	if again := iv.snapshot(); again.keys[0] != "a.jpg" {
+		t.Fatalf("keys = %v after a caller mutated a snapshot — snapshot handed out the "+
+			"viewer's own array", again.keys)
+	}
+}
+
+// TestBothRenderPathsRecordWhatTheyDisplayedAfterTheWidgetTakesIt is a STRUCTURAL
+// guard, labelled as one: it proves where the recording happens, not that the
+// pixels are right.
+//
+// It earns its place because neither render path can be unit-tested at all — both
+// end in gtk.Image.SetFromPixbuf, which needs a display — so the ORDERING rule
+// they must obey has no behavioural guard available. The rule is the same one
+// noteLayoutBox lives by: record only after the pixbuf is on the widget. Recorded
+// BEFORE the load, `keys` would name a frame that never appeared, and a failed
+// 30 s S3 GET would leave that claim standing while the previous comic is still
+// lit — silently, forever.
+func TestBothRenderPathsRecordWhatTheyDisplayedAfterTheWidgetTakesIt(t *testing.T) {
+	renders := []string{"updateSingleImage", "updateTwoImages"}
+
+	setPixbuf := map[string]int{}
+	for _, s := range packageCallSites(t, "SetFromPixbuf") {
+		setPixbuf[s.Func] = s.Line
+	}
+	noted := map[string]int{}
+	for _, s := range packageCallSites(t, "noteDisplayed") {
+		if _, dup := noted[s.Func]; dup {
+			t.Fatalf("%s calls noteDisplayed more than once; the last call wins and the "+
+				"earlier one is a claim about a frame that was replaced", s.Func)
+		}
+		noted[s.Func] = s.Line
+	}
+
+	if len(noted) != len(renders) {
+		t.Fatalf("noteDisplayed is called from %d function(s) %v, want exactly the %d render "+
+			"paths %v. Anything else that puts a pixbuf on the widget must record what it "+
+			"displayed, and anything that records without displaying is lying about the glass.",
+			len(noted), noted, len(renders), renders)
+	}
+	for _, fn := range renders {
+		note, ok := noted[fn]
+		if !ok {
+			t.Errorf("%s does not call noteDisplayed(); GET /api/state would go on reporting "+
+				"the previous frame's keys after this path renders", fn)
+			continue
+		}
+		set, ok := setPixbuf[fn]
+		if !ok {
+			t.Errorf("%s does not call SetFromPixbuf(); this guard is inspecting the wrong "+
+				"function", fn)
+			continue
+		}
+		if note < set {
+			t.Errorf("%s records the displayed keys at line %d, BEFORE SetFromPixbuf at line "+
+				"%d — a render that bails out between them claims a frame that never "+
+				"appeared", fn, note, set)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// seconds_until_next — one clock, the timer's
+// ---------------------------------------------------------------------------
+
+// TestCountdownFromRoundsUpAndClamps drives the arithmetic directly, at both
+// boundaries and in the middle.
+func TestCountdownFromRoundsUpAndClamps(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		remaining time.Duration
+		interval  uint
+		want      int
+	}{
+		{"freshly armed", 45 * time.Second, 45, 45},
+		{"mid-flight", 26*time.Second + 300*time.Millisecond, 45, 27},
+		{"rounds up rather than down", 400 * time.Millisecond, 45, 1},
+		{"exactly due", 0, 45, 0},
+		{"overdue is never negative", -90 * time.Second, 45, 0},
+		{"a lowered interval clamps the ceiling", 600 * time.Second, 11, 11},
+		{"a zero interval pins it at zero", 600 * time.Second, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := countdownFrom(tc.remaining, tc.interval); got != tc.want {
+				t.Fatalf("countdownFrom(%v, %d) = %d, want %d", tc.remaining, tc.interval, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSecondsUntilNextCountsDownAcrossSuccessiveReads is the behaviour a polling
+// client depends on: the number must strictly DECREASE between polls of an armed,
+// playing slideshow, and land on 0 rather than going negative.
+func TestSecondsUntilNextCountsDownAcrossSuccessiveReads(t *testing.T) {
+	// 45, not the 30 default: a mutant that reported the constant 30 would be
+	// invisible against a 30 s fixture.
+	iv := newControlTestViewer(45, "a.jpg")
+	armed := time.Now()
+	iv.swapTimeout(glib.SourceHandle(7), armed.Add(45*time.Second))
+
+	var previous int
+	for i, tc := range []struct {
+		elapsed time.Duration
+		want    int
+	}{
+		{0, 45},
+		{1 * time.Second, 44},
+		{22*time.Second + 500*time.Millisecond, 23},
+		{44*time.Second + 100*time.Millisecond, 1},
+		{45 * time.Second, 0},
+		{5 * time.Minute, 0}, // the main loop fired late; still not negative
+	} {
+		got := iv.snapshotAt(armed.Add(tc.elapsed)).secondsUntilNext
+		if got != tc.want {
+			t.Fatalf("%v after arming: seconds_until_next = %d, want %d", tc.elapsed, got, tc.want)
+		}
+		if got < 0 {
+			t.Fatalf("seconds_until_next = %d — negative", got)
+		}
+		if got > int(iv.slideInterval()) {
+			t.Fatalf("seconds_until_next = %d, above slide_interval %d", got, iv.slideInterval())
+		}
+		// Strictly decreasing while there is anything left to count; the two rows
+		// past the deadline are both 0, which is the floor and not a stall.
+		if i > 0 && previous > 0 && got >= previous {
+			t.Fatalf("seconds_until_next went %d -> %d as time advanced; it is not counting down",
+				previous, got)
+		}
+		previous = got
+	}
+}
+
+// TestSecondsUntilNextIsZeroWhenPausedAndResumesWhenPlaying pins both directions
+// of the paused rule from ONE armed timer.
+//
+// One direction alone is walkable: `return 0` always passes the paused half, and
+// ignoring paused entirely passes the playing half. Reading the same viewer twice
+// with only the flag moved is what separates them.
+func TestSecondsUntilNextIsZeroWhenPausedAndResumesWhenPlaying(t *testing.T) {
+	iv := newControlTestViewer(45, "a.jpg")
+	armed := time.Now()
+	iv.swapTimeout(glib.SourceHandle(9), armed.Add(45*time.Second))
+	at := armed.Add(20 * time.Second)
+
+	if got := iv.snapshotAt(at).secondsUntilNext; got != 25 {
+		t.Fatalf("playing: seconds_until_next = %d, want 25", got)
+	}
+
+	iv.setPausedState(true)
+	got := iv.snapshotAt(at)
+	if !got.paused {
+		t.Fatal("the fixture did not pause")
+	}
+	if got.secondsUntilNext != 0 {
+		t.Fatalf("paused: seconds_until_next = %d, want 0 — the timer still ticks while paused "+
+			"but it advances nothing, so a countdown would be counting down to a page turn "+
+			"that will not happen", got.secondsUntilNext)
+	}
+
+	iv.setPausedState(false)
+	if got := iv.snapshotAt(at).secondsUntilNext; got != 25 {
+		t.Fatalf("resumed: seconds_until_next = %d, want 25", got)
+	}
+}
+
+// TestSecondsUntilNextIsZeroWithNoArmedTimer covers the other 0: nothing is
+// scheduled at all. It is a real state — the window between retiring the fired
+// source and arming its replacement, and every viewer built before
+// startSlideshow runs.
+func TestSecondsUntilNextIsZeroWithNoArmedTimer(t *testing.T) {
+	iv := newControlTestViewer(45, "a.jpg")
+	if got := iv.snapshot().secondsUntilNext; got != 0 {
+		t.Fatalf("seconds_until_next = %d with no timer armed, want 0", got)
+	}
+
+	// Arm it, then retire it the way startTimer does.
+	armed := time.Now()
+	iv.swapTimeout(glib.SourceHandle(5), armed.Add(45*time.Second))
+	if got := iv.snapshotAt(armed).secondsUntilNext; got != 45 {
+		t.Fatalf("seconds_until_next = %d while armed, want 45; this test is not observing "+
+			"the field move", got)
+	}
+	if previous := iv.swapTimeout(0, time.Time{}); previous != 5 {
+		t.Fatalf("swapTimeout returned handle %d, want 5", previous)
+	}
+	if got := iv.snapshotAt(armed).secondsUntilNext; got != 0 {
+		t.Fatalf("seconds_until_next = %d after the timer was retired, want 0 — the countdown "+
+			"is running against a source that no longer exists", got)
+	}
+}
+
+// TestADeadlineWithoutAnArmedSourceCountsDownToNothing pins WHICH field means
+// "an advance is scheduled".
+//
+// swapTimeout writes the handle and the deadline together, so on every path the
+// accessors take, "no handle" and "no deadline" coincide and dropping the handle
+// check from snapshotAt changes no observable behaviour — the same shape as
+// TestSnapshotNormalisesAnOutOfRangeIndex, and handled the same way: build the
+// state the accessors would never produce and check the rule still holds.
+//
+// It is not decoration. The hazard this whole field is written against is a
+// SECOND clock, and a second clock arrives exactly as a deadline that no GLib
+// source backs — a "predict the next advance" convenience, a deadline restored
+// from config, a half-finished refactor. The armed GLib source is the thing that
+// actually turns the page, so it is the thing the countdown is allowed to
+// describe.
+func TestADeadlineWithoutAnArmedSourceCountsDownToNothing(t *testing.T) {
+	now := time.Now()
+	iv := &ImageViewer{
+		images:        []string{"a.jpg"},
+		mutex:         &sync.RWMutex{},
+		config:        &Config{SlideInterval: 45},
+		nextAdvanceAt: now.Add(30 * time.Second), // a deadline...
+		timeoutID:     0,                         // ...with no source behind it
+	}
+	if got := iv.snapshotAt(now).secondsUntilNext; got != 0 {
+		t.Fatalf("seconds_until_next = %d for a deadline with no armed GLib source, want 0 — "+
+			"the countdown is describing an advance that nothing will perform", got)
+	}
+
+	// Positive control: the same deadline WITH a source does count down, so the
+	// assertion above is about the handle and not about a field that is inert.
+	iv.timeoutID = 4
+	if got := iv.snapshotAt(now).secondsUntilNext; got != 30 {
+		t.Fatalf("seconds_until_next = %d once a source is armed, want 30; this test cannot "+
+			"see the handle check move", got)
+	}
+}
+
+// TestStartSlideshowArmsTheCountdownFromTheTimersOwnInterval is the seam test:
+// the countdown and the GLib timeout must be armed from ONE interval read at ONE
+// instant, not from two.
+//
+// glib.TimeoutAdd registers a source without gtk.Init or a running main loop, so
+// this drives the REAL startSlideshow rather than a stand-in. 53 is neither the
+// 30 default nor a power of two, so neither constant can stand in for it.
+func TestStartSlideshowArmsTheCountdownFromTheTimersOwnInterval(t *testing.T) {
+	iv := newControlTestViewer(53, "a.jpg")
+
+	iv.startSlideshow()
+	armedBy := time.Now()
+	t.Cleanup(func() {
+		// Leave no callback registered in the shared default main context.
+		if previous := iv.swapTimeout(0, time.Time{}); previous != 0 {
+			glib.SourceRemove(previous)
+		}
+	})
+
+	if got := iv.snapshotAt(armedBy).secondsUntilNext; got != 53 {
+		t.Fatalf("immediately after startSlideshow: seconds_until_next = %d, want 53 — the "+
+			"countdown was not armed from the same interval as the GLib timeout", got)
+	}
+	if got := iv.snapshotAt(armedBy.Add(20 * time.Second)).secondsUntilNext; got != 33 {
+		t.Fatalf("20 s later: seconds_until_next = %d, want 33", got)
+	}
+	if got := iv.snapshotAt(armedBy.Add(53 * time.Second)).secondsUntilNext; got != 0 {
+		t.Fatalf("at the deadline: seconds_until_next = %d, want 0", got)
+	}
+}
+
+// TestTheSlideTimerHasExactlyOneArmingSite is an asserted ledger, and it is the
+// deterministic form of "two clocks that can disagree is a defect".
+//
+// The countdown is honest only because the deadline is written by the SAME call
+// that stores the GLib handle, from the SAME interval read, at the ONE place that
+// arms a timeout. A second glib.TimeoutAdd anywhere in package main — a
+// "restart the timer after a page turn" convenience, say — would arm a source
+// whose deadline nothing recorded, and GET /api/state would count down to an
+// instant that is not when the slide changes. Nothing else in the suite can see
+// that, because the second timer would work perfectly.
+func TestTheSlideTimerHasExactlyOneArmingSite(t *testing.T) {
+	adds := packageCallSites(t, "TimeoutAdd")
+	for _, s := range adds {
+		t.Logf("  %s:%d  %s() on %s", s.File, s.Line, s.Func, s.Recv)
+	}
+	if len(adds) != 1 || adds[0].File != "main.go" || adds[0].Func != "startSlideshow" {
+		t.Fatalf("glib.TimeoutAdd is called from %+v, want exactly one site in "+
+			"main.go startSlideshow. Every armed timeout must record its deadline through "+
+			"swapTimeout in the same statement, or seconds_until_next counts down to the "+
+			"wrong instant.", adds)
+	}
+
+	swaps := packageCallSites(t, "swapTimeout")
+	inStart := 0
+	for _, s := range swaps {
+		if s.File == "main.go" && s.Func == "startSlideshow" {
+			inStart++
+			continue
+		}
+		t.Errorf("swapTimeout is called from %s:%d in %s(); the handle and its deadline are "+
+			"one atomic write and startSlideshow is the only writer", s.File, s.Line, s.Func)
+	}
+	// Two: one to retire the previous source, one to arm the next.
+	if inStart != 2 {
+		t.Errorf("startSlideshow calls swapTimeout %d time(s), want 2 (retire, then arm)", inStart)
+	}
+}
+
+// TestSnapshotReadsKeysAndTheCountdownUnderTheSameLock is a -race detection, not
+// a structural check. Both new fields are read on the HTTP handler goroutine
+// while the GTK thread writes them, so an unlocked read of either — or a
+// retained slice — is a genuine race.
+func TestSnapshotReadsKeysAndTheCountdownUnderTheSameLock(t *testing.T) {
+	iv := newControlTestViewer(30, "a.jpg", "b.jpg", "c.jpg")
+	iv.setViewModeState(ViewLandscapeTwo)
+	// Prime the record so the reader below is never racing the writer's FIRST
+	// write: "empty" is a legitimate state and asserting against it would make
+	// this a scheduling test rather than a race detection.
+	iv.noteDisplayed([]string{"a.jpg", "b.jpg"})
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	wg.Add(1)
+	go func() { // the GTK thread: rendering and re-arming the timer
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			iv.noteDisplayed(displayedPair(i%3, "a.jpg", (i+1)%3, "b.jpg"))
+			iv.swapTimeout(glib.SourceHandle(i%7+1), time.Now().Add(time.Duration(i%30)*time.Second))
+			iv.setPausedState(i%2 == 0)
+		}
+	}()
+
+	for i := 0; i < 4000; i++ { // the HTTP goroutine
+		s := iv.snapshot()
+		if len(s.keys) == 0 || len(s.keys) > 2 {
+			t.Errorf("keys = %v, want one or two entries", s.keys)
+			break
+		}
+		if s.secondsUntilNext < 0 || s.secondsUntilNext > int(s.slideInterval) {
+			t.Errorf("seconds_until_next = %d, outside [0, %d]", s.secondsUntilNext, s.slideInterval)
+			break
+		}
+	}
+	close(stop)
+	wg.Wait()
+
+	if previous := iv.swapTimeout(0, time.Time{}); previous != 0 {
+		_ = previous // no real GLib source was ever created here; nothing to remove
+	}
+}

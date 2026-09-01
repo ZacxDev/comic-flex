@@ -278,6 +278,24 @@ type ImageViewer struct {
 	// GTK main loop. See beginRelayout, and maxQueuedMutations for why a new
 	// scheduler onto that loop has to declare its bound.
 	relayoutPending bool
+	// displayedKeys is what the last COMPLETED render put on the screen, left to
+	// right — one key in either single view, two in the two-up view, one in the
+	// two-up view when both halves are the same position. It is written by the
+	// render paths AFTER SetFromPixbuf, for exactly the reason lastLayoutBox is:
+	// a render that bailed out must leave the previous frame's answer standing,
+	// because that frame is still lit.
+	//
+	// 🔴 It is what GET /api/state's `keys` reports, and it exists so that a
+	// consumer never has to DERIVE the second two-up key from currentIndex. It
+	// cannot: the gallery is shuffled per process (is_random_order), so the
+	// client's ordering is not this one. Guarded by mutex like the rest.
+	displayedKeys []string
+	// nextAdvanceAt is when the armed slide timer will next fire, in Go's
+	// monotonic clock. It is written by the SAME call that stores timeoutID
+	// (swapTimeout), from the SAME interval that arms the GLib source, so the
+	// countdown GET /api/state reports cannot drift away from the timer that
+	// drives it. Zero means nothing is armed. Guarded by mutex like the rest.
+	nextAdvanceAt time.Time
 }
 
 // injectedVersion is set at link time by a release build:
@@ -588,8 +606,11 @@ func (iv *ImageViewer) updateSingleImage() {
 	iv.image.SetFromPixbuf(scaledPixbuf)
 	// Recorded only after the pixbuf is actually on the widget, so that a render
 	// which bailed out above is retried by the next geometry change rather than
-	// being remembered as done.
+	// being remembered as done. noteDisplayed is here for the same reason and
+	// must stay here: a render that returned early above left the PREVIOUS comic
+	// on the screen, and that is what GET /api/state must keep reporting.
 	iv.noteLayoutBox(box)
+	iv.noteDisplayed([]string{imageKey})
 	runtime.GC()
 }
 
@@ -677,6 +698,10 @@ func (iv *ImageViewer) updateTwoImages() {
 
 	iv.image.SetFromPixbuf(canvas)
 	iv.noteLayoutBox(box)
+	// The keys THIS render loaded and composited, from the same pairKeys read the
+	// loads above used — not a fresh look at currentIndex, which a queued page
+	// turn may already have moved while the two S3 GETs were in flight.
+	iv.noteDisplayed(displayedPair(idx, leftKey, rightIdx, rightKey))
 	runtime.GC()
 }
 
@@ -1140,14 +1165,24 @@ func (iv *ImageViewer) startSlideshow() {
 		// Retire the previous source before arming the next, as before. Taking
 		// the handle out of the struct first means the GLib call that retires
 		// it runs with no lock held.
-		if previous := iv.swapTimeout(0); previous != 0 {
+		if previous := iv.swapTimeout(0, time.Time{}); previous != 0 {
 			glib.SourceRemove(previous)
 		}
 
 		// Read through the accessor: POST /api/interval writes this field from
 		// an enqueued closure, so an unlocked read here would be a data race
 		// against GET /api/state's reader.
-		iv.swapTimeout(glib.TimeoutAdd(iv.slideInterval()*1000, func() bool {
+		//
+		// 🔴 ONE interval read, feeding BOTH the GLib source and the deadline
+		// GET /api/state counts down from. Reading it twice — once for
+		// TimeoutAdd and once for the deadline — would let POST /api/interval
+		// land between them and produce a countdown for a duration no timer was
+		// ever armed for. Same reason firesAt is computed BEFORE the TimeoutAdd
+		// call rather than after it returns: this is the instant the source
+		// starts counting from, and the two must not be separated by a cgo call.
+		interval := iv.slideInterval()
+		firesAt := time.Now().Add(time.Duration(interval) * time.Second)
+		iv.swapTimeout(glib.TimeoutAdd(interval*1000, func() bool {
 			if !iv.isPaused() {
 				if iv.advance(iv.stepSize()) {
 					iv.updateImage()
@@ -1155,7 +1190,7 @@ func (iv *ImageViewer) startSlideshow() {
 			}
 			startTimer()
 			return false
-		}))
+		}), firesAt)
 	}
 	startTimer()
 }
