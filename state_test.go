@@ -330,13 +330,13 @@ func TestTimeoutHandleAccessIsRaceFree(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 1; i <= 2000; i++ {
-			iv.swapTimeout(glib.SourceHandle(i))
+			iv.swapTimeout(glib.SourceHandle(i), time.Time{})
 		}
 	}()
 	go func() {
 		defer wg.Done()
 		for i := 2001; i <= 4000; i++ {
-			iv.swapTimeout(glib.SourceHandle(i))
+			iv.swapTimeout(glib.SourceHandle(i), time.Time{})
 		}
 	}()
 	wg.Wait()
@@ -437,7 +437,7 @@ func TestAccessorsAreNotReentrant(t *testing.T) {
 					_ = iv.getViewMode()
 					iv.setViewModeState(ViewMode(i % 3))
 					_ = iv.isPaused()
-					iv.swapTimeout(glib.SourceHandle(i))
+					iv.swapTimeout(glib.SourceHandle(i), time.Time{})
 					iv.onScanComplete(func() {
 						_, _, _ = iv.currentKey()
 						_ = iv.stepSize()

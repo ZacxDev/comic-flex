@@ -1,10 +1,13 @@
 package main
 
 import (
+	"reflect"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ZacxDev/comic-flex/internal/control"
+	"github.com/gotk3/gotk3/glib"
 )
 
 // These cover the state accessors added for the control API, and the adapter
@@ -200,7 +203,7 @@ func TestSnapshotIsOneConsistentRead(t *testing.T) {
 		slideInterval: 37,
 		scanning:      true,
 	}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("snapshot = %+v, want %+v", got, want)
 	}
 }
@@ -223,7 +226,7 @@ func TestSnapshotOfAnUnscannedGalleryIsNotAnEmptyOne(t *testing.T) {
 	if after.total != 0 || after.scanning {
 		t.Fatalf("post-scan snapshot = %+v, want total 0 and scanning false", after)
 	}
-	if before == after {
+	if reflect.DeepEqual(before, after) {
 		t.Fatal("an un-scanned gallery and a scanned-but-empty one produce identical snapshots — " +
 			"a client cannot tell 'indexing…' from 'no comics'")
 	}
@@ -326,18 +329,54 @@ func TestAdapterSnapshotMapsEveryField(t *testing.T) {
 		t.Fatal("gotoKey failed")
 	}
 
+	// The renderer's record is deliberately a DIFFERENT page from the selected
+	// one, so a mutant that filled Keys from s.index/s.key instead of from the
+	// viewer's displayedKeys produces ["c/3.jpg"] here and fails.
+	iv.noteDisplayed([]string{"a/1.jpg"})
+
 	got := gtkViewer{iv: iv}.Snapshot()
 	want := control.Snapshot{
 		Total:         3,
 		Index:         2,
 		Key:           "c/3.jpg",
+		Keys:          []string{"a/1.jpg"},
 		ViewMode:      "portrait_single",
 		Paused:        true,
 		SlideInterval: 37,
 		Scanning:      true,
+		// No timer is armed on a struct-literal viewer, so there is no scheduled
+		// advance to count down to.
+		SecondsUntilNext: 0,
 	}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("adapter Snapshot = %+v, want %+v", got, want)
+	}
+}
+
+// TestAdapterSnapshotCarriesTheCountdown is separate from the field-by-field map
+// above because that fixture has no timer armed, so its expected
+// SecondsUntilNext is 0 — and an adapter that hardcoded 0, or dropped the field,
+// would map cleanly onto it. This one arms a timer so the value has to travel.
+//
+// The window is a range rather than a point: the adapter's Snapshot reads
+// time.Now() itself, so between arming and reading a slow scheduler can consume
+// a fraction of a second. 45 s of budget makes "44 or 45" the only two answers a
+// working implementation can give, and neither is 0.
+func TestAdapterSnapshotCarriesTheCountdown(t *testing.T) {
+	iv := newControlTestViewer(45, "a/1.jpg")
+	iv.swapTimeout(glib.SourceHandle(11), time.Now().Add(45*time.Second))
+
+	got := gtkViewer{iv: iv}.Snapshot()
+	if got.SecondsUntilNext != 45 && got.SecondsUntilNext != 44 {
+		t.Fatalf("adapter SecondsUntilNext = %d, want 45 (or 44 if this machine took a whole "+
+			"second between the two statements) — the countdown is not reaching the wire",
+			got.SecondsUntilNext)
+	}
+	if got.SlideInterval != 45 {
+		t.Fatalf("adapter SlideInterval = %d, want 45", got.SlideInterval)
+	}
+	if previous := iv.swapTimeout(0, time.Time{}); previous != 11 {
+		t.Fatalf("swapTimeout returned %d, want 11", previous)
 	}
 }
 

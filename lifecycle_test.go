@@ -203,7 +203,7 @@ func TestStartSlideshowReadsTheIntervalUnderTheLock(t *testing.T) {
 
 	// Retire the source the last startTimer armed, so the test leaves no
 	// callback registered in the shared default main context.
-	if previous := iv.swapTimeout(0); previous != 0 {
+	if previous := iv.swapTimeout(0, time.Time{}); previous != 0 {
 		glib.SourceRemove(previous)
 	}
 

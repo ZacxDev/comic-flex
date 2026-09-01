@@ -115,13 +115,20 @@ func (g gtkViewer) Enqueue(fn func()) bool { return g.iv.enqueueBounded(idleOnce
 func (g gtkViewer) Snapshot() control.Snapshot {
 	s := g.iv.snapshot()
 	return control.Snapshot{
-		Total:         s.total,
-		Index:         s.index,
-		Key:           s.key,
-		ViewMode:      string(toControlViewMode(s.viewMode)),
-		Paused:        s.paused,
-		SlideInterval: int(s.slideInterval),
-		Scanning:      s.scanning,
+		Total: s.total,
+		Index: s.index,
+		Key:   s.key,
+		// Handed straight across from the viewer's own snapshot — which already
+		// copied it out from under the read lock — and NOT rebuilt here from
+		// s.index. See control.Snapshot's contract: deriving it is the client-side
+		// bug this field exists to remove, and doing it in the adapter would be
+		// the same bug wearing a server.
+		Keys:             s.keys,
+		ViewMode:         string(toControlViewMode(s.viewMode)),
+		Paused:           s.paused,
+		SlideInterval:    int(s.slideInterval),
+		Scanning:         s.scanning,
+		SecondsUntilNext: s.secondsUntilNext,
 	}
 }
 
