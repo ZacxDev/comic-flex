@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"math/rand"
 	"net/http"
 	"os"
@@ -20,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ZacxDev/comic-flex/internal/layout"
 	"github.com/gotk3/gotk3/gdk"
 	"github.com/gotk3/gotk3/glib"
 	"github.com/gotk3/gotk3/gtk"
@@ -264,6 +264,20 @@ type ImageViewer struct {
 	// not contend for the lock every render takes.
 	scanRefusals  refusalLog
 	queueRefusals refusalLog
+	// displayUnknown coalesces the line displaySize writes when GDK cannot tell
+	// us the monitor geometry. Same reason and same mechanism as the two above:
+	// it is reached from every render, so it must not be one line per call.
+	displayUnknown refusalLog
+	// lastLayoutW/H is the box the last COMPLETED render scaled into. It is what
+	// makes the configure-event relayout idempotent: the geometry a rotation
+	// produces arrives as a burst of events, and only a box that differs from
+	// this one is worth a fresh 30 s image load. Zero means "nothing rendered
+	// yet", which correctly compares unequal to any real box.
+	lastLayoutBox layout.Box
+	// relayoutPending is the single-slot bound on relayout closures queued on the
+	// GTK main loop. See beginRelayout, and maxQueuedMutations for why a new
+	// scheduler onto that loop has to declare its bound.
+	relayoutPending bool
 }
 
 // injectedVersion is set at link time by a release build:
@@ -563,15 +577,19 @@ func (iv *ImageViewer) updateSingleImage() {
 		return
 	}
 
-	width, height := iv.window.GetSize()
+	box := iv.layoutBox()
 
-	scaledPixbuf, err := scaleToFit(pixbuf, width, height)
+	scaledPixbuf, err := scaleToFit(pixbuf, box.W, box.H)
 	if err != nil {
 		log.Printf("Unable to scale pixbuf: %v", err)
 		return
 	}
 
 	iv.image.SetFromPixbuf(scaledPixbuf)
+	// Recorded only after the pixbuf is actually on the widget, so that a render
+	// which bailed out above is retried by the next geometry change rather than
+	// being remembered as done.
+	iv.noteLayoutBox(box)
 	runtime.GC()
 }
 
@@ -607,109 +625,264 @@ func (iv *ImageViewer) updateTwoImages() {
 		return
 	}
 
-	winWidth, winHeight := iv.window.GetSize()
+	// Layout: [margin][left image][gap][right image][margin], each image centred
+	// vertically in the canvas. All of that arithmetic is layout.TwoUp now, so it
+	// is testable without a display — and so this path and updateSingleImage read
+	// the SAME box from the SAME place.
+	box := iv.layoutBox()
+	plan := layout.TwoUp(box, leftPb.GetWidth(), leftPb.GetHeight(), rightPb.GetWidth(), rightPb.GetHeight())
 
-	// Layout: [margin][left image][gap][right image][margin]
-	// Use consistent margins and gap for even spacing
-	margin := 20
-	gap := 40
-	availableWidth := winWidth - (2 * margin) - gap
-	maxImageWidth := availableWidth / 2
+	// A box too narrow to hold two images either side of the gap leaves a
+	// non-positive scale target. ScaleSimple does return an error for that, but
+	// only after gdk_pixbuf emits a g_return_val_if_fail critical, so say it
+	// plainly here instead.
+	if plan.Left.ScaleW < 1 || plan.Left.ScaleH < 1 || plan.Right.ScaleW < 1 || plan.Right.ScaleH < 1 {
+		log.Printf("Unable to lay two images out in a %dx%d box", box.W, box.H)
+		return
+	}
 
-	// Scale both images to fit within their allocated space
-	// Never crop - always scale to fit entirely within bounds
-	leftScaled, err := scaleToFit(leftPb, maxImageWidth, winHeight)
+	// Scale both images to fit within their allocated space.
+	// Never crop - always scale to fit entirely within bounds.
+	leftScaled, err := leftPb.ScaleSimple(plan.Left.ScaleW, plan.Left.ScaleH, gdk.INTERP_BILINEAR)
 	if err != nil {
 		log.Printf("Unable to scale left image: %v", err)
 		return
 	}
-	rightScaled, err := scaleToFit(rightPb, maxImageWidth, winHeight)
+	rightScaled, err := rightPb.ScaleSimple(plan.Right.ScaleW, plan.Right.ScaleH, gdk.INTERP_BILINEAR)
 	if err != nil {
 		log.Printf("Unable to scale right image: %v", err)
 		return
 	}
 
-	// Get actual scaled dimensions
-	lw := leftScaled.GetWidth()
-	lh := leftScaled.GetHeight()
-	rw := rightScaled.GetWidth()
-	rh := rightScaled.GetHeight()
-
 	// Create black canvas
-	canvas, err := gdk.PixbufNew(gdk.COLORSPACE_RGB, true, 8, winWidth, winHeight)
+	canvas, err := gdk.PixbufNew(gdk.COLORSPACE_RGB, true, 8, plan.CanvasW, plan.CanvasH)
 	if err != nil {
 		log.Printf("Unable to create canvas: %v", err)
 		return
 	}
 	canvas.Fill(0x000000FF)
 
-	// Position images with even spacing from center
-	// Center point is at winWidth/2, gap is centered there
-	centerX := winWidth / 2
-
-	// Left image: right edge at centerX - gap/2
-	leftX := centerX - gap/2 - lw
-	leftY := (winHeight - lh) / 2
-
-	// Right image: left edge at centerX + gap/2
-	rightX := centerX + gap/2
-	rightY := (winHeight - rh) / 2
-
-	// Ensure positions are not negative (safety check)
-	if leftX < 0 {
-		leftX = 0
-	}
-	if leftY < 0 {
-		leftY = 0
-	}
-	if rightY < 0 {
-		rightY = 0
-	}
-
-	// Composite images onto canvas with bounds checking
+	// Composite images onto canvas with bounds checking.
 	// dest_x/y: where to start writing in dest
 	// dest_width/height: how many pixels to write (clamped to canvas bounds)
 	// offset_x/y: maps source (0,0) to this dest coordinate
-
-	// Left image - clamp dimensions to canvas bounds
-	leftDestW := lw
-	if leftX+lw > winWidth {
-		leftDestW = winWidth - leftX
+	if plan.Left.Visible() {
+		leftScaled.Composite(canvas, plan.Left.X, plan.Left.Y, plan.Left.DestW, plan.Left.DestH,
+			float64(plan.Left.X), float64(plan.Left.Y), 1.0, 1.0, gdk.INTERP_BILINEAR, 255)
 	}
-	leftDestH := lh
-	if leftY+lh > winHeight {
-		leftDestH = winHeight - leftY
-	}
-	if leftDestW > 0 && leftDestH > 0 {
-		leftScaled.Composite(canvas, leftX, leftY, leftDestW, leftDestH,
-			float64(leftX), float64(leftY), 1.0, 1.0, gdk.INTERP_BILINEAR, 255)
-	}
-
-	// Right image - clamp dimensions to canvas bounds
-	rightDestW := rw
-	if rightX+rw > winWidth {
-		rightDestW = winWidth - rightX
-	}
-	rightDestH := rh
-	if rightY+rh > winHeight {
-		rightDestH = winHeight - rightY
-	}
-	if rightDestW > 0 && rightDestH > 0 {
-		rightScaled.Composite(canvas, rightX, rightY, rightDestW, rightDestH,
-			float64(rightX), float64(rightY), 1.0, 1.0, gdk.INTERP_BILINEAR, 255)
+	if plan.Right.Visible() {
+		rightScaled.Composite(canvas, plan.Right.X, plan.Right.Y, plan.Right.DestW, plan.Right.DestH,
+			float64(plan.Right.X), float64(plan.Right.Y), 1.0, 1.0, gdk.INTERP_BILINEAR, 255)
 	}
 
 	iv.image.SetFromPixbuf(canvas)
+	iv.noteLayoutBox(box)
 	runtime.GC()
 }
 
+// scaleToFit scales a pixbuf to the largest size that fits the box, preserving
+// its aspect ratio.
+//
+// The arithmetic now lives in internal/layout so it can be tested without a
+// display; this is the gdk_pixbuf call that was wrapped around it. See
+// layout.Fit for what changed (two guards) and what did not (everything else).
 func scaleToFit(pb *gdk.Pixbuf, maxWidth, maxHeight int) (*gdk.Pixbuf, error) {
-	origW := float64(pb.GetWidth())
-	origH := float64(pb.GetHeight())
-	scale := math.Min(float64(maxWidth)/origW, float64(maxHeight)/origH)
-	destW := int(origW * scale)
-	destH := int(origH * scale)
+	destW, destH := layout.Fit(pb.GetWidth(), pb.GetHeight(), layout.Box{W: maxWidth, H: maxHeight})
+	if destW == 0 || destH == 0 {
+		return nil, fmt.Errorf("cannot scale a %dx%d pixbuf into a %dx%d box",
+			pb.GetWidth(), pb.GetHeight(), maxWidth, maxHeight)
+	}
 	return pb.ScaleSimple(destW, destH, gdk.INTERP_BILINEAR)
+}
+
+// displaySize returns the pixel geometry of the monitor the window is on, or
+// 0,0 when GDK cannot tell us.
+//
+// 🔴 It deliberately does NOT use gdk.Screen.GetWidth/GetHeight, which look like
+// the obvious answer: at the pinned gotk3 v0.6.2 those live in
+// gdk_deprecated_since_3_22.go, behind a `gtk_deprecated` build tag that this
+// module does not set, so naming them does not compile. The monitor API in
+// gdk_since_3_22.go is what is actually built, and the Pi runs GTK 3.24.
+//
+// Returning 0,0 rather than guessing is what makes the failure safe: SelectBox
+// treats a non-positive dimension as unknown and falls back to the window size,
+// which is exactly the behaviour that shipped before this change.
+func (iv *ImageViewer) displaySize() (int, int) {
+	display, err := gdk.DisplayGetDefault()
+	if err != nil || display == nil {
+		iv.noteDisplayUnknown("no default GDK display")
+		return 0, 0
+	}
+
+	w, h, ok := firstUsableSize(
+		// The monitor the window is actually on, when the window is realised.
+		func() (int, int) {
+			gdkWin, err := iv.window.GetWindow()
+			if err != nil || gdkWin == nil {
+				return 0, 0
+			}
+			monitor, err := display.GetMonitorAtWindow(gdkWin)
+			if err != nil || monitor == nil {
+				return 0, 0
+			}
+			return monitorGeometry(monitor)
+		},
+		// Before the window is realised there is no monitor-at-window to ask for.
+		func() (int, int) {
+			monitor, err := display.GetPrimaryMonitor()
+			if err != nil || monitor == nil {
+				return 0, 0
+			}
+			return monitorGeometry(monitor)
+		},
+		func() (int, int) {
+			if display.GetNMonitors() <= 0 {
+				return 0, 0
+			}
+			monitor, err := display.GetMonitor(0)
+			if err != nil || monitor == nil {
+				return 0, 0
+			}
+			return monitorGeometry(monitor)
+		},
+	)
+	if ok {
+		return w, h
+	}
+
+	// 🔴 This is SILENT INERTNESS unless it says something. With no display
+	// reading, SelectBox falls back entirely to the window size — which is
+	// exactly the policy that latched. The operator would then see the original
+	// bug, from a build that claims to fix it, with nothing in the journal.
+	iv.noteDisplayUnknown("GDK reported no usable monitor geometry")
+	return 0, 0
+}
+
+// firstUsableSize returns the first reading whose dimensions are BOTH positive.
+//
+// 🔴 The fallback chain in displaySize is a function rather than three nested
+// ifs because round 1 of the audit found that chain UNREACHABLE. The first
+// candidate's guard was `if geo != nil`, and at the pinned gotk3 v0.6.2
+// Monitor.GetGeometry is `wrapRectangle(&rect)` over a stack local, with
+// wrapRectangle returning nil ONLY for a nil argument — so that pointer is
+// never nil and the check was provably always true. An invalidated monitor
+// (one being torn down mid-xrandr, i.e. exactly when this runs) leaves the
+// rectangle ZEROED, and a 0x0 geometry then sailed through as an answer and
+// short-circuited both fallbacks — making them unreachable for the one failure
+// they were written for.
+//
+// Saying "the first USABLE reading" once, in a function with a test, is what
+// stops that shape returning. Readings are funcs so a later candidate is never
+// evaluated once an earlier one answers.
+func firstUsableSize(readings ...func() (int, int)) (w, h int, ok bool) {
+	for _, read := range readings {
+		w, h = read()
+		if w > 0 && h > 0 {
+			return w, h, true
+		}
+	}
+	return 0, 0, false
+}
+
+// monitorGeometry reads a monitor's pixel geometry. It reports 0,0 when GDK
+// hands back nothing usable; firstUsableSize decides what that means.
+//
+// ⚠ The nil check below is UNREACHABLE at the pinned gotk3 v0.6.2 and no test
+// pins it — said plainly so nobody reads it as coverage. GetGeometry is
+// `wrapRectangle(&rect)` over a stack local and wrapRectangle returns nil only
+// for a nil argument, so the pointer is always non-nil. It is kept as defence
+// against that changing, NOT as the guard against a bad reading: the guard that
+// actually fires is the positive-dimension test in firstUsableSize, which is
+// what a zeroed rectangle trips.
+func monitorGeometry(monitor *gdk.Monitor) (int, int) {
+	geo := monitor.GetGeometry()
+	if geo == nil {
+		return 0, 0
+	}
+	return geo.GetWidth(), geo.GetHeight()
+}
+
+// noteDisplayUnknown logs that the display geometry could not be read, at most
+// once per refusalLogInterval.
+//
+// It is coalesced through the same refusalLog the two admission points use,
+// because displaySize runs on every render and every relayout: a line per call
+// would be unbounded journald volume on a Raspberry Pi for a condition that is
+// one condition, not many.
+func (iv *ImageViewer) noteDisplayUnknown(reason string) {
+	if n, since, report := iv.displayUnknown.note(time.Now()); report {
+		log.Printf("display geometry unavailable (%s): layout is falling back to the window "+
+			"size, which cannot correct an oversized window; %d occurrence(s) %s",
+			reason, n, refusalSpan(since))
+	}
+}
+
+// layoutBox returns the box every render must scale into.
+//
+// 🔴 This replaces the bare `iv.window.GetSize()` that both render paths used.
+// The window's size is an OUTPUT of the previous render — an oversized pixbuf
+// grows it — so feeding it back in as the only input is what let one stale
+// frame latch permanently. See layout.SelectBox for the measurement and the
+// rule. Both reads happen here, on the GTK thread, and neither takes iv.mutex.
+func (iv *ImageViewer) layoutBox() layout.Box {
+	displayW, displayH := iv.displaySize()
+	windowW, windowH := iv.window.GetSize()
+	return layout.SelectBox(displayW, displayH, windowW, windowH)
+}
+
+// scheduleRelayout re-renders the current page if the layout box has changed
+// since the last render, and reports whether it scheduled anything.
+//
+// 🔴 It is what makes the fix complete rather than half of one. Fixing the box
+// alone still leaves ONE wrong frame after every rotation: xrandr returns before
+// the X server has resized the screen and long before GTK has reconfigured the
+// window, so the render setViewMode does immediately afterwards is computed
+// against pre-rotation geometry no matter which box policy it uses. Measured on
+// the Pi, the window did not reach its new size until ~2 s after the POST. There
+// was no configure-event or size-allocate handler anywhere in the program, so
+// nothing ever recomputed when the real geometry finally arrived.
+//
+// It must NOT run the render inline. configure-event is emitted during size
+// allocation, and updateImage can block for up to 30 s in an S3 GET; doing that
+// inside GTK's own layout pass is a reentrancy hazard as well as a freeze. So
+// the work goes onto the main loop via the program's single glib.IdleAdd site.
+//
+// 🔴 It is bounded by ONE outstanding relayout, not by maxQueuedMutations — see
+// beginRelayout in state.go. A rotation emits a burst of configure events and
+// each one would otherwise queue another 30 s image load. The slot is released
+// from INSIDE the closure, for the reason scanImagesAsyncVia spells out: a bound
+// released when the work is merely SCHEDULED bounds nothing.
+//
+// schedule is idleOnce in production, and a parameter for the same reason
+// enqueueBounded takes one — so both the coalescing and the release are
+// exercisable without a GTK main loop.
+func (iv *ImageViewer) scheduleRelayout(schedule func(func())) bool {
+	return iv.scheduleRelayoutVia(schedule, iv.layoutBox)
+}
+
+// scheduleRelayoutVia is scheduleRelayout with both GTK-bound collaborators as
+// parameters — the main-loop scheduler and the geometry read.
+//
+// readBox is a parameter for the same reason schedule is: iv.layoutBox calls
+// gtk.Window.GetSize and the GDK monitor API, so a test that could not stand it
+// in would need a real window on a real display, and the coalescing and release
+// behaviour below would go untested. Compare scanImagesAsyncVia.
+func (iv *ImageViewer) scheduleRelayoutVia(schedule func(func()), readBox func() layout.Box) bool {
+	if !iv.beginRelayout() {
+		return false
+	}
+	schedule(func() {
+		defer iv.endRelayout()
+		// The box is read HERE, inside the closure, rather than at the configure
+		// event that triggered it: several events arrive while this waits its
+		// turn, and only the geometry at render time decides anything.
+		box := readBox()
+		if !iv.layoutBoxChanged(box) {
+			return
+		}
+		iv.updateImage()
+	})
+	return true
 }
 
 func (iv *ImageViewer) stepSize() int {
@@ -809,6 +982,54 @@ func (iv *ImageViewer) setupUI() error {
 	iv.window.Connect("destroy", func() {
 		gtk.MainQuit()
 	})
+
+	// 🔴 The program had NO resize handling at all — no configure-event, no
+	// size-allocate — which is the half of the rotation bug that a correct
+	// layout box does not fix on its own. setViewMode shells out to xrandr and
+	// renders immediately; the X server has not resized the screen yet and the
+	// window manager has not reconfigured the window, so that render is computed
+	// against the OLD orientation. Without this handler nothing ever recomputed
+	// it, and the wrong frame stayed until something else happened to re-render.
+	//
+	// Returning false lets GTK's own configure handling run. The work itself is
+	// deferred onto the main loop and coalesced — see scheduleRelayout, which
+	// must not be inlined here.
+	iv.window.Connect("configure-event", func(win *gtk.Window, event *gdk.Event) bool {
+		iv.scheduleRelayout(idleOnce)
+		return false
+	})
+
+	// 🔴 configure-event alone is NOT enough, because it only fires when the
+	// WINDOW changes — and the two sides of a rotation arrive independently.
+	//
+	// If the window manager gets there before GDK does, layoutBox reads a
+	// half-updated pair: a window already at 2160x3840 and a display GDK still
+	// reports as 3840x2160, whose minimum is a SQUARE 2160x2160 box. That
+	// renders small and records itself. When GDK then catches up, the pixbuf is
+	// SMALLER than the window, so the window does not move, so no further
+	// configure-event is emitted and nothing ever re-reads the geometry. The
+	// frame stays letterboxed.
+	//
+	// While playing, the 30 s slide timer papers over it. While PAUSED it does
+	// not: startSlideshow gates the re-render behind `if !iv.isPaused()`, so the
+	// undersized frame would persist indefinitely — and pausing is exactly what
+	// an operator does to look at one page.
+	//
+	// Listening to the screen closes it: both orderings now end with a relayout,
+	// whichever side moved last. Duplicate triggers cost nothing because
+	// scheduleRelayout coalesces to one outstanding closure and skips the render
+	// when the box has not actually changed.
+	//
+	// gdk.Screen is deprecated in GTK 3.22+ but these two signals are still
+	// emitted in 3.24 (the Pi runs 3.24.38); Connect at gotk3 v0.6.2 returns only
+	// a handle, so there is no error to check.
+	// Written out rather than looped over a slice of names: these two names ARE
+	// the wiring, and TestGeometryChangesAreObservedFromBothTheWindowAndTheScreen
+	// pins the set by reading them here. A loop variable hides them from that
+	// ledger, which is how the screen half could be deleted with every test
+	// still green.
+	screen.Connect("size-changed", func() { iv.scheduleRelayout(idleOnce) })
+	screen.Connect("monitors-changed", func() { iv.scheduleRelayout(idleOnce) })
 
 	iv.window.Connect("key-press-event", func(win *gtk.Window, event *gdk.Event) {
 		keyEvent := &gdk.EventKey{Event: event}

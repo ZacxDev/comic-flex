@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ZacxDev/comic-flex/internal/layout"
 	"github.com/gotk3/gotk3/glib"
 )
 
@@ -377,8 +378,9 @@ func (iv *ImageViewer) scanCount() int {
 // code did not enforce. This bounds the closures enqueueBounded schedules — the
 // R1 mutation endpoints that go through Server.enqueue, which is POST
 // /api/{next,prev,pause,resume,toggle,viewmode,goto,interval} today. It does NOT
-// bound every closure on the main loop. Two others exist and are bounded
-// elsewhere:
+// bound every closure on the main loop. Three others exist and are bounded
+// elsewhere — count the bullets rather than trusting this number, which has
+// been wrong once already:
 //
 //   - scanImagesAsyncVia schedules its completion callback (the one that reaches
 //     updateSingleImage and a 30 s S3 GET) DIRECTLY, outside this accounting. It
@@ -387,9 +389,14 @@ func (iv *ImageViewer) scanCount() int {
 //     scheduled it. Round 2 released it in the goroutine's defer and asserted the
 //     bound here anyway; 40 sequential rescans then left 40 closures outstanding.
 //   - scheduleQuit schedules the shutdown at PRIORITY_HIGH, once per process.
+//   - scheduleRelayout schedules the post-geometry-change re-render, bounded to
+//     ONE outstanding closure by beginRelayout below. It is not control-
+//     originated at all — a configure-event from the window manager is what
+//     drives it — but it reaches the same main loop and can block for the same
+//     30 s, so it is counted here.
 //
-// So the invariant is: at most maxQueuedMutations + maxConcurrentScans + 1
-// control-originated closures outstanding — and it holds only while every
+// So the invariant is: at most maxQueuedMutations + maxConcurrentScans + 1 + 1
+// closures outstanding on the main loop — and it holds only while every
 // scheduled closure RELEASES THE SLOT THAT ADMITTED IT, from inside itself.
 // Anything new that schedules onto the main loop without going through
 // enqueueBounded must state its own bound here, and must free that bound in the
@@ -422,6 +429,80 @@ func (iv *ImageViewer) queueDepth() int {
 	iv.mutex.RLock()
 	defer iv.mutex.RUnlock()
 	return iv.queuedMutations
+}
+
+// ---------------------------------------------------------------------------
+// The layout box, and the relayout that follows a geometry change.
+// ---------------------------------------------------------------------------
+
+// noteLayoutBox records the box the render that just completed scaled into.
+//
+// 🔴 It takes a layout.Box, NOT a (w, h) pair, and that is a correctness choice
+// rather than a stylistic one. With two ints, `iv.noteLayoutBox(box.H, box.W)`
+// is a transposition that compiles, type-checks and reads fine — an audit
+// mutation did exactly that and SURVIVED the whole suite. A single struct
+// argument makes the mistake unrepresentable instead of relying on a test to
+// notice it.
+func (iv *ImageViewer) noteLayoutBox(b layout.Box) {
+	iv.mutex.Lock()
+	defer iv.mutex.Unlock()
+	iv.lastLayoutBox = b
+}
+
+// layoutBoxChanged reports whether b differs from the box the last completed
+// render used — i.e. whether a re-render would actually produce anything new.
+//
+// 🔴 BOTH AXES. An audit mutation that compared width only survived the suite,
+// and that is the sharpest possible miss here: the latch this whole change
+// exists to prevent was measured as 3840x2160 -> 3840x3513, in which the WIDTH
+// IS IDENTICAL and only the height moves. A width-only comparator would decline
+// to re-render in precisely the case that matters.
+//
+// A render that has not completed leaves the zero Box, which differs from every
+// real box, so the first geometry change after a failed load re-renders rather
+// than being suppressed.
+func (iv *ImageViewer) layoutBoxChanged(b layout.Box) bool {
+	iv.mutex.RLock()
+	defer iv.mutex.RUnlock()
+	return b != iv.lastLayoutBox
+}
+
+// beginRelayout reserves the single relayout slot, or reports false when one is
+// already outstanding.
+//
+// 🔴 ONE, not maxQueuedMutations. A rotation emits a burst of configure events —
+// the screen resize, the window manager's reconfigure, and the window's own
+// resize as the new pixbuf lands — and every one of them would otherwise queue
+// a closure that can block for 30 s in an S3 GET. Coalescing them is the whole
+// point: they all ask the same question, and the closure reads the geometry
+// itself when it runs, so the one that runs is the one with the current answer.
+//
+// Like maxConcurrentScans and unlike a naive bound, the slot is released from
+// INSIDE the scheduled closure (scheduleRelayout in main.go), so it covers the
+// render and not merely the scheduling of it.
+func (iv *ImageViewer) beginRelayout() bool {
+	iv.mutex.Lock()
+	defer iv.mutex.Unlock()
+	if iv.relayoutPending {
+		return false
+	}
+	iv.relayoutPending = true
+	return true
+}
+
+// endRelayout gives the slot back once the relayout closure has run.
+func (iv *ImageViewer) endRelayout() {
+	iv.mutex.Lock()
+	defer iv.mutex.Unlock()
+	iv.relayoutPending = false
+}
+
+// relayoutIsPending reports whether a relayout closure is outstanding. It exists
+// so a test can assert the COALESCING rather than only the scheduling.
+func (iv *ImageViewer) relayoutIsPending() bool {
+	iv.mutex.RLock()
+	defer iv.mutex.RUnlock()
+	return iv.relayoutPending
 }
 
 // enqueueBounded reserves a slot, hands fn to schedule, and releases the slot
