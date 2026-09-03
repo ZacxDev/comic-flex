@@ -50,7 +50,7 @@ func TestQueueIsAlwaysPresentInTheStateObject(t *testing.T) {
 	s := newTestServer(t, f)
 
 	body := do(t, s, "GET", "/api/state", "").Body.String()
-	for _, want := range []string{`"queue":{`, `"length":0`, `"position":0`, `"skipped":0`} {
+	for _, want := range []string{`"queue":{`, `"id":0`, `"length":0`, `"position":0`, `"skipped":0`} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("state body does not contain %s — a client cannot tell a Pi with no queue "+
 				"from a Pi that predates queues at all, and those are opposite facts.\nbody: %s",
@@ -66,7 +66,7 @@ func TestQueueStateIsPassedThroughUnchanged(t *testing.T) {
 	f := newFakeViewer()
 	f.snap = Snapshot{
 		Total: 88, Index: 41, ViewMode: string(ViewLandscapeSingle), SlideInterval: 45,
-		Queue: QueueState{Length: 12, Position: 5, Skipped: 3},
+		Queue: QueueState{ID: 7, Length: 12, Position: 5, Skipped: 3},
 	}
 	s := newTestServer(t, f)
 
@@ -74,7 +74,9 @@ func TestQueueStateIsPassedThroughUnchanged(t *testing.T) {
 	if err := json.Unmarshal(do(t, s, "GET", "/api/state", "").Body.Bytes(), &got); err != nil {
 		t.Fatalf("body is not JSON: %v", err)
 	}
-	want := map[string]any{"length": float64(12), "position": float64(5), "skipped": float64(3)}
+	want := map[string]any{
+		"id": float64(7), "length": float64(12), "position": float64(5), "skipped": float64(3),
+	}
 	if !reflect.DeepEqual(got["queue"], want) {
 		t.Fatalf("queue = %#v, want %#v", got["queue"], want)
 	}
@@ -182,17 +184,23 @@ func TestTheQueueHasItsOwnBodyCap(t *testing.T) {
 	})
 }
 
-// TestQueueResolvesNothingOnTheHandlerGoroutine pins the deliberate ASYMMETRY
-// with POST /api/goto, which is the decision most likely to be "fixed" by someone
+// TestQueueResolvesNoKeyOnTheHandlerGoroutine pins the deliberate ASYMMETRY with
+// POST /api/goto, which is the decision most likely to be "fixed" by someone
 // adding a 404 for symmetry.
 //
 // goto names ONE page and can tell the caller it is missing. A queue names many,
 // and decision D3 says a key that has left the gallery is skipped and COUNTED at
-// play time rather than refused up front — so a resolution here would be a
-// lookup whose answer is thrown away, taken against a gallery a rescan can
-// replace before the closure runs. The observable: the handler makes no R2 read
-// at all, and a queue of keys that are all missing is a perfectly good 202.
-func TestQueueResolvesNothingOnTheHandlerGoroutine(t *testing.T) {
+// play time rather than refused up front — so a per-key resolution here would be
+// a lookup whose answer is thrown away, taken against a gallery a rescan can
+// replace before the closure runs. A queue of keys that are all missing is a
+// perfectly good 202.
+//
+// 🔴 The assertion is the EXACT read log, not "no reads". The handler does make
+// one R2 read — the indexing admission check below — and asserting emptiness
+// would have made that check impossible to add without deleting a guard. What
+// must never appear is a Resolve: one read that does not depend on the keys is a
+// different thing from len(keys) lookups whose results are discarded.
+func TestQueueResolvesNoKeyOnTheHandlerGoroutine(t *testing.T) {
 	f := newFakeViewer("a/1.jpg", "b/2.jpg")
 	s := newTestServer(t, f)
 
@@ -201,13 +209,84 @@ func TestQueueResolvesNothingOnTheHandlerGoroutine(t *testing.T) {
 		t.Fatalf("a queue of keys not in the gallery -> %d, want 202. Decision D3 makes a missing "+
 			"key a SKIP at play time, not a refusal here. (body %s)", w.Code, w.Body.String())
 	}
-	if got := f.readLog(); len(got) != 0 {
-		t.Fatalf("the queue handler read viewer state on its own goroutine: %v. That resolution "+
-			"is thrown away and is stale by the time the closure runs; the authoritative one "+
-			"happens inside the closure, under the lock.", got)
+	if got, want := f.readLog(), []string{"Snapshot"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("reads = %v, want exactly %v. A Resolve here is a per-key lookup whose answer is "+
+			"thrown away and is stale by the time the closure runs; the authoritative resolution "+
+			"happens inside the closure, under the lock.", got, want)
 	}
 	f.drain()
 	if got, want := f.callLog(), []string{"SetQueue:gone/1.jpg,gone/2.jpg"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("calls = %v, want %v", got, want)
 	}
+}
+
+// TestAQueuePostedWhileIndexingIsRefusedAsBackpressure is finding F3.
+//
+// `scanning && total == 0` is the Pi's state at every boot until the first
+// listing returns. A queue installed then is consumed in full against an empty
+// gallery, every key is skipped, the display never moves — and the caller was
+// told 202. The refusal makes it observable AND retryable, and it reuses the
+// backpressure convention rather than inventing a second one, because retrying
+// really is the correct response: the scan is seconds away.
+//
+// Both directions, and the second is what stops the first passing for the wrong
+// reason: an empty gallery that has FINISHED scanning still answers 202, because
+// retrying that would never help and the honest report is the skip count.
+func TestAQueuePostedWhileIndexingIsRefusedAsBackpressure(t *testing.T) {
+	t.Run("indexing is refused", func(t *testing.T) {
+		f := newFakeViewer()
+		f.snap = Snapshot{Total: 0, Scanning: true,
+			ViewMode: string(ViewLandscapeSingle), SlideInterval: 30}
+		s := newTestServer(t, f)
+
+		w := do(t, s, "POST", "/api/queue", `{"keys":["a/1.jpg","b/2.jpg"]}`)
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("a queue posted while the gallery is still indexing -> %d, want 503. Every "+
+				"key would be skipped against an empty gallery and the caller would be told 202 "+
+				"for a collection that never played. (body %s)", w.Code, w.Body.String())
+		}
+		if got := w.Header().Get("Retry-After"); got == "" {
+			t.Error("a 503 with no Retry-After — the caller is told to back off with no idea how long")
+		}
+		var body errorBody
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil || body.Error == "" {
+			t.Errorf("503 body = %q, want a JSON error message", w.Body.String())
+		}
+		if n := f.pendingCount(); n != 0 {
+			t.Fatalf("a refused queue enqueued %d closures, want 0", n)
+		}
+		if got := f.callLog(); len(got) != 0 {
+			t.Fatalf("a refused queue reached the viewer: %v", got)
+		}
+	})
+
+	t.Run("a scanned but empty gallery is accepted", func(t *testing.T) {
+		f := newFakeViewer()
+		f.snap = Snapshot{Total: 0, Scanning: false,
+			ViewMode: string(ViewLandscapeSingle), SlideInterval: 30}
+		s := newTestServer(t, f)
+
+		w := do(t, s, "POST", "/api/queue", `{"keys":["a/1.jpg"]}`)
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("a queue posted against a scanned-but-empty gallery -> %d, want 202. "+
+				"Retrying an empty bucket would never help, so the honest answer is the 202 and "+
+				"an attributable skip count — not backpressure. (body %s)", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("a scanning gallery that already has images is accepted", func(t *testing.T) {
+		// scanning is true past the point where total is populated (a rescan's
+		// completion closure is still queued). Refusing on `scanning` ALONE would
+		// make the endpoint dead for the whole drain latency of the display queue.
+		f := newFakeViewer("a/1.jpg", "b/2.jpg")
+		f.snap.Scanning = true
+		s := newTestServer(t, f)
+
+		w := do(t, s, "POST", "/api/queue", `{"keys":["a/1.jpg"]}`)
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("a queue posted during a rescan of a POPULATED gallery -> %d, want 202. The "+
+				"refusal condition is `scanning AND total == 0`, not `scanning`. (body %s)",
+				w.Code, w.Body.String())
+		}
+	})
 }

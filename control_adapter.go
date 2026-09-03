@@ -130,6 +130,7 @@ func (g gtkViewer) Snapshot() control.Snapshot {
 		Scanning:         s.scanning,
 		SecondsUntilNext: s.secondsUntilNext,
 		Queue: control.QueueState{
+			ID:       s.queueID,
 			Length:   s.queueLength,
 			Position: s.queuePosition,
 			Skipped:  s.queueSkipped,

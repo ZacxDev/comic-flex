@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"reflect"
 	"sync"
 	"testing"
 
@@ -49,13 +50,26 @@ func keyNow(t *testing.T, iv *ImageViewer) string {
 	return key
 }
 
-// wantQueue asserts the three numbers GET /api/state carries.
+// wantQueue asserts the depth, position and skip count GET /api/state carries.
+// The generation is asserted separately, by wantQueueID — it is the one number
+// that is a function of how many queues this viewer has ever been given rather
+// than of the one it is on, so folding it in here would make every fixture
+// count its own setQueue calls.
 func wantQueue(t *testing.T, iv *ImageViewer, length, position, skipped int) {
 	t.Helper()
-	l, p, s := iv.queueState()
+	_, l, p, s := iv.queueState()
 	if l != length || p != position || s != skipped {
 		t.Fatalf("queueState = (length %d, position %d, skipped %d), want (%d, %d, %d)",
 			l, p, s, length, position, skipped)
+	}
+}
+
+// wantQueueID asserts the generation.
+func wantQueueID(t *testing.T, iv *ImageViewer, id int) {
+	t.Helper()
+	got, _, _, _ := iv.queueState()
+	if got != id {
+		t.Fatalf("queue id = %d, want %d", got, id)
 	}
 }
 
@@ -71,9 +85,18 @@ func TestTheQueueIsPlayedBeforeTheGallery(t *testing.T) {
 
 	// Installed, nothing played: position 0 is "no queued key is selected", and
 	// the display has not moved.
+	//
+	// 🔴 That is a claim about setQueue, the STATE accessor — NOT about the
+	// endpoint. POST /api/queue turns to the first queued page immediately, by
+	// design (gtkViewer.SetQueue calls advance right after this), and
+	// TestAdapterSetQueueTurnsToTheFirstPlayableKeyImmediately is what pins that.
+	// The message says which layer it pins because a maintainer reading only the
+	// failure would otherwise come away believing the endpoint is lazy.
 	wantQueue(t, iv, 2, 0, 0)
 	if got := keyNow(t, iv); got != "c/3.jpg" {
-		t.Fatalf("installing a queue moved the display to %q; it must not move until a page turn", got)
+		t.Fatalf("setQueue moved the display to %q. Installing a queue is a STATE change only — "+
+			"the page turn is the caller's, and gtkViewer.SetQueue makes it immediately "+
+			"afterwards. (This does NOT say POST /api/queue is lazy; it is not.)", got)
 	}
 
 	if !iv.advance(1) {
@@ -187,7 +210,7 @@ func TestASkippedKeyIsCountedExactlyOnce(t *testing.T) {
 		t.Fatalf("stepping forward again landed on %q, want a/1.jpg", got)
 	}
 
-	l, p, s := iv.queueState()
+	_, l, p, s := iv.queueState()
 	if s != 2 {
 		t.Fatalf("skipped = %d after stepping back and forward over the same two missing keys, "+
 			"want 2. Every pass over a missing entry is being counted, so the number the client "+
@@ -513,7 +536,325 @@ func TestAdapterSnapshotCarriesTheQueue(t *testing.T) {
 	iv.advance(1) // two skips, cursor on the third entry
 
 	got := gtkViewer{iv: iv}.Snapshot().Queue
-	if got.Length != 4 || got.Position != 3 || got.Skipped != 2 {
-		t.Fatalf("adapter Snapshot().Queue = %+v, want {Length:4 Position:3 Skipped:2}", got)
+	// ID 1 because this viewer has been given exactly one queue. It is asserted
+	// here rather than only in the state tests because the adapter is where a
+	// field is most cheaply dropped: the mapping is four lines of struct literal.
+	if got.ID != 1 || got.Length != 4 || got.Position != 3 || got.Skipped != 2 {
+		t.Fatalf("adapter Snapshot().Queue = %+v, want {ID:1 Length:4 Position:3 Skipped:2}", got)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// The two-up view (finding F1)
+// ---------------------------------------------------------------------------
+
+// screen returns what the two-up render would put on the display, left to right,
+// through the same displayedPair the renderer records into GET /api/state's
+// `keys`. It is the closest a test with no X server can get to looking at it.
+func screen(t *testing.T, iv *ImageViewer) []string {
+	t.Helper()
+	l, left, r, right, ok := iv.pairKeys()
+	if !ok {
+		t.Fatal("pairKeys reported an empty gallery")
+	}
+	return displayedPair(l, left, r, right)
+}
+
+// TestATwoUpQueuePlaysInOrderAndShowsNothingUnqueued is the regression test for
+// finding F1, and it is the auditor's exact scenario.
+//
+// Measured against the first implementation — which moved the cursor by ONE
+// entry per turn while pairKeys took the GALLERY neighbour for the right half:
+//
+//	turn 1: LEFT e/5 RIGHT a/1   <- a/1 is queue[2], on screen TWO TURNS EARLY
+//	turn 2: LEFT c/3 RIGHT d/4   <- d/4 was never queued at all
+//	turn 3: LEFT a/1 RIGHT b/2   <- b/2 was never queued either
+//
+// Ordering is the entire point of a queue, so that is not a cosmetic wart in the
+// right-hand panel: the collection played 1st, 3rd, 2nd, 3rd with three unqueued
+// pages mixed in. Reachable at runtime from POST /api/viewmode even though
+// config.yaml ships landscape_single.
+func TestATwoUpQueuePlaysInOrderAndShowsNothingUnqueued(t *testing.T) {
+	iv := newControlTestViewer(30, queueGallery()...)
+	iv.setViewModeState(ViewLandscapeTwo)
+	if got := iv.stepSize(); got != 2 {
+		t.Fatalf("stepSize = %d in the two-up view, want 2 — the fixture is not exercising it", got)
+	}
+	iv.gotoIndex(0) // interrupted at a/1
+
+	iv.setQueue([]string{"e/5.jpg", "c/3.jpg", "a/1.jpg"})
+
+	for turn, want := range [][]string{
+		// Two queued pages per turn, in the order they were sent.
+		{"e/5.jpg", "c/3.jpg"},
+		// An odd-length queue's last page has no partner. It collapses to one
+		// key, exactly as a one-image gallery does — showing an unqueued comic
+		// beside it is the defect this test exists for.
+		{"a/1.jpg"},
+	} {
+		if !iv.advance(iv.stepSize()) {
+			t.Fatalf("turn %d reported nothing to show", turn+1)
+		}
+		if got := screen(t, iv); !reflect.DeepEqual(got, want) {
+			t.Fatalf("turn %d shows %v, want %v — a queued page is out of order, or half the "+
+				"screen is showing a gallery neighbour nobody queued", turn+1, got, want)
+		}
+	}
+
+	// Drained: back to the gallery, two pages on from the interruption at a/1.
+	if !iv.advance(iv.stepSize()) {
+		t.Fatal("the draining page turn reported nothing to show")
+	}
+	if got, want := screen(t, iv), []string{"c/3.jpg", "d/4.jpg"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("after the drain the screen shows %v, want %v — the gallery resumes two pages "+
+			"on from the interrupted position, and both halves come from the gallery again",
+			got, want)
+	}
+	wantQueue(t, iv, 0, 0, 0)
+}
+
+// TestATwoUpQueueAdvancesTwoEntriesPerTurn pins the cursor arithmetic directly,
+// separately from what lands on the glass. An even-length queue is used so that
+// the collapse case above cannot mask a cursor that moved by one.
+func TestATwoUpQueueAdvancesTwoEntriesPerTurn(t *testing.T) {
+	iv := newControlTestViewer(30, queueGallery()...)
+	iv.setViewModeState(ViewLandscapeTwo)
+	iv.gotoIndex(0)
+	iv.setQueue([]string{"e/5.jpg", "d/4.jpg", "c/3.jpg", "b/2.jpg"})
+
+	iv.advance(iv.stepSize())
+	wantQueue(t, iv, 4, 1, 0) // position names the LEFT entry
+	if got, want := screen(t, iv), []string{"e/5.jpg", "d/4.jpg"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("first screen = %v, want %v", got, want)
+	}
+
+	iv.advance(iv.stepSize())
+	wantQueue(t, iv, 4, 3, 0) // 3, not 2: a page turn is two entries here
+	if got, want := screen(t, iv), []string{"c/3.jpg", "b/2.jpg"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("second screen = %v, want %v — the queue advanced by one entry, so the second "+
+			"screen repeats a page the first one already showed", got, want)
+	}
+
+	// And back: a Prev returns the PREVIOUS SCREEN, not a screen overlapping it.
+	iv.advance(-iv.stepSize())
+	if got, want := screen(t, iv), []string{"e/5.jpg", "d/4.jpg"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("after Prev the screen = %v, want %v", got, want)
+	}
+	wantQueue(t, iv, 4, 1, 0)
+
+	// Forward again from the front: the same second screen, not an overlap.
+	iv.advance(iv.stepSize())
+	if got, want := screen(t, iv), []string{"c/3.jpg", "b/2.jpg"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("forward again = %v, want %v", got, want)
+	}
+}
+
+// TestATwoUpQueueSkipsMissingKeysOnBothHalves: a key that has left the gallery is
+// skipped wherever it falls, including in the right-hand slot, and each is
+// counted once.
+func TestATwoUpQueueSkipsMissingKeysOnBothHalves(t *testing.T) {
+	iv := newControlTestViewer(30, queueGallery()...)
+	iv.setViewModeState(ViewLandscapeTwo)
+	iv.gotoIndex(0)
+	iv.setQueue([]string{"gone/7.jpg", "e/5.jpg", "gone/8.jpg", "c/3.jpg"})
+
+	iv.advance(iv.stepSize())
+	if got, want := screen(t, iv), []string{"e/5.jpg", "c/3.jpg"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("screen = %v, want %v — a missing key must not leave a gallery neighbour on "+
+			"the screen beside a queued one", got, want)
+	}
+	wantQueue(t, iv, 4, 2, 2)
+}
+
+// ---------------------------------------------------------------------------
+// A rescan under a running queue (finding F4)
+//
+// 🔴 The whole of this block is coverage the first round did not have, and its
+// absence let a mutant survive a fully green 447-test suite. state_queue_test.go
+// mentioned setImages and Rescan zero times, so every claim about what happens
+// when the gallery changes MID-QUEUE was a docstring and nothing else.
+// ---------------------------------------------------------------------------
+
+// TestARescanThatRemovesAPlayedPageDoesNotCountItTwice is the F4 regression test.
+//
+// The mutant it kills is `queueScanned = i` instead of `i + 1` on the LANDING
+// branch of the forward scan, which survived the round-1 suite. It is not an
+// equivalent mutant: the two values differ exactly when a forward scan later
+// passes over an entry that was ALREADY PLAYED, and the only way that happens is
+// a step back followed by that entry leaving the gallery — i.e. a rescan under a
+// running queue, which nothing exercised.
+//
+// The contract being pinned: queue.skipped counts each queued key at most ONCE
+// for the life of one queue. A page that played and then vanished from the bucket
+// is not re-counted, because otherwise the number measures how often the Pi
+// re-listed the bucket rather than how many pages the operator cannot see — and
+// it grows without bound on a Pi that rescans on a timer.
+func TestARescanThatRemovesAPlayedPageDoesNotCountItTwice(t *testing.T) {
+	iv := queueTestViewer(t)
+	iv.setQueue([]string{"a/1.jpg", "b/2.jpg", "c/3.jpg"})
+
+	iv.advance(1) // land a/1  (entry 0 looked up: present)
+	iv.advance(1) // land b/2  (entry 1 looked up: present)
+	iv.advance(-1)
+	if got := keyNow(t, iv); got != "a/1.jpg" {
+		t.Fatalf("stepping back landed on %q, want a/1.jpg", got)
+	}
+	wantQueue(t, iv, 3, 1, 0)
+
+	// The rescan: b/2 has left the bucket while the queue is mid-play.
+	iv.setImages([]string{"a/1.jpg", "c/3.jpg", "d/4.jpg", "e/5.jpg"})
+
+	if !iv.advance(1) {
+		t.Fatal("advance reported nothing to show after the rescan")
+	}
+	if got := keyNow(t, iv); got != "c/3.jpg" {
+		t.Fatalf("after the rescan the page turn showed %q, want c/3.jpg — b/2 has left the "+
+			"gallery and must be passed over", got)
+	}
+	_, _, _, skipped := iv.queueState()
+	if skipped != 0 {
+		t.Fatalf("skipped = %d after a rescan removed a page that had ALREADY PLAYED, want 0. "+
+			"queue.skipped counts each queued key at most once for the life of the queue; "+
+			"counting a played page when a later pass finds it gone makes the number a "+
+			"function of how often the bucket was re-listed, and it grows without bound on a "+
+			"Pi that rescans.", skipped)
+	}
+}
+
+// TestARescanThatRemovesAnUnplayedPageCountsItOnce is the other direction, and it
+// is what stops the guard above being satisfied by a viewer that never counts
+// anything after a rescan.
+func TestARescanThatRemovesAnUnplayedPageCountsItOnce(t *testing.T) {
+	iv := queueTestViewer(t)
+	iv.setQueue([]string{"a/1.jpg", "b/2.jpg", "c/3.jpg"})
+	iv.advance(1) // land a/1; b/2 and c/3 not yet looked up
+
+	iv.setImages([]string{"a/1.jpg", "c/3.jpg", "d/4.jpg", "e/5.jpg"})
+
+	iv.advance(1)
+	if got := keyNow(t, iv); got != "c/3.jpg" {
+		t.Fatalf("page turn after the rescan showed %q, want c/3.jpg", got)
+	}
+	wantQueue(t, iv, 3, 3, 1)
+
+	// And not again on a second pass over it.
+	iv.advance(-1)
+	iv.advance(1)
+	wantQueue(t, iv, 3, 3, 1)
+}
+
+// TestARescanThatEmptiesTheGalleryDrainsTheQueue: the extreme case, and the one
+// that would panic if any index arithmetic here assumed a non-empty ring.
+func TestARescanThatEmptiesTheGalleryDrainsTheQueue(t *testing.T) {
+	iv := queueTestViewer(t)
+	iv.setQueue([]string{"a/1.jpg", "b/2.jpg"})
+	iv.advance(1)
+
+	iv.setImages(nil)
+
+	if iv.advance(1) {
+		t.Fatal("advance reported something to show after the gallery emptied")
+	}
+	wantQueue(t, iv, 0, 0, 1) // b/2 was still unplayed, so it counts
+}
+
+// TestADrainAfterARescanReturnsToTheSamePageNotTheSameIndex is finding F7.
+//
+// The gallery is shuffled once per process, so a rescan replaces it with a
+// DIFFERENT ORDER. Decision D4 says the gallery resumes where the queue
+// interrupted it — and after a reshuffle "the page" and "the position" are
+// different facts. The position is the meaningless one: index 2 in the new order
+// is an arbitrary comic. Here the interrupted page c/3.jpg moves from index 2 to
+// index 1, so a drain that trusted the index resumes at x/9.jpg instead of a/1.
+func TestADrainAfterARescanReturnsToTheSamePageNotTheSameIndex(t *testing.T) {
+	iv := queueTestViewer(t) // interrupted at c/3.jpg, index 2
+	iv.setQueue([]string{"e/5.jpg"})
+	iv.advance(1)
+
+	// A rescan that keeps c/3.jpg but moves it.
+	iv.setImages([]string{"x/9.jpg", "c/3.jpg", "a/1.jpg"})
+
+	if !iv.advance(1) {
+		t.Fatal("the draining page turn reported nothing to show")
+	}
+	if got := keyNow(t, iv); got != "a/1.jpg" {
+		t.Fatalf("after a rescan the drained queue resumed at %q, want a/1.jpg — the page after "+
+			"the interrupted one (c/3.jpg, now index 1). Trusting the recorded INDEX resumes at "+
+			"x/9.jpg, an arbitrary comic in the new shuffle.", got)
+	}
+}
+
+// TestADrainFallsBackToTheIndexWhenTheInterruptedPageIsGone covers the other arm
+// of that decision: the interrupted page has left the bucket entirely, so there
+// is no key to resolve and the recorded position is the best answer left.
+func TestADrainFallsBackToTheIndexWhenTheInterruptedPageIsGone(t *testing.T) {
+	iv := queueTestViewer(t) // interrupted at c/3.jpg, index 2
+	iv.setQueue([]string{"e/5.jpg"})
+	iv.advance(1)
+
+	// c/3.jpg is gone; the remaining four keep their relative order, so index 2
+	// is now d/4.jpg and the drain lands one on from it.
+	iv.setImages([]string{"a/1.jpg", "b/2.jpg", "d/4.jpg", "e/5.jpg"})
+
+	if !iv.advance(1) {
+		t.Fatal("the draining page turn reported nothing to show")
+	}
+	if got := keyNow(t, iv); got != "e/5.jpg" {
+		t.Fatalf("after the interrupted page left the bucket the drain landed on %q, want "+
+			"e/5.jpg — index 2 (d/4.jpg) plus one", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The queue generation (finding F2)
+// ---------------------------------------------------------------------------
+
+// TestTheQueueGenerationMakesTheSkipCountAttributable is the F2 regression test.
+//
+// queue.skipped deliberately outlives the queue that produced it, so after a
+// drain GET /api/state reports `{length:0, skipped:2}` — and goes on reporting it
+// through fifty unrelated page turns. Without an identity beside it, a polling
+// client cannot tell "the collection that just finished skipped 2 pages" from
+// "some queue an hour ago skipped 2", so it either shows that toast on every poll
+// forever or never shows it at all. The generation is what lets it show it once.
+func TestTheQueueGenerationMakesTheSkipCountAttributable(t *testing.T) {
+	iv := queueTestViewer(t)
+	wantQueueID(t, iv, 0) // nothing has ever been queued in this process
+
+	iv.setQueue([]string{"gone/7.jpg", "e/5.jpg", "gone/8.jpg"})
+	wantQueueID(t, iv, 1)
+	iv.advance(1) // skip gone/7, land e/5
+	iv.advance(1) // skip gone/8, drain
+
+	wantQueue(t, iv, 0, 0, 2)
+	wantQueueID(t, iv, 1)
+
+	// Fifty unrelated page turns later, the count still stands — and is still
+	// attributable to queue 1, which is what makes standing acceptable.
+	for i := 0; i < 50; i++ {
+		iv.advance(1)
+	}
+	wantQueue(t, iv, 0, 0, 2)
+	wantQueueID(t, iv, 1)
+
+	// A new instruction is a new generation with a clean count.
+	iv.setQueue([]string{"a/1.jpg"})
+	wantQueueID(t, iv, 2)
+	wantQueue(t, iv, 1, 0, 0)
+}
+
+// TestTheQueueGenerationIsNotReusedOrRolledBack: it counts POST /api/queue calls,
+// not running queues, so ending one does not give its id back.
+func TestTheQueueGenerationIsNotReusedOrRolledBack(t *testing.T) {
+	iv := queueTestViewer(t)
+	for want := 1; want <= 3; want++ {
+		iv.setQueue([]string{"e/5.jpg"})
+		wantQueueID(t, iv, want)
+	}
+	iv.advance(1)
+	iv.gotoKey("a/1.jpg") // ends the queue
+	wantQueue(t, iv, 0, 0, 0)
+	wantQueueID(t, iv, 3)
+	iv.setQueue([]string{"e/5.jpg"})
+	wantQueueID(t, iv, 4)
 }

@@ -571,6 +571,38 @@ func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+
+	// 🔴 A QUEUE POSTED BEFORE THE FIRST SCAN LANDS IS CONSUMED IN FULL AND
+	// DISCARDED, so it is refused instead of accepted.
+	//
+	// `Scanning && Total == 0` is the Pi's state at every boot until the first
+	// ListImages returns — the state the whole `scanning` field exists to make
+	// visible. A queue installed then finds NOTHING in the gallery, decision D3
+	// skips every key, and the display never leaves the page it was on. The
+	// caller got a 202. That is exactly the "telling the caller its page turn is
+	// queued when nothing was queued" lie the 503 convention exists to avoid, and
+	// the only trace left behind would be `skipped == the length it sent`, which
+	// is indistinguishable from a genuinely stale collection.
+	//
+	// 503 + Retry-After, not 400 or 404, because RETRYING IS THE CORRECT
+	// RESPONSE: the scan is seconds away and the same request will then work. It
+	// reuses the backpressure convention the cluster-side caller already handles
+	// (pi.BusyError) rather than inventing a second one for a second reason —
+	// which is the same argument that made the GTK queue cap answer 503.
+	//
+	// ⚠ SCOPE, stated because it is narrower than it looks. This is a
+	// best-effort admission taken on the handler goroutine, exactly like
+	// handleGoto's 404 lookup: the scan can finish between this read and the
+	// closure running, in which case the queue installs and plays normally. It
+	// does NOT cover a genuinely EMPTY bucket (`!Scanning && Total == 0`), and
+	// deliberately: retrying that would never help, so the honest answer there is
+	// the 202 with `skipped == length`, now attributable through queue.id.
+	if snap := s.viewer.Snapshot(); snap.Scanning && snap.Total == 0 {
+		refuse(w, "the gallery has not finished indexing, so every queued key would be "+
+			"skipped; retry shortly")
+		return
+	}
+
 	keys := body.Keys
 	s.enqueue(w, func() { s.viewer.SetQueue(keys) })
 }

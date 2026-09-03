@@ -319,11 +319,20 @@ type ImageViewer struct {
 	// a restarted Pi comes back without it. See the play-queue section of
 	// state.go, which owns every access to these five fields.
 	queue []string
-	// queueIndex is the cursor into queue: the entry currently on the display.
-	// -1 means none is — either no queue is running, or one was installed and no
-	// page turn has consumed an entry yet. The wire's 1-based `queue.position` is
-	// derived from it in queueStateLocked, in one place.
+	// queueIndex is the cursor into queue: the LEFT-most entry currently on the
+	// display. -1 means none is — either no queue is running, or one was
+	// installed and no page turn has consumed an entry yet. The wire's 1-based
+	// `queue.position` is derived from it in queueStateLocked, in one place.
 	queueIndex int
+	// queueTailIndex is the LAST entry on the display: queueIndex in either
+	// single view, and the entry sharing the screen with it in the two-up view.
+	// -1 alongside queueIndex.
+	//
+	// 🔴 It is what makes the two-up view play the QUEUE rather than the queue on
+	// the left and the gallery on the right. pairKeys reads it; landQueueLocked
+	// is the only writer, and it writes it in the same lock acquisition that moves
+	// the cursor.
+	queueTailIndex int
 	// queueScanned is the high-water mark of the forward scan: every entry below
 	// it has already been looked up in the gallery once. It is what makes a
 	// skipped key count EXACTLY ONCE no matter how often the operator steps back
@@ -334,10 +343,26 @@ type ImageViewer struct {
 	// only by the next setQueue — a drained queue reports length 0, so a count
 	// cleared with the queue could never be read by the client it exists for.
 	queueSkipped int
-	// queueReturnIndex is the gallery position the queue interrupted, restored
-	// when the queue drains (decision D4). The queue is an interruption, not a
-	// seek.
+	// queueReturnIndex and queueReturnKey are the gallery position and the PAGE
+	// the queue interrupted, restored when the queue drains (decision D4). The
+	// queue is an interruption, not a seek.
+	//
+	// 🔴 Two of them because a rescan under a running queue reshuffles the
+	// gallery, and an index then names a different comic. The key wins when it is
+	// still in the bucket; the index is the fallback for a page that has left it.
+	// queueResumeIndexLocked is the one place that decides between them.
 	queueReturnIndex int
+	queueReturnKey   string
+	// queueSeq is the play queue's generation: incremented by every setQueue,
+	// never reused, 0 before the first one.
+	//
+	// 🔴 It is what makes queueSkipped ATTRIBUTABLE. That count deliberately
+	// outlives the queue that produced it, so without an identity beside it a
+	// polling client cannot tell "the collection that just finished skipped 2"
+	// from "some queue an hour ago skipped 2" — and would show a stale toast on
+	// every poll forever. It is reported as `queue.id`. Being per-process, it
+	// also restates decision D2 on the wire: a Pi that restarted is back at 0.
+	queueSeq int
 }
 
 // injectedVersion is set at link time by a release build:

@@ -268,7 +268,7 @@ func TestStateJSONShape(t *testing.T) {
 		// from maxQueueKeys — so a mutant that crossed two of the three, or
 		// hardcoded a constant the package names, cannot land on the right answer
 		// by accident of the fixture.
-		Queue: QueueState{Length: 12, Position: 5, Skipped: 3},
+		Queue: QueueState{ID: 7, Length: 12, Position: 5, Skipped: 3},
 	}
 	s := newTestServer(t, f)
 
@@ -291,6 +291,7 @@ func TestStateJSONShape(t *testing.T) {
 		"scanning":           false,
 		"seconds_until_next": float64(19),
 		"queue": map[string]any{
+			"id":       float64(7),
 			"length":   float64(12),
 			"position": float64(5),
 			"skipped":  float64(3),

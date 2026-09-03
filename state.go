@@ -101,7 +101,7 @@ func (iv *ImageViewer) advance(delta int) bool {
 			return true
 		}
 		// Drained. Fall through to the gallery from the interrupted position.
-		iv.currentIndex = iv.queueReturnIndex
+		iv.currentIndex = iv.queueResumeIndexLocked()
 		iv.endQueueLocked()
 	}
 
@@ -143,6 +143,33 @@ func (iv *ImageViewer) pairKeys() (leftIdx int, left string, rightIdx int, right
 	// Normalise locally, not by writing back: this runs under the READ lock.
 	l := wrapIndex(iv.currentIndex, 0, n)
 	r := wrapIndex(l, 1, n)
+
+	// 🔴 WHILE A QUEUE IS RUNNING THE RIGHT HALF COMES FROM THE QUEUE, NOT FROM
+	// THE GALLERY. Taking images[l+1] here was measured to break the queue's one
+	// job: with the gallery a,b,c,d,e and the queue [e,c,a], a two-up run showed
+	// `LEFT e RIGHT a` on the first turn — playing the operator's THIRD queued
+	// page two turns early — and `LEFT c RIGHT d` on the second, where d was
+	// never queued at all. Ordering is the entire point of a queue, so half a
+	// screen of gallery neighbours is not a cosmetic wart.
+	//
+	// queueTailIndex is the entry the page turn decided shares the screen with
+	// the cursor; it is chosen in landQueueLocked, under the write lock, at the
+	// same moment the cursor moves. It is NOT recomputed here: this is a read
+	// path, and a right half derived independently of the one the advance planned
+	// is two answers to one question — the shape Snapshot.Keys exists to remove.
+	//
+	// tail == cursor (an odd-length queue's last page, or any single view) leaves
+	// r == l, which displayedPair collapses to one key exactly as it does for a
+	// one-image gallery. A tail whose key has left the gallery between the page
+	// turn and this render collapses the same way rather than falling back to a
+	// gallery neighbour: showing nothing extra is honest, showing an unqueued
+	// comic is the defect above.
+	if len(iv.queue) > 0 && iv.queueTailIndex >= 0 && iv.queueTailIndex < len(iv.queue) {
+		r = l
+		if idx, found := iv.indexOfKeyLocked(iv.queue[iv.queueTailIndex]); found {
+			r = idx
+		}
+	}
 	return l, iv.images[l], r, iv.images[r], true
 }
 
@@ -887,13 +914,44 @@ func (iv *ImageViewer) setQueue(keys []string) {
 	// once; replacing the queue (decision D7) does not interrupt it again.
 	if len(iv.queue) == 0 {
 		iv.queueReturnIndex = iv.currentIndex
+		// 🔴 The KEY as well as the index, because a rescan can reorder the
+		// gallery under a running queue and an index then names a different
+		// comic. Decision D4 says the gallery resumes at the page it was
+		// interrupted on, and after a reshuffle the page and the position are
+		// different facts — the position is the meaningless one. The index stays
+		// as the fallback for a page that has left the bucket entirely.
+		iv.queueReturnKey = ""
+		if len(iv.images) > 0 {
+			iv.queueReturnKey = iv.images[wrapIndex(iv.currentIndex, 0, len(iv.images))]
+		}
 	}
 	iv.queue = stored
 	// -1, not 0: nothing has been played yet, and 0 would mean "the first entry
 	// is on the display" before any page turn has happened.
 	iv.queueIndex = -1
+	iv.queueTailIndex = -1
 	iv.queueScanned = 0
 	iv.queueSkipped = 0
+	// The generation. It is what makes queue.skipped ATTRIBUTABLE: a drained
+	// queue reports length 0 with the count still standing, and without an
+	// identity a polling client cannot tell "the collection that just finished
+	// skipped 2" from "some queue an hour ago skipped 2" — so it would either
+	// show a stale toast on every poll or never show one at all. Monotonic per
+	// process, never reused, and it starts from 0 again after a restart, which is
+	// decision D2 being true rather than a wart.
+	iv.queueSeq++
+}
+
+// queueResumeIndexLocked is where the gallery resumes when the queue drains: the
+// PAGE the queue interrupted, re-resolved by key, falling back to the recorded
+// position when that page has left the gallery. The caller must hold the lock.
+func (iv *ImageViewer) queueResumeIndexLocked() int {
+	if iv.queueReturnKey != "" {
+		if idx, ok := iv.indexOfKeyLocked(iv.queueReturnKey); ok {
+			return idx
+		}
+	}
+	return iv.queueReturnIndex
 }
 
 // endQueueLocked clears the running queue, keeping the skip count. The caller
@@ -903,21 +961,31 @@ func (iv *ImageViewer) setQueue(keys []string) {
 func (iv *ImageViewer) endQueueLocked() {
 	iv.queue = nil
 	iv.queueIndex = -1
+	iv.queueTailIndex = -1
 	iv.queueScanned = 0
 	iv.queueReturnIndex = 0
+	iv.queueReturnKey = ""
+	// queueSeq is NOT reset either: it identifies the queue queueSkipped came
+	// from, so a client can attribute a count that outlives its queue.
 }
 
-// advanceQueueLocked moves the queue cursor by one entry in the direction of
-// delta, skipping keys that have left the gallery, and reports whether it landed
-// on one. false means the queue is exhausted forwards and the caller should
-// return to the gallery. The caller must already hold the write lock.
+// advanceQueueLocked moves the queue on by ONE SCREEN in the direction of delta,
+// skipping keys that have left the gallery, and reports whether it landed on one.
+// false means the queue is exhausted forwards and the caller should return to the
+// gallery. The caller must already hold the write lock.
 //
-// Skips are counted per decision D3, and counted EXACTLY ONCE each. That is what
-// queueScanned is for: it is the high-water mark of the forward scan, and a
-// backward step can only ever revisit indices below it, so the backward arm
-// counts nothing and cannot inflate the number a client shows the operator. The
-// invariant holds by construction — a landing at j sets queueScanned to at least
-// j+1, and the backward arm only visits indices below queueIndex.
+// "One screen" is |delta| entries — see the page-size note in the body. Consuming
+// one entry per turn regardless of the view was a measured defect, not a
+// simplification: in the two-up view it played queued pages out of order and put
+// unqueued gallery neighbours on half the screen.
+//
+// Skips are counted per decision D3, EXACTLY ONCE each. queueScanned is the
+// high-water mark that makes that true, and its scope is stated at
+// scanQueueForwardLocked rather than here, because the case that matters — an
+// entry that was PLAYED and then left the gallery in a mid-queue rescan — is a
+// property of that scan and not of this cursor arithmetic. The backward arm
+// counts nothing at all; every index it can reach is below the high-water mark by
+// construction.
 //
 // 🔴 A BACKWARD STEP OFF THE FRONT STAYS PUT rather than draining into the
 // gallery. Prev inside a collection means "the previous page of this collection";
@@ -925,40 +993,143 @@ func (iv *ImageViewer) endQueueLocked() {
 // comic the operator was not reading. The queue is left over the ONE way it is
 // documented to end: forward exhaustion, or an explicit POST /api/goto.
 func (iv *ImageViewer) advanceQueueLocked(delta int) bool {
+	// |delta| is the PAGE SIZE the caller turns by — 1 in either single view, 2
+	// in the two-up view, because every caller passes ±stepSize(). The queue
+	// consumes that many entries per turn, and it must: consuming ONE while the
+	// screen shows TWO was measured to play the operator's third queued page on
+	// the first turn.
+	step := delta
+	if step < 0 {
+		step = -step
+	}
+	if step == 0 {
+		step = 1
+	}
+
 	if delta >= 0 {
-		for i := iv.queueIndex + 1; i < len(iv.queue); i++ {
-			idx, ok := iv.indexOfKeyLocked(iv.queue[i])
-			if !ok {
-				if i >= iv.queueScanned {
-					iv.queueSkipped++
-					iv.queueScanned = i + 1
-				}
-				continue
-			}
-			iv.queueIndex = i
+		// From the last entry that was ON THE SCREEN, not from the cursor. In the
+		// two-up view they differ by one, and starting from the cursor would show
+		// the right-hand page again as the next left-hand page.
+		cursor, ok := iv.scanQueueForwardLocked(iv.queueTailIndex + 1)
+		if !ok {
+			return false
+		}
+		return iv.landQueueLocked(cursor, step)
+	}
+
+	at := iv.queueIndex
+	moved := false
+	for n := 0; n < step; n++ {
+		prev, ok := iv.scanQueueBackwardLocked(at - 1)
+		if !ok {
+			break
+		}
+		at = prev
+		moved = true
+	}
+	if !moved {
+		// Nothing playable behind the cursor. If an entry is currently on the
+		// display, hold on it; if none is (a Prev before the first page turn into
+		// a freshly installed queue), there is nothing to hold and the gallery
+		// takes over.
+		//
+		// ⚠ A HOLD REPORTS true, SO THE CALLER RE-RENDERS. gtkViewer.Prev calls
+		// updateImage() on true, which re-fetches the image already on the screen
+		// — one S3 GET for no visible change. That is a KNOWN, DELIBERATE cost,
+		// not an oversight: it is the same shape a one-image gallery already has
+		// (advance wraps to the same index and re-renders), the alternative is a
+		// third return value threaded through advance for a case an operator
+		// reaches by pressing prev at the front of a collection, and the honest
+		// answer to "is there something to show?" here is yes. If the re-fetch
+		// ever matters, the fix is a no-op check in updateImage against
+		// displayedKeys, which would cover the one-image gallery too — not a
+		// special case here.
+		if iv.queueIndex < 0 {
+			return false
+		}
+		at = iv.queueIndex
+	}
+	return iv.landQueueLocked(at, step)
+}
+
+// scanQueueForwardLocked returns the first playable entry at or after from,
+// counting every entry it passes over as a skip — exactly once each. ok is false
+// when nothing playable remains. The caller must hold the write lock.
+//
+// 🔴 THE HIGH-WATER MARK IS WHAT MAKES "EXACTLY ONCE" TRUE, AND IT IS WIDER THAN
+// "the operator pressed prev". queueScanned records that an entry has been LOOKED
+// UP, whatever the answer was — so an entry that was played and then LEFT THE
+// GALLERY IN A MID-QUEUE RESCAN is not counted when a later forward pass finds it
+// missing. Counting it would make queue.skipped a function of how many times the
+// bucket was re-listed rather than of how many pages the operator cannot see, and
+// it would grow without bound on a Pi that rescans. Setting this to i instead of
+// i+1 on the landing branch survived a fully green 447-test suite until
+// TestARescanThatRemovesAPlayedPageDoesNotCountItTwice existed.
+func (iv *ImageViewer) scanQueueForwardLocked(from int) (int, bool) {
+	if from < 0 {
+		from = 0
+	}
+	for i := from; i < len(iv.queue); i++ {
+		if _, ok := iv.indexOfKeyLocked(iv.queue[i]); ok {
 			if i+1 > iv.queueScanned {
 				iv.queueScanned = i + 1
 			}
-			iv.currentIndex = idx
-			return true
+			return i, true
 		}
+		if i >= iv.queueScanned {
+			iv.queueSkipped++
+			iv.queueScanned = i + 1
+		}
+	}
+	return 0, false
+}
+
+// scanQueueBackwardLocked returns the nearest playable entry at or before from.
+// It counts NOTHING: every index it can reach is below the cursor and has
+// therefore already been looked up by a forward scan. The caller must hold the
+// write lock.
+func (iv *ImageViewer) scanQueueBackwardLocked(from int) (int, bool) {
+	if from >= len(iv.queue) {
+		from = len(iv.queue) - 1
+	}
+	for i := from; i >= 0; i-- {
+		if _, ok := iv.indexOfKeyLocked(iv.queue[i]); ok {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// landQueueLocked points the display at the entry at cursor and works out which
+// further entries share the screen with it — step-1 of them, so one in the
+// two-up view and none in either single view. It reports false when the cursor's
+// own key has left the gallery, which the caller treats as a drain.
+//
+// 🔴 The tail is decided HERE, under the write lock, at the same moment the
+// cursor moves — and pairKeys reads it rather than recomputing one. Two
+// independently-derived answers to "what is on the right?" is the divergence
+// Snapshot.Keys exists to remove, one layer down.
+func (iv *ImageViewer) landQueueLocked(cursor, step int) bool {
+	if cursor < 0 || cursor >= len(iv.queue) {
 		return false
 	}
-
-	for i := iv.queueIndex - 1; i >= 0; i-- {
-		idx, ok := iv.indexOfKeyLocked(iv.queue[i])
-		if !ok {
-			continue
-		}
-		iv.queueIndex = i
-		iv.currentIndex = idx
-		return true
+	idx, ok := iv.indexOfKeyLocked(iv.queue[cursor])
+	if !ok {
+		return false
 	}
-	// Nothing playable behind the cursor. If an entry is currently on the
-	// display, stay on it; if none is (a Prev before the first page turn into a
-	// freshly installed queue), there is nothing to hold and the gallery takes
-	// over.
-	return iv.queueIndex >= 0
+	iv.queueIndex = cursor
+	iv.currentIndex = idx
+
+	tail := cursor
+	for n := 1; n < step; n++ {
+		next, ok := iv.scanQueueForwardLocked(tail + 1)
+		if !ok {
+			break
+		}
+		tail = next
+	}
+	iv.queueTailIndex = tail
+	return true
 }
 
 // indexOfKeyLocked is indexOfKey's body without the locking. The caller must
@@ -979,25 +1150,29 @@ func (iv *ImageViewer) indexOfKeyLocked(key string) (int, bool) {
 	return 0, false
 }
 
-// queueState reports the running queue's depth, 1-based position and skip count
-// — the three numbers GET /api/state carries under "queue".
+// queueState reports the generation, depth, 1-based position and skip count —
+// the four numbers GET /api/state carries under "queue".
 //
 // position is 1-BASED, and 0 means "no queued key is selected". See
 // control.QueueState, which states the wire contract; this is the one place the
 // internal -1 cursor is translated, so the off-by-one cannot be made twice.
-func (iv *ImageViewer) queueState() (length, position, skipped int) {
+//
+// In the two-up view position names the LEFT-hand entry. The right-hand one is
+// deliberately not reported: a client renders "page 3 of 12" from a position, and
+// a second number would only let it disagree with the screen.
+func (iv *ImageViewer) queueState() (id, length, position, skipped int) {
 	iv.mutex.RLock()
 	defer iv.mutex.RUnlock()
 	return iv.queueStateLocked()
 }
 
 // queueStateLocked is queueState's body. The caller must already hold the lock.
-func (iv *ImageViewer) queueStateLocked() (length, position, skipped int) {
+func (iv *ImageViewer) queueStateLocked() (id, length, position, skipped int) {
 	length = len(iv.queue)
 	if length > 0 && iv.queueIndex >= 0 {
 		position = iv.queueIndex + 1
 	}
-	return length, position, iv.queueSkipped
+	return iv.queueSeq, length, position, iv.queueSkipped
 }
 
 // viewerSnapshot is one consistent read of everything GET /api/state reports.
@@ -1018,9 +1193,11 @@ type viewerSnapshot struct {
 	slideInterval    uint
 	scanning         bool
 	secondsUntilNext int
-	// The play queue's depth, 1-based position and skip count. They are read
-	// under the same lock as everything above, so they cannot describe a queue
-	// the viewer was not on.
+	// The play queue's generation, depth, 1-based position and skip count. They
+	// are read under the same lock as everything above, so they cannot describe a
+	// queue the viewer was not on — which is the whole reason queueID travels
+	// beside queueSkipped rather than being fetched by a second call.
+	queueID       int
 	queueLength   int
 	queuePosition int
 	queueSkipped  int
@@ -1060,7 +1237,7 @@ func (iv *ImageViewer) snapshotAt(now time.Time) viewerSnapshot {
 	// Through queueStateLocked rather than open-coded here, so the 1-based
 	// translation of the cursor exists once. Two copies of an off-by-one is two
 	// chances to make it, and only one of them has a test pointed at it.
-	s.queueLength, s.queuePosition, s.queueSkipped = iv.queueStateLocked()
+	s.queueID, s.queueLength, s.queuePosition, s.queueSkipped = iv.queueStateLocked()
 	if s.total > 0 {
 		s.index = wrapIndex(iv.currentIndex, 0, s.total)
 		s.key = iv.images[s.index]

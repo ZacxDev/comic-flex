@@ -209,6 +209,29 @@ type Snapshot struct {
 // is measured rather than assumed: TestQueueIsAlwaysPresentInTheStateObject
 // drives a zero-valued queue through the real handler and reads the raw bytes.
 type QueueState struct {
+	// ID identifies WHICH queue the other three fields describe. It is a
+	// per-process generation: 0 before any queue has been installed, and
+	// incremented by every POST /api/queue. It is never reused, and a Pi that
+	// restarted is back at 0 — which is decision D2 (the queue is transient)
+	// visible on the wire rather than only in a comment.
+	//
+	// 🔴 IT IS WHAT MAKES Skipped ACTIONABLE, and without it that field cannot be
+	// rendered correctly at all. Skipped outlives the queue that produced it (see
+	// below), so a drained queue reports `{"id":7,"length":0,"skipped":2}` — and
+	// goes on reporting it through fifty unrelated page turns. A polling client
+	// with no identity to hang that on cannot tell "the collection that just
+	// finished skipped 2 pages" from "some queue an hour ago skipped 2", so it
+	// either shows the toast on every poll forever or never shows it. With an id
+	// it shows it once, for that queue.
+	//
+	// The client learns its own queue's id by polling after its 202: the id it
+	// sees increase is the one its POST installed. That is a guess in the
+	// presence of a second client, and deliberately so — an endpoint that
+	// returned the id would have to allocate it on the handler goroutine, before
+	// the closure that installs the queue has run, and a caller told "your queue
+	// is #8" for a queue a later POST replaced before it was ever installed is a
+	// worse lie than an ambiguity between two operators of one television.
+	ID int `json:"id"`
 	// Length is how many keys the running queue holds — including ones already
 	// played and ones that turn out to have left the gallery. 0 means no queue
 	// is running, which is also the state a queue returns to when it drains.
@@ -219,6 +242,10 @@ type QueueState struct {
 	//
 	// 🔴 One-based so that 0 can mean "none" without a -1 sentinel. A consumer
 	// renders "page 3 of 12" straight from Position and Length.
+	//
+	// In the two-up view it names the LEFT-hand entry, and the queue consumes TWO
+	// entries per page turn there — so Position advances by two, and a client must
+	// not assume consecutive polls differ by one.
 	Position int `json:"position"`
 	// Skipped counts queued keys passed over because they were no longer in the
 	// gallery when the queue reached them (decision D3). It is what lets a client
@@ -229,7 +256,15 @@ type QueueState struct {
 	// Length back to 0, so a count cleared at the same moment could only ever be
 	// read by a client that happened to poll mid-queue — i.e. never, for the
 	// message it exists to make possible. It is reset by the next POST /api/queue
-	// and by nothing else.
+	// and by nothing else. READ IT WITH ID: on its own it is unattributable, and
+	// a client that renders it without checking which queue it belongs to shows a
+	// stale toast forever.
+	//
+	// It counts each queued key AT MOST ONCE for the life of one queue, including
+	// across a mid-queue rescan: a page that was played and then left the bucket
+	// is not counted when a later pass finds it gone. Otherwise the number would
+	// measure how often the Pi re-listed the bucket rather than how many pages the
+	// operator cannot see.
 	Skipped int `json:"skipped"`
 }
 
