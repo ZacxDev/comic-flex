@@ -311,6 +311,33 @@ type ImageViewer struct {
 	// The FIELD is guarded by mutex like the rest; what it points at must run on
 	// the GTK main loop. See setArmTimer and rearmSlideTimer in state.go.
 	armTimer func()
+	// queue is the play queue: an ordered list of object keys POST /api/queue
+	// asked for, to be shown BEFORE the shuffled gallery resumes. Empty means no
+	// queue is running. Guarded by mutex like the rest.
+	//
+	// 🔴 TRANSIENT BY DESIGN (decision D2) — it lives here and nowhere else, and
+	// a restarted Pi comes back without it. See the play-queue section of
+	// state.go, which owns every access to these five fields.
+	queue []string
+	// queueIndex is the cursor into queue: the entry currently on the display.
+	// -1 means none is — either no queue is running, or one was installed and no
+	// page turn has consumed an entry yet. The wire's 1-based `queue.position` is
+	// derived from it in queueStateLocked, in one place.
+	queueIndex int
+	// queueScanned is the high-water mark of the forward scan: every entry below
+	// it has already been looked up in the gallery once. It is what makes a
+	// skipped key count EXACTLY ONCE no matter how often the operator steps back
+	// and forward over it.
+	queueScanned int
+	// queueSkipped counts entries passed over because they were no longer in the
+	// gallery (decision D3). It OUTLIVES the queue that produced it and is reset
+	// only by the next setQueue — a drained queue reports length 0, so a count
+	// cleared with the queue could never be read by the client it exists for.
+	queueSkipped int
+	// queueReturnIndex is the gallery position the queue interrupted, restored
+	// when the queue drains (decision D4). The queue is an interruption, not a
+	// seek.
+	queueReturnIndex int
 }
 
 // injectedVersion is set at link time by a release build:

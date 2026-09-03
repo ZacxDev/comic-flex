@@ -73,6 +73,35 @@ const (
 	intervalMax = 3600
 )
 
+// maxQueueKeys bounds POST /api/queue. An over-long list is refused with 400.
+//
+// 🔴 This is the same hazard maxQueuedMutations and maxConcurrentScans exist for,
+// arriving through a different door: an authenticated network client hands the Pi
+// a list of arbitrary length and the Pi holds every entry of it in memory until
+// the queue drains or is replaced. Unbounded, one request is unbounded residency.
+//
+// 500 is chosen against the product rather than against a round number: a
+// collection is a comic, and a long trade paperback is a couple of hundred pages,
+// so 500 leaves room for a double-length one and refuses "play the whole bucket"
+// (~7,500 objects). It is deliberately NOT equal to any fixture in the tests, so
+// a cap that quietly changed to a test's own list length could not pass unnoticed.
+const maxQueueKeys = 500
+
+// maxQueueBodyBytes is the body cap for POST /api/queue alone.
+//
+// 🔴 It is a SECOND cap and not a raise of maxBodyBytes, because the two protect
+// different things. maxBodyBytes exists so an endpoint whose whole body is
+// `{"seconds":30}` cannot be handed megabytes; widening it to fit a queue would
+// widen it for every one of those endpoints too. 500 keys of the longest key
+// shape the bucket actually holds ("CGC Comics 2022/Absolute Batman/img284.jpg"
+// is 43 bytes, and percent-safe keys with spaces and parentheses run longer) plus
+// JSON quoting and commas fits inside 128 KiB with room to spare, and 128 KiB is
+// nothing on a Pi that renders 4K pixbufs.
+//
+// A body over this cap is 413, not 400: it is refused by the decoder before any
+// of our validation runs, exactly as maxBodyBytes is on the other endpoints.
+const maxQueueBodyBytes = 128 << 10
+
 // Config configures a control Server.
 type Config struct {
 	// Addr to bind. Empty means DefaultAddr.
@@ -150,6 +179,7 @@ func (s *Server) routes() http.Handler {
 	api.HandleFunc("POST /api/viewmode", s.handleViewMode)
 	api.HandleFunc("POST /api/goto", s.handleGoto)
 	api.HandleFunc("POST /api/interval", s.handleInterval)
+	api.HandleFunc("POST /api/queue", s.handleQueue)
 	api.HandleFunc("POST /api/rescan", s.handleRescan)
 
 	mux := http.NewServeMux()
@@ -253,7 +283,19 @@ func notFound(w http.ResponseWriter, msg string) {
 //     would be accepted with the second object silently discarded — the caller
 //     would be told 202 for a value it never sent.
 func decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
-	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	return decodeBodyLimit(w, r, dst, maxBodyBytes)
+}
+
+// decodeBodyLimit is decodeBody with an explicit cap, for the one endpoint whose
+// body is a LIST rather than a scalar.
+//
+// 🔴 It is a parameter and not a second copy of the function. Both refusals
+// decodeBody documents — the size cap and the exactly-one-value rule — are what
+// the whole API's bodies rest on, and a queue-shaped duplicate of them is the
+// second call site that forgets the trailing-JSON check. One rule, one place;
+// only the number differs.
+func decodeBodyLimit(w http.ResponseWriter, r *http.Request, dst any, limit int64) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
 	dec := json.NewDecoder(r.Body)
 	if err := dec.Decode(dst); err != nil {
 		if errors.Is(err, io.EOF) {
@@ -262,7 +304,7 @@ func decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
 			writeJSON(w, http.StatusRequestEntityTooLarge, errorBody{
-				Error: "body larger than " + strconv.Itoa(maxBodyBytes) + " bytes",
+				Error: "body larger than " + strconv.FormatInt(limit, 10) + " bytes",
 			})
 			return false
 		}
@@ -468,6 +510,69 @@ func (s *Server) handleInterval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.enqueue(w, func() { s.viewer.SetInterval(n) })
+}
+
+// handleQueue installs a play queue: an ordered list of object keys to show
+// before the shuffled gallery resumes.
+//
+// 🔴 IT IS AN ORDINARY ENQUEUED MUTATION, and that is deliberate rather than
+// incidental. It answers 202 through Server.enqueue like the other eight, which
+// means it can also answer 503 + Retry-After when the GTK loop is full, and the
+// cluster-side caller's existing pi.BusyError handling covers it with no second
+// convention to learn. Do NOT give it a bespoke "queued" reply: the queue is not
+// installed when this returns, exactly as a page turn has not happened when
+// POST /api/next returns.
+//
+// The three 400s, and why each is a refusal rather than a shrug:
+//
+//	empty list      — "play nothing" has no meaning, and the honest failure is to
+//	                  say so. It is also the shape a client bug produces (an empty
+//	                  collection, a filter that matched nothing), and answering
+//	                  202 would silently CLEAR a running queue on decision D7's
+//	                  replace rule — a destructive act from a request that meant
+//	                  nothing. There is deliberately no "cancel the queue" verb
+//	                  here; POST /api/goto ends a queue, because an explicit seek
+//	                  is the operator taking over.
+//	too long        — maxQueueKeys. An unbounded list from a network client is the
+//	                  hazard the admission caps exist for, arriving as one request.
+//	an empty key    — an empty string can never be in the gallery, so it would be
+//	                  counted as a SKIP and inflate the number a client shows the
+//	                  operator ("3 pages were no longer in the library" when one of
+//	                  the three was never a page). POST /api/goto rejects `{"key":""}`
+//	                  for the same reason; this is that rule applied per element.
+//
+// 🔴 The keys are NOT resolved here. handleGoto's 404 lookup exists because a
+// goto names ONE page and the caller can be told; a queue names many, decision D3
+// says a key that has left the gallery is skipped and counted rather than
+// refused, and a resolution taken on this goroutine would be stale by the time
+// the closure runs anyway. So there is no 404 on this endpoint at all, and a
+// queue whose every key has left the bucket is a legal 202 that reports
+// queue.skipped == len(keys) on the next GET /api/state.
+func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Keys []string `json:"keys"`
+	}
+	// The queue's own cap, not maxBodyBytes: this is the one body that is a list.
+	if !decodeBodyLimit(w, r, &body, maxQueueBodyBytes) {
+		return
+	}
+	if len(body.Keys) == 0 {
+		badRequest(w, `queue requires a non-empty "keys" array`)
+		return
+	}
+	if len(body.Keys) > maxQueueKeys {
+		badRequest(w, "queue holds at most "+strconv.Itoa(maxQueueKeys)+" keys; got "+
+			strconv.Itoa(len(body.Keys)))
+		return
+	}
+	for i, k := range body.Keys {
+		if k == "" {
+			badRequest(w, "queue key at position "+strconv.Itoa(i)+" is empty")
+			return
+		}
+	}
+	keys := body.Keys
+	s.enqueue(w, func() { s.viewer.SetQueue(keys) })
 }
 
 // handleRescan starts a bucket listing. It is the ONE mutation endpoint that

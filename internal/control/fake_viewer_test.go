@@ -2,6 +2,7 @@ package control
 
 import (
 	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -163,6 +164,16 @@ func (f *fakeViewer) GotoKey(k string) {
 }
 func (f *fakeViewer) GotoIndex(i int)     { f.record("GotoIndex:" + strconv.Itoa(i)) }
 func (f *fakeViewer) SetInterval(sec int) { f.record("SetInterval:" + strconv.Itoa(sec)) }
+
+// SetQueue records the KEYS it was handed, in order, and not merely the call.
+//
+// 🔴 A bare "SetQueue" would read identically for every list, so a handler that
+// truncated the queue, reordered it, dropped the last entry or passed a stale
+// slice would be invisible here. The whole point of this endpoint is WHICH keys
+// arrive, so the fixture has to carry them.
+func (f *fakeViewer) SetQueue(keys []string) {
+	f.record("SetQueue:" + strings.Join(keys, ","))
+}
 
 // Rescan stands in for the real adapter: it admits a listing or refuses, and it
 // returns SYNCHRONOUSLY without queueing anything. The recorded call goes in

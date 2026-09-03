@@ -79,9 +79,32 @@ func (iv *ImageViewer) imageCount() int {
 
 // advance moves currentIndex by delta and reports whether there is anything to
 // show afterwards. It is a no-op returning false on an empty gallery.
+//
+// 🔴 THE PLAY QUEUE IS CONSUMED FIRST, AND THIS IS THE ONE PLACE IT HAPPENS.
+// Every page turn in the program comes through here — the slide timer, the
+// arrow/space keypresses, POST /api/next and POST /api/prev — so putting the
+// queue anywhere else would mean a queue the timer honours and the keyboard does
+// not, or the reverse. One rule, one place.
+//
+// When the queue is exhausted in the forward direction it DRAINS: currentIndex
+// is restored to the gallery position the queue interrupted and the same delta is
+// then applied to that position (decision D4). The queue is an interruption, not
+// a seek, so the gallery continues exactly where it would have been had the queue
+// never run — not from wherever the last queued key happens to sit in the
+// per-process shuffle, which is a position with no meaning to anyone.
 func (iv *ImageViewer) advance(delta int) bool {
 	iv.mutex.Lock()
 	defer iv.mutex.Unlock()
+
+	if len(iv.queue) > 0 {
+		if iv.advanceQueueLocked(delta) {
+			return true
+		}
+		// Drained. Fall through to the gallery from the interrupted position.
+		iv.currentIndex = iv.queueReturnIndex
+		iv.endQueueLocked()
+	}
+
 	if len(iv.images) == 0 {
 		iv.currentIndex = 0
 		return false
@@ -764,27 +787,32 @@ func (iv *ImageViewer) rearmSlideTimer() (rearmed bool) {
 func (iv *ImageViewer) indexOfKey(key string) (int, bool) {
 	iv.mutex.RLock()
 	defer iv.mutex.RUnlock()
-	for i, k := range iv.images {
-		if k == key {
-			return i, true
-		}
-	}
-	return 0, false
+	return iv.indexOfKeyLocked(key)
 }
 
 // gotoKey selects key and reports whether it was found. A key that has since
 // left the gallery is a no-op rather than an error: the caller is an enqueued
 // closure with nobody left to answer.
+//
+// 🔴 A SUCCESSFUL GOTO ENDS ANY RUNNING PLAY QUEUE. An explicit "show me this
+// page" is the operator taking over, and leaving the queue installed would make
+// the very next page turn jump back into a collection the operator just left —
+// the display disobeying the last thing it was told. It is also the only way to
+// cancel a queue: POST /api/queue refuses an empty list rather than overloading
+// itself with a second meaning.
+//
+// A FAILED goto changes nothing, queue included: the key was not in the gallery,
+// so nothing was taken over.
 func (iv *ImageViewer) gotoKey(key string) bool {
 	iv.mutex.Lock()
 	defer iv.mutex.Unlock()
-	for i, k := range iv.images {
-		if k == key {
-			iv.currentIndex = i
-			return true
-		}
+	i, ok := iv.indexOfKeyLocked(key)
+	if !ok {
+		return false
 	}
-	return false
+	iv.currentIndex = i
+	iv.endQueueLocked()
+	return true
 }
 
 // gotoIndex selects an absolute position, clamped into range, and reports
@@ -793,6 +821,11 @@ func (iv *ImageViewer) gotoKey(key string) bool {
 // The clamp is not belt-and-braces: the handler bounds-checked against a
 // snapshot taken before this closure was queued, and a rescan in between can
 // have shortened the gallery. That is defect 3's shape exactly.
+//
+// 🔴 Like gotoKey, a successful goto ENDS any running play queue — same reason,
+// and it is stated in both places rather than in one because the two are separate
+// entry points a maintainer edits separately. An empty gallery is not a goto that
+// happened, so it leaves the queue alone; there is nothing to take over.
 func (iv *ImageViewer) gotoIndex(index int) bool {
 	iv.mutex.Lock()
 	defer iv.mutex.Unlock()
@@ -802,7 +835,169 @@ func (iv *ImageViewer) gotoIndex(index int) bool {
 	}
 	iv.currentIndex = index
 	iv.clampIndexLocked()
+	iv.endQueueLocked()
 	return true
+}
+
+// ---------------------------------------------------------------------------
+// The play queue (clawgate #442 phase 2, W4).
+//
+// A queue is an ordered list of object keys to show BEFORE the shuffled gallery
+// resumes. Everything below obeys the same rule 1 as the accessors above:
+// acquire, do the smallest possible amount of work, release. Nothing here calls
+// back into the viewer, shells out, or touches a widget — the `Locked` helpers
+// are the exception that proves it, and they are called only from a caller that
+// already holds the write lock and are never exported past this file.
+//
+// 🔴 IT IS TRANSIENT BY DESIGN (decision D2). There is no persistence here and
+// none is wanted: a queue is a "play this now" instruction, and a Pi that came
+// back from a reboot replaying a collection nobody asked for would be a defect,
+// not a feature. Do not add a file, a config key or a MinIO object for it.
+// ---------------------------------------------------------------------------
+
+// setQueue REPLACES the play queue and records the gallery position it is
+// interrupting, so that a drain can return to it (decision D4).
+//
+// Decision D7 is the `replace`: a second POST /api/queue while one is running
+// wins outright, rather than appending to it or being refused. That keeps the
+// state machine on the Pi to one list and one cursor, and it matches what the
+// operator means by tapping "play" on a different collection.
+//
+// 🔴 It COPIES the caller's slice, for the reason noteDisplayed does: the slice
+// arrives from a JSON decode on an HTTP goroutine and is captured by a closure,
+// and retaining that backing array would let the request's memory alias state the
+// snapshot reader walks under a different lock.
+//
+// queueSkipped is reset HERE and nowhere else. It has to outlive the queue that
+// produced it — a drained queue reports length 0, and a count cleared at the same
+// instant could only be read by a client that happened to poll mid-queue — so the
+// next instruction is the only honest place to zero it.
+func (iv *ImageViewer) setQueue(keys []string) {
+	stored := make([]string, len(keys))
+	copy(stored, keys)
+
+	iv.mutex.Lock()
+	defer iv.mutex.Unlock()
+	// 🔴 The interruption point is recorded ONLY when no queue is already
+	// running, and that is not a micro-optimisation. currentIndex during a queue
+	// is a QUEUED key's position in the shuffle, so recording it here would make
+	// a second POST /api/queue overwrite the real interruption point with a page
+	// from the collection the operator just abandoned — and the gallery would
+	// then resume somewhere it was never interrupted. The gallery is interrupted
+	// once; replacing the queue (decision D7) does not interrupt it again.
+	if len(iv.queue) == 0 {
+		iv.queueReturnIndex = iv.currentIndex
+	}
+	iv.queue = stored
+	// -1, not 0: nothing has been played yet, and 0 would mean "the first entry
+	// is on the display" before any page turn has happened.
+	iv.queueIndex = -1
+	iv.queueScanned = 0
+	iv.queueSkipped = 0
+}
+
+// endQueueLocked clears the running queue, keeping the skip count. The caller
+// must already hold the write lock.
+//
+// 🔴 queueSkipped is deliberately NOT cleared. See setQueue.
+func (iv *ImageViewer) endQueueLocked() {
+	iv.queue = nil
+	iv.queueIndex = -1
+	iv.queueScanned = 0
+	iv.queueReturnIndex = 0
+}
+
+// advanceQueueLocked moves the queue cursor by one entry in the direction of
+// delta, skipping keys that have left the gallery, and reports whether it landed
+// on one. false means the queue is exhausted forwards and the caller should
+// return to the gallery. The caller must already hold the write lock.
+//
+// Skips are counted per decision D3, and counted EXACTLY ONCE each. That is what
+// queueScanned is for: it is the high-water mark of the forward scan, and a
+// backward step can only ever revisit indices below it, so the backward arm
+// counts nothing and cannot inflate the number a client shows the operator. The
+// invariant holds by construction — a landing at j sets queueScanned to at least
+// j+1, and the backward arm only visits indices below queueIndex.
+//
+// 🔴 A BACKWARD STEP OFF THE FRONT STAYS PUT rather than draining into the
+// gallery. Prev inside a collection means "the previous page of this collection";
+// falling out of the front of a queue into the shuffle would be a page turn to a
+// comic the operator was not reading. The queue is left over the ONE way it is
+// documented to end: forward exhaustion, or an explicit POST /api/goto.
+func (iv *ImageViewer) advanceQueueLocked(delta int) bool {
+	if delta >= 0 {
+		for i := iv.queueIndex + 1; i < len(iv.queue); i++ {
+			idx, ok := iv.indexOfKeyLocked(iv.queue[i])
+			if !ok {
+				if i >= iv.queueScanned {
+					iv.queueSkipped++
+					iv.queueScanned = i + 1
+				}
+				continue
+			}
+			iv.queueIndex = i
+			if i+1 > iv.queueScanned {
+				iv.queueScanned = i + 1
+			}
+			iv.currentIndex = idx
+			return true
+		}
+		return false
+	}
+
+	for i := iv.queueIndex - 1; i >= 0; i-- {
+		idx, ok := iv.indexOfKeyLocked(iv.queue[i])
+		if !ok {
+			continue
+		}
+		iv.queueIndex = i
+		iv.currentIndex = idx
+		return true
+	}
+	// Nothing playable behind the cursor. If an entry is currently on the
+	// display, stay on it; if none is (a Prev before the first page turn into a
+	// freshly installed queue), there is nothing to hold and the gallery takes
+	// over.
+	return iv.queueIndex >= 0
+}
+
+// indexOfKeyLocked is indexOfKey's body without the locking. The caller must
+// already hold the lock — read or write.
+//
+// 🔴 It exists so the queue's per-entry resolution happens under the SAME lock
+// acquisition as the currentIndex write it feeds. Calling indexOfKey from
+// advanceQueueLocked would be an RLock taken while the write lock is held, which
+// sync.RWMutex answers with a permanent hang (see this file's rule 1), and doing
+// the lookup before the lock would resolve against a gallery a rescan can replace
+// in between — defect 3's shape.
+func (iv *ImageViewer) indexOfKeyLocked(key string) (int, bool) {
+	for i, k := range iv.images {
+		if k == key {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// queueState reports the running queue's depth, 1-based position and skip count
+// — the three numbers GET /api/state carries under "queue".
+//
+// position is 1-BASED, and 0 means "no queued key is selected". See
+// control.QueueState, which states the wire contract; this is the one place the
+// internal -1 cursor is translated, so the off-by-one cannot be made twice.
+func (iv *ImageViewer) queueState() (length, position, skipped int) {
+	iv.mutex.RLock()
+	defer iv.mutex.RUnlock()
+	return iv.queueStateLocked()
+}
+
+// queueStateLocked is queueState's body. The caller must already hold the lock.
+func (iv *ImageViewer) queueStateLocked() (length, position, skipped int) {
+	length = len(iv.queue)
+	if length > 0 && iv.queueIndex >= 0 {
+		position = iv.queueIndex + 1
+	}
+	return length, position, iv.queueSkipped
 }
 
 // viewerSnapshot is one consistent read of everything GET /api/state reports.
@@ -823,6 +1018,12 @@ type viewerSnapshot struct {
 	slideInterval    uint
 	scanning         bool
 	secondsUntilNext int
+	// The play queue's depth, 1-based position and skip count. They are read
+	// under the same lock as everything above, so they cannot describe a queue
+	// the viewer was not on.
+	queueLength   int
+	queuePosition int
+	queueSkipped  int
 }
 
 // snapshot reads every reported field under a SINGLE read lock, as of now.
@@ -856,6 +1057,10 @@ func (iv *ImageViewer) snapshotAt(now time.Time) viewerSnapshot {
 		slideInterval: iv.config.SlideInterval,
 		scanning:      iv.scansInFlight > 0,
 	}
+	// Through queueStateLocked rather than open-coded here, so the 1-based
+	// translation of the cursor exists once. Two copies of an off-by-one is two
+	// chances to make it, and only one of them has a test pointed at it.
+	s.queueLength, s.queuePosition, s.queueSkipped = iv.queueStateLocked()
 	if s.total > 0 {
 		s.index = wrapIndex(iv.currentIndex, 0, s.total)
 		s.key = iv.images[s.index]

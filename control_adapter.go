@@ -129,6 +129,11 @@ func (g gtkViewer) Snapshot() control.Snapshot {
 		SlideInterval:    int(s.slideInterval),
 		Scanning:         s.scanning,
 		SecondsUntilNext: s.secondsUntilNext,
+		Queue: control.QueueState{
+			Length:   s.queueLength,
+			Position: s.queuePosition,
+			Skipped:  s.queueSkipped,
+		},
 	}
 }
 
@@ -178,6 +183,32 @@ func (g gtkViewer) GotoKey(key string) {
 
 func (g gtkViewer) GotoIndex(index int) {
 	if g.iv.gotoIndex(index) {
+		g.iv.updateImage()
+	}
+}
+
+// SetQueue installs a play queue and turns to its first playable page.
+//
+// 🔴 IT ADVANCES IMMEDIATELY, and that is the decision rather than an accident of
+// reuse. Storing the list alone would leave the display on whatever it was
+// showing until the slide timer next fired — up to slide_interval away, which
+// POST /api/interval allows to be 3600 — so an operator who tapped "play
+// collection" would watch the wrong comic for an hour and reasonably conclude the
+// button is broken. POST /api/goto moves the display now for the same reason.
+//
+// It goes through iv.advance, not through a bespoke "show queue[0]" path, because
+// advance is where the queue's skip rule and its drain rule live. A queue whose
+// every key has left the gallery therefore drains on this very call, lands back
+// on the interrupted position, and reports its skip count on the next
+// GET /api/state — which is decision D3 working, not an error.
+//
+// It is an R1 write: it runs inside an Enqueue closure on the GTK main loop, so
+// the updateImage below is legal. 🔴 Do NOT follow Rescan here; Rescan is the
+// documented exception that runs on the HTTP handler goroutine and must not
+// render. The shape below is Next/Prev's, and that is the correct neighbour.
+func (g gtkViewer) SetQueue(keys []string) {
+	g.iv.setQueue(keys)
+	if g.iv.advance(g.iv.stepSize()) {
 		g.iv.updateImage()
 	}
 }
