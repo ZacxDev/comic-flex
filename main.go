@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	crand "crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -258,12 +260,16 @@ type ImageViewer struct {
 	// queuedMutations counts control-API closures handed to the GTK main loop
 	// and not yet run. Guarded by mutex like the rest; see maxQueuedMutations.
 	queuedMutations int
-	// scanRefusals and queueRefusals coalesce the log lines the two admission
-	// points write when they refuse. They carry their OWN mutex (see refusalLog
-	// in state.go) and are deliberately not guarded by iv.mutex: a refusal must
-	// not contend for the lock every render takes.
-	scanRefusals  refusalLog
-	queueRefusals refusalLog
+	// scanRefusals, queueRefusals and admissionRefusals coalesce the log lines the
+	// THREE admission points write when they refuse — the concurrent-scan bound,
+	// the GTK command queue cap, and internal/control's gallery-not-yet-indexed
+	// gate on POST /api/queue, which is decided in that package and reported back
+	// through the RefuseLog callback startControlAPI installs. They carry their
+	// OWN mutex (see refusalLog in state.go) and are deliberately not guarded by
+	// iv.mutex: a refusal must not contend for the lock every render takes.
+	scanRefusals      refusalLog
+	queueRefusals     refusalLog
+	admissionRefusals refusalLog
 	// displayUnknown coalesces the line displaySize writes when GDK cannot tell
 	// us the monitor geometry. Same reason and same mechanism as the two above:
 	// it is reached from every render, so it must not be one line per call.
@@ -311,6 +317,77 @@ type ImageViewer struct {
 	// The FIELD is guarded by mutex like the rest; what it points at must run on
 	// the GTK main loop. See setArmTimer and rearmSlideTimer in state.go.
 	armTimer func()
+	// queue is the play queue: an ordered list of object keys POST /api/queue
+	// asked for, to be shown BEFORE the shuffled gallery resumes. Empty means no
+	// queue is running. Guarded by mutex like the rest.
+	//
+	// 🔴 TRANSIENT BY DESIGN (decision D2) — it lives here and nowhere else, and
+	// a restarted Pi comes back without it. See the play-queue section of
+	// state.go, which owns every access to the SIX queue fields below (queue,
+	// queueIndex, queueTailIndex, queueScanned, queueSkipped, queueSeq) plus the
+	// two that record the interruption point (queueReturnIndex, queueReturnKey).
+	// Count them rather than trusting this sentence — it said "five" for a round
+	// after three more were added.
+	queue []string
+	// queueIndex is the cursor into queue: the LEFT-most entry currently on the
+	// display. -1 means none is — either no queue is running, or one was
+	// installed and no page turn has consumed an entry yet. The wire's 1-based
+	// `queue.position` is derived from it in queueStateLocked, in one place.
+	queueIndex int
+	// queueTailIndex is the LAST entry on the display: queueIndex in either
+	// single view, and the entry sharing the screen with it in the two-up view.
+	// -1 alongside queueIndex.
+	//
+	// 🔴 It is what makes the two-up view play the QUEUE rather than the queue on
+	// the left and the gallery on the right. pairKeys reads it; landQueueLocked
+	// is the only writer, and it writes it in the same lock acquisition that moves
+	// the cursor.
+	queueTailIndex int
+	// queueScanned is the high-water mark of the forward scan: every entry below
+	// it has already been looked up in the gallery once. It is what makes a
+	// skipped key count EXACTLY ONCE no matter how often the operator steps back
+	// and forward over it.
+	queueScanned int
+	// queueSkipped counts entries passed over because they were no longer in the
+	// gallery (decision D3). It OUTLIVES the queue that produced it and is reset
+	// only by the next setQueue — a drained queue reports length 0, so a count
+	// cleared with the queue could never be read by the client it exists for.
+	queueSkipped int
+	// queueReturnIndex and queueReturnKey are the gallery position and the PAGE
+	// the queue interrupted, restored when the queue drains (decision D4). The
+	// queue is an interruption, not a seek.
+	//
+	// 🔴 Two of them because a rescan under a running queue reshuffles the
+	// gallery, and an index then names a different comic. The key wins when it is
+	// still in the bucket; the index is the fallback for a page that has left it.
+	// queueResumeIndexLocked is the one place that decides between them.
+	queueReturnIndex int
+	queueReturnKey   string
+	// queueSeq is the play queue's generation: incremented by every setQueue,
+	// 0 before the first one, and UNIQUE ONLY WITHIN ONE RUN OF THE PROCESS.
+	//
+	// 🔴 IT IS REUSED ACROSS BOOTS, so the key a client dedupes on is the PAIR
+	// (boot_id, queue.id) and never queue.id alone. This sentence said "never
+	// reused" for a round, seven lines above the restart behaviour that falsifies
+	// it and with no per-process qualifier at all — the strongest of the three
+	// copies of this rule and the one an implementation maintainer reads. The
+	// cost of believing it is exact: a client dedupes on the id, the Pi reboots,
+	// its third collection reports {id:3, skipped:1}, and the client suppresses a
+	// real notification because it "already handled 3" — the failure boot_id was
+	// added to prevent.
+	//
+	// 🔴 One rule, three places, and they must agree: here, setQueue in state.go,
+	// and control.QueueState.ID (the wire-facing one). Round 2 fixed only the
+	// third. Grep `never reused` and `queueSeq` before editing any of them.
+	//
+	// It is what makes queueSkipped ATTRIBUTABLE. That count deliberately
+	// outlives the queue that produced it, so without an identity beside it a
+	// polling client cannot tell "the collection that just finished skipped 2"
+	// from "some queue an hour ago skipped 2" — and would show a stale toast on
+	// every poll forever. It is reported as `queue.id`; bootID is reported beside
+	// it as `boot_id`, and being per-process it also restates decision D2 on the
+	// wire: a Pi that restarted is back at 0.
+	queueSeq int
 }
 
 // injectedVersion is set at link time by a release build:
@@ -344,6 +421,54 @@ var injectedVersion string
 // add a third build path, give it one of the two or it lands on "unknown"
 // silently.
 var version = resolveVersion(injectedVersion, buildSettings())
+
+// bootID identifies THIS RUN of the process. It is reported by GET /api/state as
+// `boot_id`, and it is generated once, here, at package initialisation.
+//
+// 🔴 It exists so a client can dedupe on the PAIR (boot_id, queue.id). queue.id
+// is a per-process counter that starts again at 0 after a restart, so ids are
+// reused across boots — a client that suppressed a "3 pages were no longer in the
+// library" notification because it had "already handled queue 3" would go on
+// suppressing a genuine one from a rebooted Pi's third collection. It also gives
+// a client the only way to observe decision D2 from outside: a changed boot_id is
+// how it learns the collection it was watching is GONE rather than finished.
+//
+// It is not a version and not ordered — comparing two values for anything but
+// equality is meaningless.
+var bootID = newBootID()
+
+// newBootID returns an opaque per-run identity.
+//
+// 🔴 Random, not the clock. A Raspberry Pi has NO BATTERY-BACKED RTC: it comes
+// up at whatever time the filesystem or NTP last left it, so two consecutive
+// boots can genuinely report the same wall clock, and a time-derived identity
+// would be equal across exactly the event this one exists to distinguish.
+//
+// 🔴 THERE IS NO FALLBACK, AND THERE CANNOT BE ONE. This function used to test
+// crypto/rand.Read's error and degrade to the clock on failure. That branch was
+// DEAD CODE and the comment above it promised a behaviour the runtime does not
+// offer. Read at the toolchain this repo builds with (go1.25.13,
+// $GOROOT/src/crypto/rand/rand.go): "Read fills b with cryptographically secure
+// random bytes. It never returns an error, and always fills b entirely… and
+// crashes the program irrecoverably if an error is returned." The crash is
+// runtime.fatal via linkname, followed by panic("unreachable") — recover() cannot
+// catch it, and neither tier here nor flake.nix pins an older Go.
+//
+// So the honest statement of the failure mode, rather than a guard that cannot
+// fire: ON A MACHINE WHERE READING RANDOMNESS FAILS, THIS PROCESS DIES AT
+// PACKAGE INITIALISATION — before main(), before the slideshow, before the
+// control API. That is the runtime's decision and this program cannot soften it.
+// It is also a condition the Pi has never been observed in; it is stated so that
+// nobody re-adds an error check believing it buys resilience. A guard that cannot
+// fire is worse than none: it reads as coverage and stops anyone looking (the
+// same rule countdownFrom's comment states, for the same reason).
+func newBootID() string {
+	var b [8]byte
+	// The error is discarded because there is no error: see above. It is
+	// discarded EXPLICITLY, with `_`, rather than by a check that always passes.
+	_, _ = crand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
 
 // buildSettings returns the toolchain's VCS stamp, or nil when there is none
 // (ReadBuildInfo has no build info, or the build was made with -buildvcs=false).
@@ -845,8 +970,8 @@ func monitorGeometry(monitor *gdk.Monitor) (int, int) {
 // noteDisplayUnknown logs that the display geometry could not be read, at most
 // once per refusalLogInterval.
 //
-// It is coalesced through the same refusalLog the two admission points use,
-// because displaySize runs on every render and every relayout: a line per call
+// It is coalesced through the same refusalLog type the three admission points
+// use, because displaySize runs on every render and every relayout: a line per call
 // would be unbounded journald volume on a Raspberry Pi for a condition that is
 // one condition, not many.
 func (iv *ImageViewer) noteDisplayUnknown(reason string) {

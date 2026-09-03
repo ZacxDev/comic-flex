@@ -73,6 +73,35 @@ const (
 	intervalMax = 3600
 )
 
+// maxQueueKeys bounds POST /api/queue. An over-long list is refused with 400.
+//
+// 🔴 This is the same hazard maxQueuedMutations and maxConcurrentScans exist for,
+// arriving through a different door: an authenticated network client hands the Pi
+// a list of arbitrary length and the Pi holds every entry of it in memory until
+// the queue drains or is replaced. Unbounded, one request is unbounded residency.
+//
+// 500 is chosen against the product rather than against a round number: a
+// collection is a comic, and a long trade paperback is a couple of hundred pages,
+// so 500 leaves room for a double-length one and refuses "play the whole bucket"
+// (~7,500 objects). It is deliberately NOT equal to any fixture in the tests, so
+// a cap that quietly changed to a test's own list length could not pass unnoticed.
+const maxQueueKeys = 500
+
+// maxQueueBodyBytes is the body cap for POST /api/queue alone.
+//
+// 🔴 It is a SECOND cap and not a raise of maxBodyBytes, because the two protect
+// different things. maxBodyBytes exists so an endpoint whose whole body is
+// `{"seconds":30}` cannot be handed megabytes; widening it to fit a queue would
+// widen it for every one of those endpoints too. 500 keys of the longest key
+// shape the bucket actually holds ("CGC Comics 2022/Absolute Batman/img284.jpg"
+// is 43 bytes, and percent-safe keys with spaces and parentheses run longer) plus
+// JSON quoting and commas fits inside 128 KiB with room to spare, and 128 KiB is
+// nothing on a Pi that renders 4K pixbufs.
+//
+// A body over this cap is 413, not 400: it is refused by the decoder before any
+// of our validation runs, exactly as maxBodyBytes is on the other endpoints.
+const maxQueueBodyBytes = 128 << 10
+
 // Config configures a control Server.
 type Config struct {
 	// Addr to bind. Empty means DefaultAddr.
@@ -84,14 +113,43 @@ type Config struct {
 	Viewer Viewer
 	// Version is reported by GET /healthz.
 	Version string
+	// RefuseLog, when non-nil, is called with a one-line reason each time THIS
+	// PACKAGE decides a 503 on its own — today only the gallery-not-yet-indexed
+	// gate on POST /api/queue. Optional: a nil RefuseLog is a Server that refuses
+	// silently, which is what every test that does not care about logging gets.
+	//
+	// 🔴 IT EXISTS BECAUSE A SILENT REFUSAL IS UNOBSERVABLE ON A PI. The other
+	// two admission points are counted and logged by the viewer, coalesced
+	// through refusalLog — deliberately, because an operator needs journald
+	// evidence that the display said no. The indexing gate is decided HERE, and
+	// this package cannot reach the viewer's log: it imports no logger by design
+	// (see the header of viewer.go — the whole point is that it has no
+	// dependencies a GTK-less test cannot satisfy), and widening the Viewer port
+	// with a logging method would put a log line in the contract every future
+	// implementer has to satisfy. A callback keeps the decision here and the
+	// journald volume policy — coalescing included — with the one component that
+	// already owns it.
+	//
+	// The implementation MUST be safe to call from an HTTP handler goroutine and
+	// MUST NOT block: it runs before the response is written.
+	RefuseLog func(reason string)
 }
 
 // Server is the Pi-side control API.
 type Server struct {
-	token   string
-	viewer  Viewer
-	version string
-	http    *http.Server
+	token     string
+	viewer    Viewer
+	version   string
+	refuseLog func(reason string)
+	http      *http.Server
+}
+
+// noteRefusal reports a refusal this package decided on its own. It is a no-op
+// when no RefuseLog was configured.
+func (s *Server) noteRefusal(reason string) {
+	if s.refuseLog != nil {
+		s.refuseLog(reason)
+	}
 }
 
 // New builds a Server. It returns an error — and therefore no listener — when
@@ -108,9 +166,10 @@ func New(cfg Config) (*Server, error) {
 		addr = DefaultAddr
 	}
 	s := &Server{
-		token:   cfg.Token,
-		viewer:  cfg.Viewer,
-		version: cfg.Version,
+		token:     cfg.Token,
+		viewer:    cfg.Viewer,
+		version:   cfg.Version,
+		refuseLog: cfg.RefuseLog,
 	}
 	s.http = &http.Server{
 		Addr:              addr,
@@ -150,6 +209,8 @@ func (s *Server) routes() http.Handler {
 	api.HandleFunc("POST /api/viewmode", s.handleViewMode)
 	api.HandleFunc("POST /api/goto", s.handleGoto)
 	api.HandleFunc("POST /api/interval", s.handleInterval)
+	api.HandleFunc("POST /api/queue", s.handleQueue)
+	api.HandleFunc("POST /api/queue/cancel", s.handleQueueCancel)
 	api.HandleFunc("POST /api/rescan", s.handleRescan)
 
 	mux := http.NewServeMux()
@@ -207,8 +268,20 @@ func (s *Server) enqueue(w http.ResponseWriter, fn func()) {
 }
 
 // refuse is the ONE place a 503 is written, so the status, the Retry-After and
-// the JSON shape cannot drift between the two admission points (the GTK queue
-// cap and the concurrent-scan bound).
+// the JSON shape cannot drift between the THREE admission points:
+//
+//	the GTK command queue cap        — every mutation except POST /api/rescan
+//	the concurrent-scan bound        — POST /api/rescan
+//	the gallery-not-yet-indexed gate — POST /api/queue only, see handleQueue
+//
+// 🔴 COUNT THE BULLETS RATHER THAN TRUSTING A NUMBER IN PROSE. This paragraph
+// said "the two admission points" for a round after the third one was added in
+// this same file, 360 lines below — and the lockstep warning immediately beneath
+// is exactly what a maintainer enumerates 503 sites FROM before updating the
+// consumer. Anything that adds a fourth adds a bullet here.
+//
+// The Retry-After is a PARAMETER, not a constant, because the three clear on
+// different timescales; refuseAfter is where that is decided.
 //
 // 🔴 503 IS A CONTRACT CHANGE AND CONSUMERS MUST BE UPDATED IN LOCKSTEP.
 // Proposal §4.2 (clawgate #442, in the homelab-infra repo) says a mutation
@@ -218,7 +291,9 @@ func (s *Server) enqueue(w http.ResponseWriter, fn func()) {
 //
 // Before this runs on the Pi, BOTH of these must land in homelab-infra:
 //
-//   - §4.2 amended to document 503 + Retry-After on every mutation endpoint,
+//   - §4.2 amended to document 503 + Retry-After on every mutation endpoint —
+//     INCLUDING that POST /api/queue can answer it for a second reason (the
+//     gallery has not finished indexing) with a LONGER Retry-After,
 //   - the cluster-side caller taught that 503 means RETRY (honouring
 //     Retry-After), not FAILED.
 //
@@ -226,7 +301,34 @@ func (s *Server) enqueue(w http.ResponseWriter, fn func()) {
 // queued when nothing was queued is the same lie as accepting a body with a
 // discarded second JSON object, which decodeBody refuses two functions down.
 func refuse(w http.ResponseWriter, msg string) {
-	w.Header().Set("Retry-After", "1")
+	refuseAfter(w, retryAfterQueueFull, msg)
+}
+
+// Retry-After values, in seconds, one per admission point. They are separate
+// because the three clear on completely different timescales, and one number
+// calibrated for the fastest is wrong for the slowest in the expensive
+// direction.
+const (
+	// retryAfterQueueFull covers the GTK command queue and the concurrent-scan
+	// budget. Both drain as the main loop turns — milliseconds to a few seconds —
+	// so a one-second backoff is the right poll cadence.
+	retryAfterQueueFull = 1
+	// retryAfterIndexing covers the gallery-not-yet-indexed gate.
+	//
+	// 🔴 It is NOT 1, and the difference is the point. That gate clears when the
+	// first ListImages over S3 returns, which on a Pi against a bucket of ~7,500
+	// objects is SECONDS TO MINUTES — not milliseconds. A client honouring a
+	// Retry-After of 1 would hot-loop once per second for the whole first scan,
+	// against the very listing it is waiting for. 5 is a poll cadence, chosen to
+	// be cheap rather than to predict when the scan ends: nothing here knows that,
+	// and pretending to would be a worse lie than backing off a little too often.
+	retryAfterIndexing = 5
+)
+
+// refuseAfter is refuse with an explicit backoff. Every 503 in this package goes
+// through it; refuse is the common case with the default.
+func refuseAfter(w http.ResponseWriter, seconds int, msg string) {
+	w.Header().Set("Retry-After", strconv.Itoa(seconds))
 	writeJSON(w, http.StatusServiceUnavailable, errorBody{Error: msg})
 }
 
@@ -253,7 +355,19 @@ func notFound(w http.ResponseWriter, msg string) {
 //     would be accepted with the second object silently discarded — the caller
 //     would be told 202 for a value it never sent.
 func decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
-	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	return decodeBodyLimit(w, r, dst, maxBodyBytes)
+}
+
+// decodeBodyLimit is decodeBody with an explicit cap, for the one endpoint whose
+// body is a LIST rather than a scalar.
+//
+// 🔴 It is a parameter and not a second copy of the function. Both refusals
+// decodeBody documents — the size cap and the exactly-one-value rule — are what
+// the whole API's bodies rest on, and a queue-shaped duplicate of them is the
+// second call site that forgets the trailing-JSON check. One rule, one place;
+// only the number differs.
+func decodeBodyLimit(w http.ResponseWriter, r *http.Request, dst any, limit int64) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
 	dec := json.NewDecoder(r.Body)
 	if err := dec.Decode(dst); err != nil {
 		if errors.Is(err, io.EOF) {
@@ -262,7 +376,7 @@ func decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
 			writeJSON(w, http.StatusRequestEntityTooLarge, errorBody{
-				Error: "body larger than " + strconv.Itoa(maxBodyBytes) + " bytes",
+				Error: "body larger than " + strconv.FormatInt(limit, 10) + " bytes",
 			})
 			return false
 		}
@@ -333,8 +447,8 @@ func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
 // the paused flag AFTER the 202 and asserts the flip landed on the late value.
 //
 // 🔴 WHAT THE CALLER IS TOLD, and why it is not the resulting state. This
-// answers 202 {"accepted":true}, exactly like the other seven enqueued
-// mutations. The state the flip lands on is not knowable here without waiting
+// answers 202 {"accepted":true}, exactly like every other enqueued mutation
+// (grep `s.enqueue(` in this file — a number here has drifted twice already). The state the flip lands on is not knowable here without waiting
 // for the closure to run, and waiting is forbidden — the loop drains at up to
 // 30 s per image. Putting a predicted `"paused": !observed` in the body would be
 // the same lie as a 202 for work that was never queued: it is a guess made from
@@ -468,6 +582,154 @@ func (s *Server) handleInterval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.enqueue(w, func() { s.viewer.SetInterval(n) })
+}
+
+// handleQueue installs a play queue: an ordered list of object keys to show
+// before the shuffled gallery resumes.
+//
+// 🔴 IT IS AN ORDINARY ENQUEUED MUTATION, and that is deliberate rather than
+// incidental. It answers 202 through Server.enqueue like every other mutation
+// on this API except POST /api/rescan (grep `s.enqueue(`), which
+// means it can also answer 503 + Retry-After when the GTK loop is full, and the
+// cluster-side caller's existing pi.BusyError handling covers it with no second
+// convention to learn. Do NOT give it a bespoke "queued" reply: the queue is not
+// installed when this returns, exactly as a page turn has not happened when
+// POST /api/next returns.
+//
+// The three 400s, and why each is a refusal rather than a shrug:
+//
+//	empty list      — "play nothing" has no meaning, and the honest failure is to
+//	                  say so. It is also the shape a client bug produces (an empty
+//	                  collection, a filter that matched nothing), and answering
+//	                  202 would silently CLEAR a running queue on decision D7's
+//	                  replace rule — a destructive act from a request that meant
+//	                  nothing. There is deliberately no "cancel the queue" verb
+//	                  here; POST /api/goto ends a queue, because an explicit seek
+//	                  is the operator taking over.
+//	too long        — maxQueueKeys. An unbounded list from a network client is the
+//	                  hazard the admission caps exist for, arriving as one request.
+//	an empty key    — an empty string can never be in the gallery, so it would be
+//	                  counted as a SKIP and inflate the number a client shows the
+//	                  operator ("3 pages were no longer in the library" when one of
+//	                  the three was never a page). POST /api/goto rejects `{"key":""}`
+//	                  for the same reason; this is that rule applied per element.
+//
+// 🔴 The keys are NOT resolved here. handleGoto's 404 lookup exists because a
+// goto names ONE page and the caller can be told; a queue names many, decision D3
+// says a key that has left the gallery is skipped and counted rather than
+// refused, and a resolution taken on this goroutine would be stale by the time
+// the closure runs anyway. So there is no 404 on this endpoint at all, and a
+// queue whose every key has left the bucket is a legal 202 that reports
+// queue.skipped == len(keys) on the next GET /api/state.
+func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Keys []string `json:"keys"`
+	}
+	// The queue's own cap, not maxBodyBytes: this is the one body that is a list.
+	if !decodeBodyLimit(w, r, &body, maxQueueBodyBytes) {
+		return
+	}
+	if len(body.Keys) == 0 {
+		badRequest(w, `queue requires a non-empty "keys" array`)
+		return
+	}
+	if len(body.Keys) > maxQueueKeys {
+		badRequest(w, "queue holds at most "+strconv.Itoa(maxQueueKeys)+" keys; got "+
+			strconv.Itoa(len(body.Keys)))
+		return
+	}
+	for i, k := range body.Keys {
+		if k == "" {
+			badRequest(w, "queue key at position "+strconv.Itoa(i)+" is empty")
+			return
+		}
+	}
+
+	// 🔴 A QUEUE POSTED BEFORE THE FIRST SCAN LANDS IS CONSUMED IN FULL AND
+	// DISCARDED, so it is refused instead of accepted.
+	//
+	// `Scanning && Total == 0` is the Pi's state at every boot until the first
+	// ListImages returns — the state the whole `scanning` field exists to make
+	// visible. A queue installed then finds NOTHING in the gallery, decision D3
+	// skips every key, and the display never leaves the page it was on. The
+	// caller got a 202. That is exactly the "telling the caller its page turn is
+	// queued when nothing was queued" lie the 503 convention exists to avoid, and
+	// the only trace left behind would be `skipped == the length it sent`, which
+	// is indistinguishable from a genuinely stale collection.
+	//
+	// 503 + Retry-After, not 400 or 404, because RETRYING IS THE CORRECT
+	// RESPONSE: the scan is seconds away and the same request will then work. It
+	// reuses the backpressure convention the cluster-side caller already handles
+	// (pi.BusyError) rather than inventing a second one for a second reason —
+	// which is the same argument that made the GTK queue cap answer 503.
+	//
+	// ⚠ SCOPE, stated because it is narrower than it looks. This is a
+	// best-effort admission taken on the handler goroutine, exactly like
+	// handleGoto's 404 lookup: the scan can finish between this read and the
+	// closure running, in which case the queue installs and plays normally. It
+	// does NOT cover a genuinely EMPTY bucket (`!Scanning && Total == 0`), and
+	// deliberately: retrying that would never help, so the honest answer there is
+	// the 202 with `skipped == length`, now attributable through queue.id.
+	//
+	// It is REPORTED as well as refused. The other two admission points are
+	// counted and logged by the viewer; this one is decided here, so without
+	// s.noteRefusal an operator whose "play collection" was turned down through
+	// the whole first bucket listing would have zero journald evidence that the
+	// Pi said anything at all. See Config.RefuseLog.
+	//
+	// The Retry-After is retryAfterIndexing, NOT the queue-full default: this
+	// clears when a listing over S3 returns, not when the main loop turns.
+	if snap := s.viewer.Snapshot(); snap.Scanning && snap.Total == 0 {
+		s.noteRefusal("queue refused: the gallery has not finished its first scan")
+		refuseAfter(w, retryAfterIndexing, "the gallery has not finished indexing, so every "+
+			"queued key would be skipped; retry shortly")
+		return
+	}
+
+	keys := body.Keys
+	s.enqueue(w, func() { s.viewer.SetQueue(keys) })
+}
+
+// handleQueueCancel ends a running play queue and puts the gallery back where
+// the queue interrupted it.
+//
+// 🔴 IT IS A DIFFERENT OPERATION FROM POST /api/goto, WHICH IS WHY IT EXISTS.
+// Goto already ends a queue — but as a SEEK, discarding the D4 interruption
+// point, so "stop this collection" and "go to page N" were the same request and
+// an operator who wanted the first got the second. Before this endpoint there was
+// no way to abort a queue without also moving the display somewhere new: with
+// `{"keys":[]}` a 400 and the Prev-floor holding at the front, a 500-key queue at
+// slide_interval 3600 held the display for 500 hours with no clean exit. That is
+// the gap this closes.
+//
+// 🔴 POST, NOT DELETE, and not a flag on POST /api/queue. Three reasons, in
+// order of weight:
+//
+//   - Every mutation on this API is a POST and every read is a GET;
+//     TestEndpointTable asserts that as "method discipline" and drives GET
+//     against a mutation expecting 405. A DELETE would be the only verb of its
+//     kind on the surface and would falsify that claim — the enumeration hazard
+//     this file has already been bitten by three times.
+//   - `POST /api/queue` with an empty list stays a 400. Overloading "here are
+//     zero keys" with "and also stop what you are doing" is a wire-contract
+//     footgun: a client bug that filters a collection down to nothing would
+//     silently cancel instead of failing loudly. Explicitly rejected.
+//   - A distinct path is greppable. "Which routes cancel things" has an answer.
+//
+// It takes NO BODY, so there is nothing to validate and no 400 it can produce.
+// The only refusal it has is the GTK queue cap's 503 + Retry-After, through
+// Server.enqueue like every other mutation except POST /api/rescan.
+//
+// 🔴 It is deliberately NOT subject to the gallery-not-yet-indexed gate that
+// POST /api/queue carries. That gate exists because a queue installed against an
+// empty gallery is consumed and discarded; there is nothing for a CANCEL to be
+// consumed against, and refusing "stop" because the Pi is busy scanning would be
+// asking the operator to wait to be allowed to stop.
+//
+// A cancel with no queue running is a NO-OP 202: see Viewer.CancelQueue for why
+// that is not an error, and why it must not move the display either.
+func (s *Server) handleQueueCancel(w http.ResponseWriter, r *http.Request) {
+	s.enqueue(w, s.viewer.CancelQueue)
 }
 
 // handleRescan starts a bucket listing. It is the ONE mutation endpoint that

@@ -85,10 +85,16 @@ func ParseViewMode(s string) (ViewMode, bool) {
 //
 // TestTheEmptiedGalleryStatesAreReachableAndDistinct pins the two Total == 0
 // states apart, so neither can quietly stop being reachable.
-// 🔴 Keys and SecondsUntilNext are the two fields the companion PWA reads, and
-// each answers a question the client provably CANNOT answer for itself. Both are
-// filled from the SAME lock acquisition as every field above them, so they never
-// describe a state the viewer was not in.
+// 🔴 Keys, SecondsUntilNext and Queue each answer a question the companion PWA
+// provably CANNOT answer for itself, and all three are filled from the SAME lock
+// acquisition as every field above them, so they never describe a state the
+// viewer was not in. This sentence said "the two fields the companion PWA reads"
+// until the play queue made it wrong; do not write a count here — the set is the
+// struct, and the struct is directly below.
+//
+// BootID is the exception to the lock clause and is called out rather than
+// folded in: it is a property of the PROCESS, filled by the adapter and constant
+// for its lifetime, so there is no viewer state for it to be consistent with.
 //
 // Keys — every object key CURRENTLY ON THE DISPLAY, left to right.
 //
@@ -174,16 +180,126 @@ func ParseViewMode(s string) (ViewMode, bool) {
 //	browser on a phone with its own clock, and a duration is immune to skew
 //	between the Pi, the pod and the handset. The client decrements locally
 //	between polls and re-syncs on each one.
+//
+// Queue — the play queue's depth and position; see QueueState.
+//
+// BootID — an opaque identity for THIS RUN of the process, generated at startup
+//
+//	and constant for the lifetime of the process. It is not a version, not a
+//	hostname and not ordered: a client may only compare it for equality.
+//
+//	🔴 It exists because Queue.ID is a per-process counter and is therefore
+//	REUSED after a restart. A client that dedupes a "3 pages were no longer in
+//	the library" notification on Queue.ID alone suppresses a real one after the
+//	Pi reboots; the key it must use is the PAIR (BootID, Queue.ID). Everything
+//	else on this struct is a fact about the slideshow, so a reader looking for
+//	"has the Pi restarted?" would otherwise find nothing here at all.
+//
+//	It is also decision D2 made checkable rather than asserted: the queue does
+//	not survive a restart, and a changed BootID is how a client learns that the
+//	collection it was watching is gone rather than merely finished.
+//
+//	Never empty on a Pi that has this field. Absent — like `queue` — identifies a
+//	Pi that predates it.
 type Snapshot struct {
-	Total            int      `json:"total"`
-	Index            int      `json:"index"`
-	Key              string   `json:"key"`
-	Keys             []string `json:"keys"`
-	ViewMode         string   `json:"view_mode"`
-	Paused           bool     `json:"paused"`
-	SlideInterval    int      `json:"slide_interval"`
-	Scanning         bool     `json:"scanning"`
-	SecondsUntilNext int      `json:"seconds_until_next"`
+	Total            int        `json:"total"`
+	Index            int        `json:"index"`
+	Key              string     `json:"key"`
+	Keys             []string   `json:"keys"`
+	ViewMode         string     `json:"view_mode"`
+	Paused           bool       `json:"paused"`
+	SlideInterval    int        `json:"slide_interval"`
+	Scanning         bool       `json:"scanning"`
+	SecondsUntilNext int        `json:"seconds_until_next"`
+	Queue            QueueState `json:"queue"`
+	BootID           string     `json:"boot_id"`
+}
+
+// QueueState is the play queue's depth and position, reported by GET /api/state
+// under the key "queue".
+//
+// 🔴 THE OBJECT IS ALWAYS PRESENT, AND ITS ABSENCE IS THE VERSION SIGNAL. A Pi
+// that predates the play queue omits "queue" from the state object entirely; a
+// Pi that has one always emits the object, zero-valued when nothing is queued.
+// So `"queue" in state` answers "does this Pi support a play queue at all" and
+// `state.queue.length == 0` answers "is one running" — two different questions
+// that a single nullable integer would have collapsed into one. That collapse is
+// not hypothetical: seconds_until_next has a legitimate 0 (paused, or no timer
+// armed), and a consumer that read an ABSENT seconds_until_next as 0 would have
+// rendered "stopped" forever against an older Pi.
+//
+// 🔴 It is a VALUE and not a pointer, deliberately. encoding/json's omitempty is
+// inert on a struct value — structs are not among the values it treats as empty
+// — so the absent-vs-empty collapse cannot be reintroduced by the one-character
+// edit that would reintroduce it on a *QueueState or on a bare int field. That
+// is measured rather than assumed: TestQueueIsAlwaysPresentInTheStateObject
+// drives a zero-valued queue through the real handler and reads the raw bytes.
+type QueueState struct {
+	// ID identifies WHICH queue the remaining fields of this struct describe. It is a
+	// per-process generation: 0 before any queue has been installed, and
+	// incremented by every POST /api/queue.
+	//
+	// 🔴 IT IS UNIQUE WITHIN ONE RUN OF THE PROCESS AND NOWHERE WIDER. A Pi that
+	// restarts counts from 0 again, so ids ARE reused across boots — which is why
+	// the pair a client must dedupe on is (BootID, Queue.ID) and never Queue.ID
+	// alone. This paragraph claimed "never reused" for a round, three lines above
+	// stating the restart behaviour that falsifies it, and the failure that
+	// contradiction ships is concrete: Pi reports {id:3, skipped:2}, the client
+	// records "handled 3", the Pi restarts, three new collections are queued, the
+	// Pi reports {id:3, skipped:1} — and the client suppresses a real
+	// notification. Snapshot.BootID exists to close exactly that.
+	//
+	// 🔴 IT IS WHAT MAKES Skipped ACTIONABLE, and without it that field cannot be
+	// rendered correctly at all. Skipped outlives the queue that produced it (see
+	// below), so a drained queue reports `{"id":7,"length":0,"skipped":2}` — and
+	// goes on reporting it through fifty unrelated page turns. A polling client
+	// with no identity to hang that on cannot tell "the collection that just
+	// finished skipped 2 pages" from "some queue an hour ago skipped 2", so it
+	// either shows the toast on every poll forever or never shows it. With an id
+	// it shows it once, for that queue.
+	//
+	// The client learns its own queue's id by polling after its 202: the id it
+	// sees increase is the one its POST installed. That is a guess in the
+	// presence of a second client, and deliberately so — an endpoint that
+	// returned the id would have to allocate it on the handler goroutine, before
+	// the closure that installs the queue has run, and a caller told "your queue
+	// is #8" for a queue a later POST replaced before it was ever installed is a
+	// worse lie than an ambiguity between two operators of one television.
+	ID int `json:"id"`
+	// Length is how many keys the running queue holds — including ones already
+	// played and ones that turn out to have left the gallery. 0 means no queue
+	// is running, which is also the state a queue returns to when it drains.
+	Length int `json:"length"`
+	// Position is the 1-BASED position of the queued key currently selected.
+	// 0 means no queued key is selected: either because Length is 0, or in the
+	// instant between a queue being installed and the first page turn into it.
+	//
+	// 🔴 One-based so that 0 can mean "none" without a -1 sentinel. A consumer
+	// renders "page 3 of 12" straight from Position and Length.
+	//
+	// In the two-up view it names the LEFT-hand entry, and the queue consumes TWO
+	// entries per page turn there — so Position advances by two, and a client must
+	// not assume consecutive polls differ by one.
+	Position int `json:"position"`
+	// Skipped counts queued keys passed over because they were no longer in the
+	// gallery when the queue reached them (decision D3). It is what lets a client
+	// say "3 pages were no longer in the library" rather than silently playing 12
+	// pages of a 15-page collection.
+	//
+	// 🔴 IT OUTLIVES THE QUEUE, and that is the point. A queue that drains sets
+	// Length back to 0, so a count cleared at the same moment could only ever be
+	// read by a client that happened to poll mid-queue — i.e. never, for the
+	// message it exists to make possible. It is reset by the next POST /api/queue
+	// and by nothing else. READ IT WITH ID: on its own it is unattributable, and
+	// a client that renders it without checking which queue it belongs to shows a
+	// stale toast forever.
+	//
+	// It counts each queued key AT MOST ONCE for the life of one queue, including
+	// across a mid-queue rescan: a page that was played and then left the bucket
+	// is not counted when a later pass finds it gone. Otherwise the number would
+	// measure how often the Pi re-listed the bucket rather than how many pages the
+	// operator cannot see.
+	Skipped int `json:"skipped"`
 }
 
 // MarshalJSON renders a Snapshot with Keys guaranteed to be an ARRAY.
@@ -311,6 +427,61 @@ type Viewer interface {
 	// It is an R1 write, so it runs inside an Enqueue closure — which is what
 	// makes arming a GLib source from it legal.
 	SetInterval(seconds int)
+	// SetQueue REPLACES the play queue with keys and selects the first of them
+	// that is still in the gallery.
+	//
+	// Decision D7: the newest instruction wins. It does not append to a running
+	// queue and it does not refuse one — that is the simplest state machine on
+	// the Pi, and "play this collection" from a phone means the collection the
+	// operator just tapped.
+	//
+	// What the implementation owes, beyond storing the list:
+	//
+	//   - A key that is no longer in the gallery is SKIPPED as the queue reaches
+	//     it, and counted into Snapshot.Queue.Skipped (decision D3). Skipping in
+	//     silence is the failure that decision exists to prevent: a 40-page
+	//     collection plays 12 and nobody knows why.
+	//   - When the queue drains, the gallery resumes AT THE POSITION THE QUEUE
+	//     INTERRUPTED (decision D4). The queue is an interruption, not a seek:
+	//     the page turn that drains it lands where the gallery would have been
+	//     had the queue never run, NOT wherever the last queued key happens to
+	//     sit in the shuffle.
+	//   - It is TRANSIENT (decision D2). Nothing persists it and a restarted Pi
+	//     comes back with no queue. Do not add persistence.
+	//
+	// 🔴 The LENGTH BOUND IS THE HANDLER'S, not the implementation's:
+	// handleQueue rejects an empty list, a list longer than maxQueueKeys and a
+	// list containing an empty key, all with 400, before anything is enqueued.
+	// An implementation must still not assume it — but it is not the guard, and
+	// duplicating the bound here would be the second copy that gets it wrong.
+	//
+	// It is an R1 write: called ONLY from inside an Enqueue closure, on the GTK
+	// thread, and it may render.
+	SetQueue(keys []string)
+
+	// CancelQueue ends any running play queue AND returns the gallery to the page
+	// the queue interrupted — the same decision-D4 resume the draining page turn
+	// performs, through the same code.
+	//
+	// 🔴 THE RESTORE IS THE WHOLE POINT, and it is what makes this a different
+	// operation from POST /api/goto. Goto already ends a queue, but as a SEEK: it
+	// puts the display somewhere NEW and discards the interruption point, so an
+	// operator who only wanted to stop the collection ends up on a page they did
+	// not choose with no way back to where the slideshow was. Cancel is the
+	// inverse — it undoes the interruption instead of adding a second one.
+	//
+	// 🔴 CANCEL WITH NO QUEUE RUNNING IS A NO-OP, NOT AN ERROR, and the
+	// implementation must not move the display in that case. The queue can drain
+	// between a UI rendering its cancel button and the operator tapping it, so
+	// the request that arrives second describes a state the Pi is already in. A
+	// client told 4xx for having achieved the desired outcome would show a
+	// spurious failure; a client whose cancel re-seeked the gallery would see the
+	// display jump for no reason. Both are worse than doing nothing.
+	//
+	// It is an R1 write: called ONLY from inside an Enqueue closure, and it may
+	// render.
+	CancelQueue()
+
 	// Rescan starts a bucket listing in the background and reports whether one
 	// was STARTED. It reports false, having started nothing, when the
 	// implementation already has as many scans outstanding as it allows, and

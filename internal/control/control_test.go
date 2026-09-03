@@ -95,6 +95,32 @@ func TestEndpointTable(t *testing.T) {
 		{"interval negative", "POST", "/api/interval", `{"seconds":-30}`, http.StatusBadRequest, false},
 		{"interval absent field", "POST", "/api/interval", `{}`, http.StatusBadRequest, false},
 
+		// The play queue. The 202 rows deliberately include a key that is NOT in
+		// the gallery: decision D3 says such a key is skipped and counted at play
+		// time, so unlike goto there is no 404 on this endpoint at all.
+		{"queue one key", "POST", "/api/queue", `{"keys":["b/2.jpg"]}`, http.StatusAccepted, false},
+		{"queue several keys", "POST", "/api/queue", `{"keys":["c/3.jpg","a/1.jpg","b/2.jpg"]}`, http.StatusAccepted, false},
+		{"queue a key not in the gallery", "POST", "/api/queue", `{"keys":["gone/9.jpg"]}`, http.StatusAccepted, false},
+		{"queue empty list", "POST", "/api/queue", `{"keys":[]}`, http.StatusBadRequest, false},
+		{"queue absent field", "POST", "/api/queue", `{}`, http.StatusBadRequest, false},
+		{"queue null list", "POST", "/api/queue", `{"keys":null}`, http.StatusBadRequest, false},
+		{"queue containing an empty key", "POST", "/api/queue", `{"keys":["a/1.jpg","","b/2.jpg"]}`, http.StatusBadRequest, false},
+		{"queue malformed json", "POST", "/api/queue", `{"keys":[`, http.StatusBadRequest, false},
+		{"queue wrong element type", "POST", "/api/queue", `{"keys":[7]}`, http.StatusBadRequest, false},
+
+		// Cancel. It takes no body, so there is no 400 it can produce, and a
+		// cancel with no queue running is a no-op 202 rather than an error — the
+		// fake here has never been given a queue at all, which IS that case.
+		{"queue cancel", "POST", "/api/queue/cancel", "", http.StatusAccepted, false},
+		{"queue cancel with no queue running", "POST", "/api/queue/cancel", "", http.StatusAccepted, false},
+		{"queue cancel via GET", "GET", "/api/queue/cancel", "", http.StatusMethodNotAllowed, true},
+		// 🔴 The two paths must not shadow each other. `POST /api/queue` has no
+		// trailing slash, so net/http's mux treats it as an exact pattern and
+		// /api/queue/cancel is a separate route — but a maintainer who "tidied"
+		// either into a subtree pattern would silently route cancels into
+		// handleQueue, where a bodyless request is a 400.
+		{"queue is not a subtree", "POST", "/api/queue/bogus", "", http.StatusNotFound, true},
+
 		// Method discipline: mutations are POST-only, reads are GET-only.
 		{"next via GET", "GET", "/api/next", "", http.StatusMethodNotAllowed, true},
 		{"toggle via GET", "GET", "/api/toggle", "", http.StatusMethodNotAllowed, true},
@@ -142,6 +168,12 @@ func TestMutationsAccept202WithoutRunningTheWork(t *testing.T) {
 		{"goto key", "/api/goto", `{"key":"c/3.jpg"}`, "GotoKey:c/3.jpg@2"},
 		{"goto index", "/api/goto", `{"index":1}`, "GotoIndex:1"},
 		{"interval", "/api/interval", `{"seconds":45}`, "SetInterval:45"},
+		// The keys arrive in the order they were sent, unchanged. A queue whose
+		// order the transport reshuffled would play a collection out of sequence,
+		// which is exactly what the ORDER in a collection is for.
+		{"queue", "/api/queue", `{"keys":["c/3.jpg","a/1.jpg","b/2.jpg"]}`,
+			"SetQueue:c/3.jpg,a/1.jpg,b/2.jpg"},
+		{"queue cancel", "/api/queue/cancel", "", "CancelQueue"},
 		// POST /api/rescan is deliberately NOT here: it is not an enqueued
 		// mutation. TestRescanStartsTheListingWithoutEnqueueingIt covers it, and
 		// TestEveryAcceptedMutationIsCoveredByOneAdmissionTest asserts the two
@@ -246,6 +278,12 @@ func TestStateJSONShape(t *testing.T) {
 		SlideInterval:    37,
 		Scanning:         false,
 		SecondsUntilNext: 19,
+		// Pairwise distinct, distinct from every other field above, and distinct
+		// from maxQueueKeys — so a mutant that crossed two of the three, or
+		// hardcoded a constant the package names, cannot land on the right answer
+		// by accident of the fixture.
+		Queue:  QueueState{ID: 7, Length: 12, Position: 5, Skipped: 3},
+		BootID: "9f3c1ab0deadbe17",
 	}
 	s := newTestServer(t, f)
 
@@ -267,6 +305,15 @@ func TestStateJSONShape(t *testing.T) {
 		"slide_interval":     float64(37),
 		"scanning":           false,
 		"seconds_until_next": float64(19),
+		// Deliberately a value no other field could produce, so a mutant that
+		// crossed boot_id with key, version or a queue field cannot pass.
+		"boot_id": "9f3c1ab0deadbe17",
+		"queue": map[string]any{
+			"id":       float64(7),
+			"length":   float64(12),
+			"position": float64(5),
+			"skipped":  float64(3),
+		},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("state body = %#v\nwant %#v", got, want)
@@ -492,6 +539,8 @@ func TestBadRequestsEnqueueNothing(t *testing.T) {
 		{"interval out of range", "/api/interval", `{"seconds":99999}`},
 		{"goto neither", "/api/goto", `{}`},
 		{"malformed json", "/api/interval", `{"seconds":`},
+		{"queue empty list", "/api/queue", `{"keys":[]}`},
+		{"queue with an empty key", "/api/queue", `{"keys":["a/1.jpg",""]}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

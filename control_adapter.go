@@ -129,6 +129,16 @@ func (g gtkViewer) Snapshot() control.Snapshot {
 		SlideInterval:    int(s.slideInterval),
 		Scanning:         s.scanning,
 		SecondsUntilNext: s.secondsUntilNext,
+		Queue: control.QueueState{
+			ID:       s.queueID,
+			Length:   s.queueLength,
+			Position: s.queuePosition,
+			Skipped:  s.queueSkipped,
+		},
+		// Not from the snapshot: it is a property of the PROCESS, not of the
+		// viewer, and it cannot change while the process runs. Reading it through
+		// the viewer's lock would imply it can.
+		BootID: bootID,
 	}
 }
 
@@ -178,6 +188,52 @@ func (g gtkViewer) GotoKey(key string) {
 
 func (g gtkViewer) GotoIndex(index int) {
 	if g.iv.gotoIndex(index) {
+		g.iv.updateImage()
+	}
+}
+
+// SetQueue installs a play queue and turns to its first playable page.
+//
+// 🔴 IT ADVANCES IMMEDIATELY, and that is the decision rather than an accident of
+// reuse. Storing the list alone would leave the display on whatever it was
+// showing until the slide timer next fired — up to slide_interval away, which
+// POST /api/interval allows to be 3600 — so an operator who tapped "play
+// collection" would watch the wrong comic for an hour and reasonably conclude the
+// button is broken. POST /api/goto moves the display now for the same reason.
+//
+// It goes through iv.advance, not through a bespoke "show queue[0]" path, because
+// advance is where the queue's skip rule and its drain rule live. A queue whose
+// every key has left the gallery therefore drains on this very call, lands back
+// on the interrupted position, and reports its skip count on the next
+// GET /api/state — which is decision D3 working, not an error.
+//
+// It is an R1 write: it runs inside an Enqueue closure on the GTK main loop, so
+// the updateImage below is legal. 🔴 Do NOT follow Rescan here; Rescan is the
+// documented exception that runs on the HTTP handler goroutine and must not
+// render. The shape below is Next/Prev's, and that is the correct neighbour.
+func (g gtkViewer) SetQueue(keys []string) {
+	g.iv.setQueue(keys)
+	if g.iv.advance(g.iv.stepSize()) {
+		g.iv.updateImage()
+	}
+}
+
+// CancelQueue ends a running play queue and puts the display back on the page the
+// queue interrupted.
+//
+// 🔴 THE RENDER IS CONDITIONAL, and that is the no-op contract rather than an
+// optimisation. cancelQueue reports false when no queue was running, and a cancel
+// that rendered anyway would burn an S3 GET — up to 30 s of held main loop — to
+// put the same frame back on the glass, for a request that arrived after the
+// queue had already drained. That is the ordinary case for a UI whose cancel
+// button cannot see the drain: it must cost nothing.
+//
+// It is an R1 write: it runs inside an Enqueue closure on the GTK main loop, so
+// the updateImage below is legal. The shape is Next/Prev's; 🔴 do NOT follow
+// Rescan, which is the documented exception that runs on the HTTP handler
+// goroutine and must not render.
+func (g gtkViewer) CancelQueue() {
+	if g.iv.cancelQueue() {
 		g.iv.updateImage()
 	}
 }
@@ -272,14 +328,20 @@ func (g gtkViewer) SetInterval(seconds int) {
 		// nobody left to return an error to, and refusing means GET /api/state does
 		// not change either.
 		//
-		// It matches the two "<noun> refused:" log sites in the program —
-		// enqueueBounded's "mutation refused" and scanImagesAsyncVia's. 🔴 Those
-		// are the only two. An earlier version of this comment said "every other
-		// refusal in this program says so" and listed handleRescan as a third:
-		// FALSE, and falsifiable by grep — internal/control does not import log at
-		// all, and handleRescan refuses over HTTP via refuse(w, …). The refusal a
-		// caller sees from handleRescan IS scanImagesAsyncVia's, so the old list
-		// named one mechanism twice and one that does not exist.
+		// It matches the "<noun> refused:" log convention the rest of the program
+		// uses. 🔴 DO NOT WRITE A COUNT HERE. This comment has now been wrong
+		// about the size of that set TWICE, in opposite directions: it once
+		// claimed handleRescan was a third site (it is not — internal/control
+		// imports no logger and refuses over HTTP via refuse(w, …), so the line a
+		// caller's refusal produces is scanImagesAsyncVia's), and the correction
+		// then pinned "the only two" — which the queue work falsified by adding a
+		// fourth. **`command grep -rn 'refused: ' --include=*.go .`** is the
+		// enumeration; it is one command and it cannot go stale.
+		//
+		// What is durably true, and is the reason to match the convention at all:
+		// every site names the noun that was refused, so an operator grepping
+		// journald for "refused:" gets all of them and can tell which admission
+		// point spoke. That property does not depend on how many there are.
 		//
 		// Uncoalesced, because handleInterval rejects anything outside 1..3600
 		// before enqueueing and no other caller of SetInterval exists, so this
@@ -358,6 +420,15 @@ func startControlAPI(iv *ImageViewer, addr string) *control.Server {
 		Token:   os.Getenv(control.TokenEnvVar),
 		Viewer:  gtkViewer{iv: iv},
 		Version: version,
+		// The control package decides one 503 on its own — the
+		// gallery-not-yet-indexed gate on POST /api/queue — and has no logger by
+		// design. Without this, an operator turned down for the whole first bucket
+		// listing gets no journald evidence at all, while the other two admission
+		// points log theirs. Coalesced HERE, through the same refusalLog type and
+		// the same interval, because journald volume policy belongs with the
+		// process that owns the journal and a client that retries on the
+		// Retry-After will drive this once every few seconds until the scan lands.
+		RefuseLog: iv.noteAdmissionRefusal,
 	})
 	if err != nil {
 		log.Printf("CONTROL API DISABLED (fail-closed): %v", err)

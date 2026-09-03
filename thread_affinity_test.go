@@ -227,6 +227,19 @@ func TestNothingOffTheGTKThreadCanReachAWidget(t *testing.T) {
 	// Rescan would mean nothing.
 	for _, must := range []string{
 		"gtkViewer.Next", "gtkViewer.Prev", "gtkViewer.GotoKey", "gtkViewer.GotoIndex",
+		// SetQueue is here for the positive control's sake AND as a structural
+		// second guard on it: installing a play queue turns to its first page
+		// immediately, so it renders, so it must reach a widget. A SetQueue that
+		// stopped rendering — the mutation that makes the endpoint look like it did
+		// nothing for up to an hour — fails here as well as in
+		// TestAdapterSetQueueTurnsToTheFirstPlayableKeyImmediately.
+		"gtkViewer.SetQueue",
+		// CancelQueue for the same pair of reasons: it restores the interrupted
+		// page and must render to do it, so a CancelQueue that stopped rendering —
+		// leaving the cancelled collection on the glass until the slide timer
+		// fires — fails here as well as in
+		// TestAdapterCancelQueueRendersOnlyWhenSomethingChanged.
+		"gtkViewer.CancelQueue",
 		"gtkViewer.SetViewMode", "ImageViewer.updateImage", "ImageViewer.updateSingleImage",
 	} {
 		if _, ok := g.funcs[must]; !ok {
