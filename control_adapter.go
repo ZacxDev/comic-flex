@@ -135,6 +135,10 @@ func (g gtkViewer) Snapshot() control.Snapshot {
 			Position: s.queuePosition,
 			Skipped:  s.queueSkipped,
 		},
+		// Not from the snapshot: it is a property of the PROCESS, not of the
+		// viewer, and it cannot change while the process runs. Reading it through
+		// the viewer's lock would imply it can.
+		BootID: bootID,
 	}
 }
 
@@ -390,6 +394,15 @@ func startControlAPI(iv *ImageViewer, addr string) *control.Server {
 		Token:   os.Getenv(control.TokenEnvVar),
 		Viewer:  gtkViewer{iv: iv},
 		Version: version,
+		// The control package decides one 503 on its own — the
+		// gallery-not-yet-indexed gate on POST /api/queue — and has no logger by
+		// design. Without this, an operator turned down for the whole first bucket
+		// listing gets no journald evidence at all, while the other two admission
+		// points log theirs. Coalesced HERE, through the same refusalLog type and
+		// the same interval, because journald volume policy belongs with the
+		// process that owns the journal and a client that retries on the
+		// Retry-After will drive this once every few seconds until the scan lands.
+		RefuseLog: iv.noteAdmissionRefusal,
 	})
 	if err != nil {
 		log.Printf("CONTROL API DISABLED (fail-closed): %v", err)

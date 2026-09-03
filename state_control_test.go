@@ -347,6 +347,11 @@ func TestAdapterSnapshotMapsEveryField(t *testing.T) {
 		// No timer is armed on a struct-literal viewer, so there is no scheduled
 		// advance to count down to.
 		SecondsUntilNext: 0,
+		// The package variable, not a literal: boot_id identifies the RUN, so the
+		// only correct expectation is the one this process generated. Asserting a
+		// literal here would either never match or pin a value the generator is
+		// free to change.
+		BootID: bootID,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("adapter Snapshot = %+v, want %+v", got, want)

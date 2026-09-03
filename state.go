@@ -126,6 +126,11 @@ func (iv *ImageViewer) currentKey() (idx int, key string, ok bool) {
 	// Normalise locally rather than writing currentIndex back: this runs under
 	// the READ lock, so mutating shared state here would be a data race.
 	i := wrapIndex(iv.currentIndex, 0, len(iv.images))
+	// While a queue is running the selection is the QUEUED PAGE, re-resolved by
+	// key. See queueLeftLocked.
+	if idx, ok := iv.queueLeftLocked(); ok {
+		i = idx
+	}
 	return i, iv.images[i], true
 }
 
@@ -142,28 +147,45 @@ func (iv *ImageViewer) pairKeys() (leftIdx int, left string, rightIdx int, right
 	}
 	// Normalise locally, not by writing back: this runs under the READ lock.
 	l := wrapIndex(iv.currentIndex, 0, n)
-	r := wrapIndex(l, 1, n)
 
-	// 🔴 WHILE A QUEUE IS RUNNING THE RIGHT HALF COMES FROM THE QUEUE, NOT FROM
-	// THE GALLERY. Taking images[l+1] here was measured to break the queue's one
-	// job: with the gallery a,b,c,d,e and the queue [e,c,a], a two-up run showed
-	// `LEFT e RIGHT a` on the first turn — playing the operator's THIRD queued
-	// page two turns early — and `LEFT c RIGHT d` on the second, where d was
-	// never queued at all. Ordering is the entire point of a queue, so half a
-	// screen of gallery neighbours is not a cosmetic wart.
+	// 🔴 WHILE A QUEUE IS RUNNING **BOTH** HALVES COME FROM THE QUEUE, NOT FROM
+	// THE GALLERY, and each is resolved BY KEY. Taking images[l+1] for the right
+	// half was measured to break the queue's one job: with the gallery a,b,c,d,e
+	// and the queue [e,c,a], a two-up run showed `LEFT e RIGHT a` on the first
+	// turn — playing the operator's THIRD queued page two turns early — and
+	// `LEFT c RIGHT d` on the second, where d was never queued at all. Ordering
+	// is the entire point of a queue, so half a screen of gallery neighbours is
+	// not a cosmetic wart.
+	//
+	// The LEFT half goes through queueLeftLocked for the same reason the right
+	// one is resolved by key: a rescan reshuffles the gallery, and an index
+	// recorded before it names a different comic afterwards. Fixing only the
+	// right half left `LEFT d/4 RIGHT c/3` reachable — d/4 never queued — with
+	// /api/state's `key` naming it while queue.position named another page.
 	//
 	// queueTailIndex is the entry the page turn decided shares the screen with
 	// the cursor; it is chosen in landQueueLocked, under the write lock, at the
 	// same moment the cursor moves. It is NOT recomputed here: this is a read
 	// path, and a right half derived independently of the one the advance planned
 	// is two answers to one question — the shape Snapshot.Keys exists to remove.
-	//
+	if idx, ok := iv.queueLeftLocked(); ok {
+		l = idx
+	}
+	r := wrapIndex(l, 1, n)
+
 	// tail == cursor (an odd-length queue's last page, or any single view) leaves
 	// r == l, which displayedPair collapses to one key exactly as it does for a
-	// one-image gallery. A tail whose key has left the gallery between the page
-	// turn and this render collapses the same way rather than falling back to a
-	// gallery neighbour: showing nothing extra is honest, showing an unqueued
-	// comic is the defect above.
+	// one-image gallery.
+	//
+	// 🔴 THE `r = l` INITIALISER IS THE LOAD-BEARING LINE, not the assignment
+	// below it. It covers the tail whose key has LEFT THE GALLERY between the page
+	// turn and this render — a rescan lands and onScanComplete renders straight
+	// after it — and without it that case falls back to the gallery neighbour,
+	// reinstating the exact defect this block exists to remove. The odd-length
+	// case cannot cover it: there tail == cursor, so the found-branch always
+	// assigns and the initialiser is never read. Only a VANISHED tail exercises
+	// it, and deleting this line survived a green 461-test suite until
+	// TestATwoUpTailThatLeftTheGalleryCollapsesRatherThanShowingANeighbour existed.
 	if len(iv.queue) > 0 && iv.queueTailIndex >= 0 && iv.queueTailIndex < len(iv.queue) {
 		r = l
 		if idx, found := iv.indexOfKeyLocked(iv.queue[iv.queueTailIndex]); found {
@@ -357,6 +379,29 @@ func (r *refusalLog) note(now time.Time) (total int, since time.Duration, report
 	r.last = now
 	total, r.suppressed = r.suppressed, 0
 	return total, since, true
+}
+
+// noteAdmissionRefusal logs a refusal that internal/control decided on its own,
+// at most once per refusalLogInterval.
+//
+// 🔴 It is the THIRD admission point's voice. The other two write their lines
+// from inside this package (scanImagesAsyncVia and enqueueBounded); the
+// gallery-not-yet-indexed gate on POST /api/queue is decided in internal/control,
+// which imports no logger deliberately, so it hands the reason back through the
+// RefuseLog callback startControlAPI installs and the line is written here.
+//
+// Coalesced for exactly the reason the other two are: a client honouring the
+// Retry-After will re-POST every few seconds for the whole first bucket listing,
+// and one line per refusal is unbounded journald volume on a Raspberry Pi for a
+// condition that is ONE condition.
+//
+// It is called from an HTTP handler goroutine, before the response is written, so
+// it must not block — refusalLog has its own mutex and never touches iv.mutex,
+// which is what keeps that true.
+func (iv *ImageViewer) noteAdmissionRefusal(reason string) {
+	if n, since, report := iv.admissionRefusals.note(time.Now()); report {
+		log.Printf("%s; %d refusal(s) %s", reason, n, refusalSpan(since))
+	}
 }
 
 // refusalSpan renders the silence a coalesced count covers, for the log line.
@@ -979,8 +1024,10 @@ func (iv *ImageViewer) endQueueLocked() {
 // simplification: in the two-up view it played queued pages out of order and put
 // unqueued gallery neighbours on half the screen.
 //
-// Skips are counted per decision D3, EXACTLY ONCE each. queueScanned is the
-// high-water mark that makes that true, and its scope is stated at
+// Skips are counted per decision D3, AT MOST ONCE each — a played entry that
+// later leaves the gallery is counted zero times, which is the case F4 is about.
+// queueScanned is the high-water mark that makes that true, and its scope is
+// stated at
 // scanQueueForwardLocked rather than here, because the case that matters — an
 // entry that was PLAYED and then left the gallery in a mid-queue rescan — is a
 // property of that scan and not of this cursor arithmetic. The backward arm
@@ -1047,14 +1094,49 @@ func (iv *ImageViewer) advanceQueueLocked(delta int) bool {
 		if iv.queueIndex < 0 {
 			return false
 		}
-		at = iv.queueIndex
+		// 🔴 THE ENTRY ON THE DISPLAY CAN HAVE LEFT THE GALLERY TOO — a rescan
+		// under a running queue — and then there is nothing to hold ON. This is
+		// the ONLY path on which landQueueLocked's re-check can fail: the forward
+		// and backward arms both hand it an index a scan just resolved under this
+		// same lock.
+		//
+		// The decision, made deliberately because two roads lead out of here and
+		// the code used to take a third by accident: a Prev FALLS FORWARD to the
+		// nearest still-playable entry rather than ending the queue. Draining
+		// would abandon a collection that still has playable pages ahead because
+		// the operator pressed BACK — the display leaving the comic they are
+		// reading for an unrelated one, which is the worse of the two surprises.
+		// Falling forward keeps `advanceQueueLocked`'s stated invariant TRUE
+		// rather than making the docstring apologise for the code: a queue ends by
+		// forward exhaustion or an explicit POST /api/goto, and by nothing else.
+		//
+		// ⚠ Yes, a Prev can therefore move the display FORWARD by one entry. That
+		// is the honest answer when every entry at and behind the cursor has been
+		// deleted from the bucket: there is no earlier page of this collection
+		// left to show. It is bounded — one page turn, still inside the
+		// collection — where draining is unbounded (a different comic entirely).
+		if iv.landQueueLocked(iv.queueIndex, step) {
+			return true
+		}
+		ahead, ok := iv.scanQueueForwardLocked(iv.queueIndex + 1)
+		if !ok {
+			return false
+		}
+		return iv.landQueueLocked(ahead, step)
 	}
 	return iv.landQueueLocked(at, step)
 }
 
 // scanQueueForwardLocked returns the first playable entry at or after from,
-// counting every entry it passes over as a skip — exactly once each. ok is false
+// counting every entry it passes over as a skip — AT MOST ONCE each. ok is false
 // when nothing playable remains. The caller must hold the write lock.
+//
+// 🔴 "At most once", NOT "exactly once", and the difference is the whole of F4.
+// An entry that was PLAYED and then left the gallery is counted ZERO times, not
+// once: see the high-water paragraph below. The stronger summary was here for a
+// round, and it is the kind that gets the conditional at the bottom of this
+// function deleted as redundant — which is precisely the mutant that survived a
+// green 461-test suite.
 //
 // 🔴 THE HIGH-WATER MARK IS WHAT MAKES "EXACTLY ONCE" TRUE, AND IT IS WIDER THAN
 // "the operator pressed prev". queueScanned records that an entry has been LOOKED
@@ -1102,8 +1184,23 @@ func (iv *ImageViewer) scanQueueBackwardLocked(from int) (int, bool) {
 
 // landQueueLocked points the display at the entry at cursor and works out which
 // further entries share the screen with it — step-1 of them, so one in the
-// two-up view and none in either single view. It reports false when the cursor's
-// own key has left the gallery, which the caller treats as a drain.
+// two-up view and none in either single view. It reports false when cursor's own
+// key has left the gallery.
+//
+// 🔴 FALSE DOES NOT MEAN "DRAIN", and an earlier version of this sentence said it
+// did while the code disagreed — a contradiction shipped between two comments
+// twelve lines apart. The ONLY caller that can see false is advanceQueueLocked's
+// backward HOLD path (the forward and backward arms hand in an index a scan just
+// resolved under this same lock), and that path answers it by falling forward to
+// the next playable entry, NOT by ending the queue. A queue still ends only by
+// forward exhaustion or an explicit POST /api/goto.
+//
+// 🔴 The re-check below is therefore load-bearing, not belt-and-braces, and it is
+// reachable from exactly one place. Deleting it does not fail loudly: cursor's
+// key is missing, indexOfKeyLocked returns its zero value, and the display
+// silently lands on GALLERY INDEX 0 — an unqueued comic — while queue.position
+// goes on naming a queued page. That mutant survived a green 461-test suite until
+// TestAPrevWhoseOwnPageVanishedFallsForwardInsteadOfEndingTheQueue existed.
 //
 // 🔴 The tail is decided HERE, under the write lock, at the same moment the
 // cursor moves — and pairKeys reads it rather than recomputing one. Two
@@ -1148,6 +1245,35 @@ func (iv *ImageViewer) indexOfKeyLocked(key string) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+// queueLeftLocked resolves the LEFT-hand entry the running queue is on, BY KEY,
+// and reports whether it could. false means there is nothing for the queue to
+// say about the selection: no queue is running, no entry is on the display yet,
+// or the entry's own key has left the gallery. The caller must hold the lock.
+//
+// 🔴 IT IS THE ONE PLACE the queue's cursor becomes a gallery index on a READ
+// path, and it exists because currentIndex goes stale. The gallery is shuffled
+// once per process, so a rescan replaces it with a DIFFERENT ORDER — and the
+// index landQueueLocked stored then names a different comic. Measured before this
+// existed: two-up, gallery reshuffled under the queue [e/5, c/3], the screen
+// showed `d/4  c/3` with d/4 never queued, and currentKey() — so GET
+// /api/state's `key`, and both single views — returned d/4 while queue.position
+// still named e/5.
+//
+// Three readers go through it (currentKey, pairKeys, snapshotAt) rather than each
+// open-coding the resolution: a predicate at three call sites is wrong at two of
+// them, in the same direction, and this one was wrong at three until the round
+// that added it fixed only the right-hand panel.
+//
+// ⚠ It does NOT write currentIndex back. These are read paths holding the READ
+// lock, and mutating shared state under it is a data race. currentIndex stays the
+// index the page turn recorded; what a client is TOLD is what is on the screen.
+func (iv *ImageViewer) queueLeftLocked() (int, bool) {
+	if len(iv.queue) == 0 || iv.queueIndex < 0 || iv.queueIndex >= len(iv.queue) {
+		return 0, false
+	}
+	return iv.indexOfKeyLocked(iv.queue[iv.queueIndex])
 }
 
 // queueState reports the generation, depth, 1-based position and skip count —
@@ -1240,6 +1366,12 @@ func (iv *ImageViewer) snapshotAt(now time.Time) viewerSnapshot {
 	s.queueID, s.queueLength, s.queuePosition, s.queueSkipped = iv.queueStateLocked()
 	if s.total > 0 {
 		s.index = wrapIndex(iv.currentIndex, 0, s.total)
+		// The queued page, re-resolved by key, for the reason queueLeftLocked
+		// states: after a rescan the recorded index names a different comic, and
+		// reporting it would make `key` disagree with `queue.position`.
+		if idx, ok := iv.queueLeftLocked(); ok {
+			s.index = idx
+		}
 		s.key = iv.images[s.index]
 	}
 	if len(iv.displayedKeys) > 0 {

@@ -113,14 +113,43 @@ type Config struct {
 	Viewer Viewer
 	// Version is reported by GET /healthz.
 	Version string
+	// RefuseLog, when non-nil, is called with a one-line reason each time THIS
+	// PACKAGE decides a 503 on its own — today only the gallery-not-yet-indexed
+	// gate on POST /api/queue. Optional: a nil RefuseLog is a Server that refuses
+	// silently, which is what every test that does not care about logging gets.
+	//
+	// 🔴 IT EXISTS BECAUSE A SILENT REFUSAL IS UNOBSERVABLE ON A PI. The other
+	// two admission points are counted and logged by the viewer, coalesced
+	// through refusalLog — deliberately, because an operator needs journald
+	// evidence that the display said no. The indexing gate is decided HERE, and
+	// this package cannot reach the viewer's log: it imports no logger by design
+	// (see the header of viewer.go — the whole point is that it has no
+	// dependencies a GTK-less test cannot satisfy), and widening the Viewer port
+	// with a logging method would put a log line in the contract every future
+	// implementer has to satisfy. A callback keeps the decision here and the
+	// journald volume policy — coalescing included — with the one component that
+	// already owns it.
+	//
+	// The implementation MUST be safe to call from an HTTP handler goroutine and
+	// MUST NOT block: it runs before the response is written.
+	RefuseLog func(reason string)
 }
 
 // Server is the Pi-side control API.
 type Server struct {
-	token   string
-	viewer  Viewer
-	version string
-	http    *http.Server
+	token     string
+	viewer    Viewer
+	version   string
+	refuseLog func(reason string)
+	http      *http.Server
+}
+
+// noteRefusal reports a refusal this package decided on its own. It is a no-op
+// when no RefuseLog was configured.
+func (s *Server) noteRefusal(reason string) {
+	if s.refuseLog != nil {
+		s.refuseLog(reason)
+	}
 }
 
 // New builds a Server. It returns an error — and therefore no listener — when
@@ -137,9 +166,10 @@ func New(cfg Config) (*Server, error) {
 		addr = DefaultAddr
 	}
 	s := &Server{
-		token:   cfg.Token,
-		viewer:  cfg.Viewer,
-		version: cfg.Version,
+		token:     cfg.Token,
+		viewer:    cfg.Viewer,
+		version:   cfg.Version,
+		refuseLog: cfg.RefuseLog,
 	}
 	s.http = &http.Server{
 		Addr:              addr,
@@ -237,8 +267,20 @@ func (s *Server) enqueue(w http.ResponseWriter, fn func()) {
 }
 
 // refuse is the ONE place a 503 is written, so the status, the Retry-After and
-// the JSON shape cannot drift between the two admission points (the GTK queue
-// cap and the concurrent-scan bound).
+// the JSON shape cannot drift between the THREE admission points:
+//
+//	the GTK command queue cap        — every mutation except POST /api/rescan
+//	the concurrent-scan bound        — POST /api/rescan
+//	the gallery-not-yet-indexed gate — POST /api/queue only, see handleQueue
+//
+// 🔴 COUNT THE BULLETS RATHER THAN TRUSTING A NUMBER IN PROSE. This paragraph
+// said "the two admission points" for a round after the third one was added in
+// this same file, 360 lines below — and the lockstep warning immediately beneath
+// is exactly what a maintainer enumerates 503 sites FROM before updating the
+// consumer. Anything that adds a fourth adds a bullet here.
+//
+// The Retry-After is a PARAMETER, not a constant, because the three clear on
+// different timescales; refuseAfter is where that is decided.
 //
 // 🔴 503 IS A CONTRACT CHANGE AND CONSUMERS MUST BE UPDATED IN LOCKSTEP.
 // Proposal §4.2 (clawgate #442, in the homelab-infra repo) says a mutation
@@ -248,7 +290,9 @@ func (s *Server) enqueue(w http.ResponseWriter, fn func()) {
 //
 // Before this runs on the Pi, BOTH of these must land in homelab-infra:
 //
-//   - §4.2 amended to document 503 + Retry-After on every mutation endpoint,
+//   - §4.2 amended to document 503 + Retry-After on every mutation endpoint —
+//     INCLUDING that POST /api/queue can answer it for a second reason (the
+//     gallery has not finished indexing) with a LONGER Retry-After,
 //   - the cluster-side caller taught that 503 means RETRY (honouring
 //     Retry-After), not FAILED.
 //
@@ -256,7 +300,34 @@ func (s *Server) enqueue(w http.ResponseWriter, fn func()) {
 // queued when nothing was queued is the same lie as accepting a body with a
 // discarded second JSON object, which decodeBody refuses two functions down.
 func refuse(w http.ResponseWriter, msg string) {
-	w.Header().Set("Retry-After", "1")
+	refuseAfter(w, retryAfterQueueFull, msg)
+}
+
+// Retry-After values, in seconds, one per admission point. They are separate
+// because the three clear on completely different timescales, and one number
+// calibrated for the fastest is wrong for the slowest in the expensive
+// direction.
+const (
+	// retryAfterQueueFull covers the GTK command queue and the concurrent-scan
+	// budget. Both drain as the main loop turns — milliseconds to a few seconds —
+	// so a one-second backoff is the right poll cadence.
+	retryAfterQueueFull = 1
+	// retryAfterIndexing covers the gallery-not-yet-indexed gate.
+	//
+	// 🔴 It is NOT 1, and the difference is the point. That gate clears when the
+	// first ListImages over S3 returns, which on a Pi against a bucket of ~7,500
+	// objects is SECONDS TO MINUTES — not milliseconds. A client honouring a
+	// Retry-After of 1 would hot-loop once per second for the whole first scan,
+	// against the very listing it is waiting for. 5 is a poll cadence, chosen to
+	// be cheap rather than to predict when the scan ends: nothing here knows that,
+	// and pretending to would be a worse lie than backing off a little too often.
+	retryAfterIndexing = 5
+)
+
+// refuseAfter is refuse with an explicit backoff. Every 503 in this package goes
+// through it; refuse is the common case with the default.
+func refuseAfter(w http.ResponseWriter, seconds int, msg string) {
+	w.Header().Set("Retry-After", strconv.Itoa(seconds))
 	writeJSON(w, http.StatusServiceUnavailable, errorBody{Error: msg})
 }
 
@@ -597,9 +668,19 @@ func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
 	// does NOT cover a genuinely EMPTY bucket (`!Scanning && Total == 0`), and
 	// deliberately: retrying that would never help, so the honest answer there is
 	// the 202 with `skipped == length`, now attributable through queue.id.
+	//
+	// It is REPORTED as well as refused. The other two admission points are
+	// counted and logged by the viewer; this one is decided here, so without
+	// s.noteRefusal an operator whose "play collection" was turned down through
+	// the whole first bucket listing would have zero journald evidence that the
+	// Pi said anything at all. See Config.RefuseLog.
+	//
+	// The Retry-After is retryAfterIndexing, NOT the queue-full default: this
+	// clears when a listing over S3 returns, not when the main loop turns.
 	if snap := s.viewer.Snapshot(); snap.Scanning && snap.Total == 0 {
-		refuse(w, "the gallery has not finished indexing, so every queued key would be "+
-			"skipped; retry shortly")
+		s.noteRefusal("queue refused: the gallery has not finished its first scan")
+		refuseAfter(w, retryAfterIndexing, "the gallery has not finished indexing, so every "+
+			"queued key would be skipped; retry shortly")
 		return
 	}
 

@@ -268,7 +268,8 @@ func TestStateJSONShape(t *testing.T) {
 		// from maxQueueKeys — so a mutant that crossed two of the three, or
 		// hardcoded a constant the package names, cannot land on the right answer
 		// by accident of the fixture.
-		Queue: QueueState{ID: 7, Length: 12, Position: 5, Skipped: 3},
+		Queue:  QueueState{ID: 7, Length: 12, Position: 5, Skipped: 3},
+		BootID: "9f3c1ab0deadbe17",
 	}
 	s := newTestServer(t, f)
 
@@ -290,6 +291,9 @@ func TestStateJSONShape(t *testing.T) {
 		"slide_interval":     float64(37),
 		"scanning":           false,
 		"seconds_until_next": float64(19),
+		// Deliberately a value no other field could produce, so a mutant that
+		// crossed boot_id with key, version or a queue field cannot pass.
+		"boot_id": "9f3c1ab0deadbe17",
 		"queue": map[string]any{
 			"id":       float64(7),
 			"length":   float64(12),

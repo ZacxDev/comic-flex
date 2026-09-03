@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	crand "crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -14,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -258,12 +261,16 @@ type ImageViewer struct {
 	// queuedMutations counts control-API closures handed to the GTK main loop
 	// and not yet run. Guarded by mutex like the rest; see maxQueuedMutations.
 	queuedMutations int
-	// scanRefusals and queueRefusals coalesce the log lines the two admission
-	// points write when they refuse. They carry their OWN mutex (see refusalLog
-	// in state.go) and are deliberately not guarded by iv.mutex: a refusal must
-	// not contend for the lock every render takes.
-	scanRefusals  refusalLog
-	queueRefusals refusalLog
+	// scanRefusals, queueRefusals and admissionRefusals coalesce the log lines the
+	// THREE admission points write when they refuse — the concurrent-scan bound,
+	// the GTK command queue cap, and internal/control's gallery-not-yet-indexed
+	// gate on POST /api/queue, which is decided in that package and reported back
+	// through the RefuseLog callback startControlAPI installs. They carry their
+	// OWN mutex (see refusalLog in state.go) and are deliberately not guarded by
+	// iv.mutex: a refusal must not contend for the lock every render takes.
+	scanRefusals      refusalLog
+	queueRefusals     refusalLog
+	admissionRefusals refusalLog
 	// displayUnknown coalesces the line displaySize writes when GDK cannot tell
 	// us the monitor geometry. Same reason and same mechanism as the two above:
 	// it is reached from every render, so it must not be one line per call.
@@ -317,7 +324,11 @@ type ImageViewer struct {
 	//
 	// 🔴 TRANSIENT BY DESIGN (decision D2) — it lives here and nowhere else, and
 	// a restarted Pi comes back without it. See the play-queue section of
-	// state.go, which owns every access to these five fields.
+	// state.go, which owns every access to the SIX queue fields below (queue,
+	// queueIndex, queueTailIndex, queueScanned, queueSkipped, queueSeq) plus the
+	// two that record the interruption point (queueReturnIndex, queueReturnKey).
+	// Count them rather than trusting this sentence — it said "five" for a round
+	// after three more were added.
 	queue []string
 	// queueIndex is the cursor into queue: the LEFT-most entry currently on the
 	// display. -1 means none is — either no queue is running, or one was
@@ -396,6 +407,41 @@ var injectedVersion string
 // add a third build path, give it one of the two or it lands on "unknown"
 // silently.
 var version = resolveVersion(injectedVersion, buildSettings())
+
+// bootID identifies THIS RUN of the process. It is reported by GET /api/state as
+// `boot_id`, and it is generated once, here, at package initialisation.
+//
+// 🔴 It exists so a client can dedupe on the PAIR (boot_id, queue.id). queue.id
+// is a per-process counter that starts again at 0 after a restart, so ids are
+// reused across boots — a client that suppressed a "3 pages were no longer in the
+// library" notification because it had "already handled queue 3" would go on
+// suppressing a genuine one from a rebooted Pi's third collection. It also gives
+// a client the only way to observe decision D2 from outside: a changed boot_id is
+// how it learns the collection it was watching is GONE rather than finished.
+//
+// It is not a version and not ordered — comparing two values for anything but
+// equality is meaningless.
+var bootID = newBootID()
+
+// newBootID returns an opaque per-run identity.
+//
+// 🔴 Random, not the clock, and the fallback ordering is the reason. A Raspberry
+// Pi has NO BATTERY-BACKED RTC: it comes up at whatever time the filesystem or
+// NTP last left it, so two consecutive boots can genuinely report the same wall
+// clock, and a time-derived identity would then be equal across exactly the event
+// it exists to distinguish. crypto/rand is the primary; the clock is only the
+// last resort for a machine on which reading randomness has failed, where an
+// occasionally-repeated id is still better than an empty field a client cannot
+// branch on.
+func newBootID() string {
+	var b [8]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		log.Printf("boot id: crypto/rand unavailable (%v); falling back to the clock, which on "+
+			"a Pi with no RTC can repeat across a reboot", err)
+		return "t" + strconv.FormatInt(time.Now().UnixNano(), 16)
+	}
+	return hex.EncodeToString(b[:])
+}
 
 // buildSettings returns the toolchain's VCS stamp, or nil when there is none
 // (ReadBuildInfo has no build info, or the build was made with -buildvcs=false).
@@ -897,8 +943,8 @@ func monitorGeometry(monitor *gdk.Monitor) (int, int) {
 // noteDisplayUnknown logs that the display geometry could not be read, at most
 // once per refusalLogInterval.
 //
-// It is coalesced through the same refusalLog the two admission points use,
-// because displaySize runs on every render and every relayout: a line per call
+// It is coalesced through the same refusalLog type the three admission points
+// use, because displaySize runs on every render and every relayout: a line per call
 // would be unbounded journald volume on a Raspberry Pi for a condition that is
 // one condition, not many.
 func (iv *ImageViewer) noteDisplayUnknown(reason string) {

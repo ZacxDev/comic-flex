@@ -176,6 +176,25 @@ func ParseViewMode(s string) (ViewMode, bool) {
 //	between polls and re-syncs on each one.
 //
 // Queue — the play queue's depth and position; see QueueState.
+//
+// BootID — an opaque identity for THIS RUN of the process, generated at startup
+//
+//	and constant for the lifetime of the process. It is not a version, not a
+//	hostname and not ordered: a client may only compare it for equality.
+//
+//	🔴 It exists because Queue.ID is a per-process counter and is therefore
+//	REUSED after a restart. A client that dedupes a "3 pages were no longer in
+//	the library" notification on Queue.ID alone suppresses a real one after the
+//	Pi reboots; the key it must use is the PAIR (BootID, Queue.ID). Everything
+//	else on this struct is a fact about the slideshow, so a reader looking for
+//	"has the Pi restarted?" would otherwise find nothing here at all.
+//
+//	It is also decision D2 made checkable rather than asserted: the queue does
+//	not survive a restart, and a changed BootID is how a client learns that the
+//	collection it was watching is gone rather than merely finished.
+//
+//	Never empty on a Pi that has this field. Absent — like `queue` — identifies a
+//	Pi that predates it.
 type Snapshot struct {
 	Total            int        `json:"total"`
 	Index            int        `json:"index"`
@@ -187,6 +206,7 @@ type Snapshot struct {
 	Scanning         bool       `json:"scanning"`
 	SecondsUntilNext int        `json:"seconds_until_next"`
 	Queue            QueueState `json:"queue"`
+	BootID           string     `json:"boot_id"`
 }
 
 // QueueState is the play queue's depth and position, reported by GET /api/state
@@ -211,9 +231,17 @@ type Snapshot struct {
 type QueueState struct {
 	// ID identifies WHICH queue the other three fields describe. It is a
 	// per-process generation: 0 before any queue has been installed, and
-	// incremented by every POST /api/queue. It is never reused, and a Pi that
-	// restarted is back at 0 — which is decision D2 (the queue is transient)
-	// visible on the wire rather than only in a comment.
+	// incremented by every POST /api/queue.
+	//
+	// 🔴 IT IS UNIQUE WITHIN ONE RUN OF THE PROCESS AND NOWHERE WIDER. A Pi that
+	// restarts counts from 0 again, so ids ARE reused across boots — which is why
+	// the pair a client must dedupe on is (BootID, Queue.ID) and never Queue.ID
+	// alone. This paragraph claimed "never reused" for a round, three lines above
+	// stating the restart behaviour that falsifies it, and the failure that
+	// contradiction ships is concrete: Pi reports {id:3, skipped:2}, the client
+	// records "handled 3", the Pi restarts, three new collections are queued, the
+	// Pi reports {id:3, skipped:1} — and the client suppresses a real
+	// notification. Snapshot.BootID exists to close exactly that.
 	//
 	// 🔴 IT IS WHAT MAKES Skipped ACTIONABLE, and without it that field cannot be
 	// rendered correctly at all. Skipped outlives the queue that produced it (see

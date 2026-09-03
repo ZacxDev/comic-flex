@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
@@ -802,6 +803,266 @@ func TestADrainFallsBackToTheIndexWhenTheInterruptedPageIsGone(t *testing.T) {
 	if got := keyNow(t, iv); got != "e/5.jpg" {
 		t.Fatalf("after the interrupted page left the bucket the drain landed on %q, want "+
 			"e/5.jpg — index 2 (d/4.jpg) plus one", got)
+	}
+}
+
+// TestAPrevWhoseOwnPageVanishedFallsForwardInsteadOfEndingTheQueue is finding
+// 🟡-1, and it is the guard that makes landQueueLocked's re-check load-bearing.
+//
+// Every entry at and behind the cursor has been deleted from the bucket by a
+// rescan, and the operator presses Prev. There is no earlier page of the
+// collection left to show. The decision: fall forward to the nearest still
+// playable entry, NOT drain — draining would abandon a collection that still has
+// playable pages ahead because the operator pressed BACK, taking the display to
+// an unrelated comic. It also keeps advanceQueueLocked's stated invariant true: a
+// queue ends by forward exhaustion or an explicit goto, and by nothing else.
+//
+// Deleting the re-check inside landQueueLocked does not fail loudly — the cursor
+// key resolves to indexOfKeyLocked's zero value and the display lands on GALLERY
+// INDEX 0, an unqueued comic, while queue.position goes on naming a queued page.
+// That mutant survived a green 461-test suite.
+func TestAPrevWhoseOwnPageVanishedFallsForwardInsteadOfEndingTheQueue(t *testing.T) {
+	iv := queueTestViewer(t)
+	iv.setQueue([]string{"a/1.jpg", "b/2.jpg", "c/3.jpg"})
+	iv.advance(1) // a/1
+	iv.advance(1) // b/2
+
+	// Both played pages leave the bucket. c/3 is still there and still unplayed.
+	// d/4 is kept at gallery index 0 so that a viewer which silently fell back to
+	// "index 0" would land on a key no assertion below expects.
+	iv.setImages([]string{"d/4.jpg", "c/3.jpg", "e/5.jpg"})
+
+	if !iv.advance(-1) {
+		t.Fatal("a Prev reported nothing to show while the queue still had a playable page")
+	}
+	if got := keyNow(t, iv); got != "c/3.jpg" {
+		t.Fatalf("a Prev whose own page had left the bucket landed on %q, want c/3.jpg — the "+
+			"nearest still-playable queued page. d/4.jpg means it silently fell back to gallery "+
+			"index 0; anything else means it dropped out of the collection entirely.", got)
+	}
+	// The queue is STILL RUNNING. Length 3, cursor on the third entry.
+	wantQueue(t, iv, 3, 3, 0)
+}
+
+// TestAPrevDrainsOnlyWhenNoQueuedPageIsPlayableAtAll is the other arm, and it is
+// what stops the guard above being satisfied by a viewer that never drains. When
+// the WHOLE queue has left the bucket there is nothing to fall forward to, and
+// the gallery is the only honest answer.
+func TestAPrevDrainsOnlyWhenNoQueuedPageIsPlayableAtAll(t *testing.T) {
+	iv := queueTestViewer(t) // interrupted at c/3.jpg
+	iv.setQueue([]string{"a/1.jpg", "b/2.jpg"})
+	iv.advance(1)
+
+	iv.setImages([]string{"c/3.jpg", "d/4.jpg", "e/5.jpg"})
+
+	if !iv.advance(-1) {
+		t.Fatal("advance reported nothing to show")
+	}
+	// skipped 1, not 0: the fall-forward attempt walked b/2.jpg, which was queued,
+	// never played, and is no longer in the library — exactly the page decision D3
+	// exists to report. a/1.jpg is NOT counted, because it played before it
+	// vanished (the F4 rule).
+	wantQueue(t, iv, 0, 0, 1)
+	if got := keyNow(t, iv); got != "e/5.jpg" {
+		t.Fatalf("with no playable queued page left, the Prev landed on %q, want e/5.jpg — one "+
+			"back in the gallery from the interrupted page c/3.jpg (now index 0)", got)
+	}
+}
+
+// TestATwoUpTailThatLeftTheGalleryCollapsesRatherThanShowingANeighbour is finding
+// 🟡-2: the `r = l` initialiser in pairKeys, which the round that added it called
+// the whole point of the fix and then left untested.
+//
+// 🔴 THE ODD-LENGTH CASE CANNOT COVER IT. There tail == cursor, so the
+// found-branch always assigns and the initialiser is never read. Only a tail whose
+// key has LEFT THE GALLERY exercises it — reachable because onScanComplete renders
+// straight after setImages — and deleting the line survived a green 461-test
+// suite, reinstating exactly the gallery-neighbour fallback this block removes.
+//
+// The fixture keeps c/3.jpg at index 2 across the rescan, so the LEFT half is not
+// in question and this test is about the right half alone.
+func TestATwoUpTailThatLeftTheGalleryCollapsesRatherThanShowingANeighbour(t *testing.T) {
+	iv := newControlTestViewer(30, queueGallery()...)
+	iv.setViewModeState(ViewLandscapeTwo)
+	iv.gotoIndex(0)
+	iv.setQueue([]string{"c/3.jpg", "e/5.jpg"})
+	iv.advance(iv.stepSize())
+	if got, want := screen(t, iv), []string{"c/3.jpg", "e/5.jpg"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("screen = %v, want %v — the fixture is not set up as this test assumes", got, want)
+	}
+
+	// The TAIL leaves the bucket. c/3.jpg keeps index 2; d/4.jpg is its gallery
+	// neighbour at index 3, and is what a fallback would put on the screen.
+	iv.setImages([]string{"a/1.jpg", "b/2.jpg", "c/3.jpg", "d/4.jpg"})
+
+	if got, want := screen(t, iv), []string{"c/3.jpg"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("with the tail's page gone the screen shows %v, want %v. Showing nothing extra "+
+			"is honest; falling back to the gallery neighbour puts d/4.jpg — a comic nobody "+
+			"queued — on half the display, which is the defect this block exists to remove.",
+			got, want)
+	}
+}
+
+// TestTheQueueCursorIsResolvedByKeyNotByIndex is finding 🟡-3.
+//
+// The gallery is shuffled once per process, so a rescan replaces it with a
+// different ORDER and the index landQueueLocked recorded then names a different
+// comic. Fixing only the right-hand panel left `LEFT d/4 RIGHT c/3` reachable —
+// d/4 never queued — with currentKey(), and therefore GET /api/state's `key` and
+// both single views, naming d/4 while queue.position named e/5.
+//
+// The rescan below moves e/5.jpg from index 4 to index 1 and puts d/4.jpg where
+// the stale index 4 now lands, so an index-authoritative cursor produces d/4.jpg
+// and a key-authoritative one produces e/5.jpg.
+func TestTheQueueCursorIsResolvedByKeyNotByIndex(t *testing.T) {
+	iv := newControlTestViewer(30, queueGallery()...)
+	iv.setViewModeState(ViewLandscapeTwo)
+	iv.gotoIndex(0)
+	iv.setQueue([]string{"e/5.jpg", "c/3.jpg"})
+	iv.advance(iv.stepSize())
+
+	iv.setImages([]string{"a/1.jpg", "e/5.jpg", "b/2.jpg", "c/3.jpg", "d/4.jpg"})
+
+	if got, want := screen(t, iv), []string{"e/5.jpg", "c/3.jpg"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("after a reshuffling rescan the two-up screen shows %v, want %v — the LEFT half "+
+			"is still being taken from the stale recorded index, so a comic nobody queued is on "+
+			"the display", got, want)
+	}
+	if got := keyNow(t, iv); got != "e/5.jpg" {
+		t.Fatalf("currentKey() = %q, want e/5.jpg. This is what GET /api/state reports as `key` "+
+			"and what BOTH single views render, so it disagreeing with queue.position is the "+
+			"same defect one layer further out.", got)
+	}
+	got := iv.snapshot()
+	if got.key != "e/5.jpg" || got.index != 1 {
+		t.Fatalf("snapshot = (index %d, key %q), want (1, e/5.jpg) — `key` and `index` must "+
+			"describe the queued page, not the position it used to sit at", got.index, got.key)
+	}
+	// And queue.position still names the same entry, so the two agree.
+	wantQueue(t, iv, 2, 1, 0)
+}
+
+// TestTheQueueCursorFallsBackToTheIndexWhenItsOwnPageIsGone: the resolver reports
+// "nothing to say" rather than inventing an answer, and the pre-existing
+// index-based normalisation takes over. Without this arm, a resolver that
+// returned (0, true) on a miss would put gallery index 0 on the display and no
+// test above would see it.
+func TestTheQueueCursorFallsBackToTheIndexWhenItsOwnPageIsGone(t *testing.T) {
+	iv := queueTestViewer(t)
+	iv.setQueue([]string{"e/5.jpg"})
+	iv.advance(1)
+	if got := keyNow(t, iv); got != "e/5.jpg" {
+		t.Fatalf("setup: currentKey = %q, want e/5.jpg", got)
+	}
+
+	// e/5.jpg leaves. currentIndex is still 4, clamped by setImages to 2.
+	iv.setImages([]string{"a/1.jpg", "b/2.jpg", "c/3.jpg"})
+
+	if got := keyNow(t, iv); got != "c/3.jpg" {
+		t.Fatalf("currentKey = %q, want c/3.jpg — with the queued page gone there is nothing for "+
+			"the queue to resolve, so the clamped index answers", got)
+	}
+}
+
+// TestASkippedEntryAtTheEndOfAScreenIsNotCountedAgain pins the SKIP branch's
+// high-water write, which the landing-branch test (F4) cannot reach.
+//
+// 🔴 Two-up is the only view that reaches it. The tail scan runs off the end of
+// the queue without landing, so the last write to queueScanned comes from the
+// SKIP branch — and on the next page turn, which starts at tail+1, those same
+// entries are walked again. With `queueScanned = i` there they are counted twice;
+// with `i + 1` they are not. In a single view a skip is always followed by a
+// landing or by a drain, so the value is overwritten either way and the mutant is
+// equivalent.
+func TestASkippedEntryAtTheEndOfAScreenIsNotCountedAgain(t *testing.T) {
+	iv := newControlTestViewer(30, queueGallery()...)
+	iv.setViewModeState(ViewLandscapeTwo)
+	iv.gotoIndex(0)
+	iv.setQueue([]string{"e/5.jpg", "gone/7.jpg", "gone/8.jpg"})
+
+	iv.advance(iv.stepSize()) // lands e/5, tail scan skips both and finds nothing
+	wantQueue(t, iv, 3, 1, 2)
+
+	// The next turn starts at tail+1 == 1 and walks the same two entries again.
+	iv.advance(iv.stepSize())
+	_, _, _, skipped := iv.queueState()
+	if skipped != 2 {
+		t.Fatalf("skipped = %d after a second page turn walked the same two missing entries, "+
+			"want 2. The skip branch is not recording that it looked them up, so every page "+
+			"turn re-counts the tail of the queue.", skipped)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The queue generation and the boot identity (findings F2 and 🟡-5)
+// ---------------------------------------------------------------------------
+
+// TestBootIDIsStableAndNonEmpty pins the half of the (boot_id, queue.id) dedupe
+// key that lives in this package.
+//
+// queue.id is a per-process counter, so it IS reused after a restart — a client
+// that deduped on it alone would suppress a real "3 pages were no longer in the
+// library" notification from a rebooted Pi's third collection. boot_id is what
+// makes the pair unique. It must never be empty (a client cannot branch on an
+// empty string any more than on an absent field) and must not change while the
+// process runs (a value that moved would make every notification look new).
+func TestBootIDIsStableAndNonEmpty(t *testing.T) {
+	if bootID == "" {
+		t.Fatal("bootID is empty — a client has nothing to pair queue.id with, and the id is " +
+			"reused after every restart")
+	}
+	iv := queueTestViewer(t)
+	first := gtkViewer{iv: iv}.Snapshot().BootID
+	iv.setQueue([]string{"e/5.jpg"})
+	iv.advance(1)
+	second := gtkViewer{iv: iv}.Snapshot().BootID
+	if second != first || first != bootID {
+		t.Fatalf("boot id moved during the process: %q then %q (package value %q). It identifies "+
+			"the RUN, so a value that changes makes every queue look like a new boot",
+			first, second, bootID)
+	}
+}
+
+// TestNewBootIDDoesNotRepeat is the other half: two runs of the generator must
+// differ, or the field cannot distinguish the reboot it exists for. It exercises
+// the generator rather than the package variable, because the variable is
+// initialised once and a test cannot restart the process.
+// 🔴 WITHIN-PROCESS UNIQUENESS IS THE WEAKER HALF, AND ON ITS OWN IT IS NEARLY
+// VACUOUS. The property that matters is uniqueness ACROSS REBOOTS, which no unit
+// test can observe — and the clock fallback satisfies the loop below perfectly
+// while failing the real property, because a Pi has no battery-backed RTC and can
+// come up at the same wall clock twice. Measured: a mutant forcing the fallback
+// (`if _, err := crand.Read(b[:]); true`) SURVIVED this test when it asserted
+// non-repetition alone.
+//
+// So the SHAPE is asserted as well: 16 lowercase hex characters is what the
+// crypto/rand path produces, and the fallback deliberately prefixes "t" so the
+// two are distinguishable. That turns "the primary source is the one running"
+// into something a test can see.
+func TestNewBootIDDoesNotRepeat(t *testing.T) {
+	seen := map[string]bool{}
+	for i := 0; i < 64; i++ {
+		id := newBootID()
+		if id == "" {
+			t.Fatal("newBootID returned an empty string")
+		}
+		if len(id) != 16 {
+			t.Fatalf("newBootID = %q (%d chars), want 16 hex characters. A different shape means "+
+				"the clock FALLBACK is answering, and the clock repeats across a reboot on a Pi "+
+				"with no RTC — which is exactly the event this id exists to distinguish.",
+				id, len(id))
+		}
+		for _, c := range id {
+			if !strings.ContainsRune("0123456789abcdef", c) {
+				t.Fatalf("newBootID = %q contains %q, which is not lowercase hex — the "+
+					"crypto/rand path is not the one producing it", id, c)
+			}
+		}
+		if seen[id] {
+			t.Fatalf("newBootID repeated %q within %d calls — it cannot distinguish one boot "+
+				"from the next, which is the only thing it is for", id, i+1)
+		}
+		seen[id] = true
 	}
 }
 

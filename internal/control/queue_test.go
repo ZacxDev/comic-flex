@@ -50,7 +50,12 @@ func TestQueueIsAlwaysPresentInTheStateObject(t *testing.T) {
 	s := newTestServer(t, f)
 
 	body := do(t, s, "GET", "/api/state", "").Body.String()
-	for _, want := range []string{`"queue":{`, `"id":0`, `"length":0`, `"position":0`, `"skipped":0`} {
+	for _, want := range []string{`"queue":{`, `"id":0`, `"length":0`, `"position":0`, `"skipped":0`,
+		// boot_id rides the same rule: present on a Pi that has it, absent on one
+		// that predates it, so a client can branch on presence. It is empty here
+		// because the fake viewer is not the process — package main's adapter is
+		// what fills it, and TestBootIDIsStableAndNonEmpty pins that end.
+		`"boot_id":`} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("state body does not contain %s — a client cannot tell a Pi with no queue "+
 				"from a Pi that predates queues at all, and those are opposite facts.\nbody: %s",
@@ -245,8 +250,30 @@ func TestAQueuePostedWhileIndexingIsRefusedAsBackpressure(t *testing.T) {
 				"key would be skipped against an empty gallery and the caller would be told 202 "+
 				"for a collection that never played. (body %s)", w.Code, w.Body.String())
 		}
-		if got := w.Header().Get("Retry-After"); got == "" {
-			t.Error("a 503 with no Retry-After — the caller is told to back off with no idea how long")
+		// 🔴 The VALUE, not merely its presence. The queue-full default of 1 s is
+		// calibrated for a bound that clears as the GTK main loop turns; this one
+		// clears when the first ListImages over S3 returns, which on a Pi against
+		// a large bucket is seconds to minutes. A client honouring a 1 here
+		// hot-loops once per second for the whole first scan, against the very
+		// listing it is waiting for. Asserting presence alone let one constant
+		// serve both, which is the mutant this line kills.
+		got := w.Header().Get("Retry-After")
+		if got == "" {
+			t.Fatal("a 503 with no Retry-After — the caller is told to back off with no idea how long")
+		}
+		secs, err := strconv.Atoi(got)
+		if err != nil {
+			t.Fatalf("Retry-After = %q, want a number of seconds", got)
+		}
+		if secs != retryAfterIndexing {
+			t.Errorf("Retry-After = %d, want %d. The indexing gate clears when a bucket listing "+
+				"over S3 returns, not when the main loop turns, so it must not share the "+
+				"queue-full backoff (%d).", secs, retryAfterIndexing, retryAfterQueueFull)
+		}
+		if retryAfterIndexing <= retryAfterQueueFull {
+			t.Errorf("retryAfterIndexing (%d) is not above retryAfterQueueFull (%d); the two "+
+				"backoffs have collapsed and the assertion above no longer distinguishes them",
+				retryAfterIndexing, retryAfterQueueFull)
 		}
 		var body errorBody
 		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil || body.Error == "" {
@@ -257,6 +284,58 @@ func TestAQueuePostedWhileIndexingIsRefusedAsBackpressure(t *testing.T) {
 		}
 		if got := f.callLog(); len(got) != 0 {
 			t.Fatalf("a refused queue reached the viewer: %v", got)
+		}
+	})
+
+	t.Run("the refusal is reported, not silent", func(t *testing.T) {
+		// 🔴 The other two admission points are counted and logged by the viewer.
+		// This one is decided in THIS package, which has no logger by design, so
+		// without the callback an operator turned down through the whole first
+		// bucket listing has zero journald evidence that the Pi said anything.
+		f := newFakeViewer()
+		f.snap = Snapshot{Total: 0, Scanning: true,
+			ViewMode: string(ViewLandscapeSingle), SlideInterval: 30}
+		var reasons []string
+		s, err := New(Config{Token: testToken, Viewer: f, Version: "test",
+			RefuseLog: func(reason string) { reasons = append(reasons, reason) }})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+
+		if w := do(t, s, "POST", "/api/queue", `{"keys":["a/1.jpg"]}`); w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status %d, want 503 — this subtest is not exercising the refusal", w.Code)
+		}
+		if len(reasons) != 1 {
+			t.Fatalf("RefuseLog called %d times, want 1. A refusal decided in this package and "+
+				"reported nowhere is invisible on the Pi.", len(reasons))
+		}
+		if !strings.Contains(reasons[0], "queue") || !strings.Contains(reasons[0], "scan") {
+			t.Errorf("RefuseLog reason = %q; it must name the endpoint and the cause, or an "+
+				"operator reading journald cannot tell which admission point spoke", reasons[0])
+		}
+
+		// And an ACCEPTED request says nothing: a log line per POST would be
+		// unbounded volume for the ordinary case.
+		f.snap.Total = 3
+		f.snap.Scanning = false
+		if w := do(t, s, "POST", "/api/queue", `{"keys":["a/1.jpg"]}`); w.Code != http.StatusAccepted {
+			t.Fatalf("status %d, want 202", w.Code)
+		}
+		if len(reasons) != 1 {
+			t.Fatalf("RefuseLog was called for an ACCEPTED queue: %v", reasons)
+		}
+	})
+
+	t.Run("a nil RefuseLog refuses silently rather than panicking", func(t *testing.T) {
+		// Every existing test builds a Server without one, so this is the shape
+		// the whole suite runs in; a Server that panicked here would take the
+		// slideshow down on a request an operator makes at every boot.
+		f := newFakeViewer()
+		f.snap = Snapshot{Total: 0, Scanning: true,
+			ViewMode: string(ViewLandscapeSingle), SlideInterval: 30}
+		s := newTestServer(t, f)
+		if w := do(t, s, "POST", "/api/queue", `{"keys":["a/1.jpg"]}`); w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status %d, want 503", w.Code)
 		}
 	})
 
