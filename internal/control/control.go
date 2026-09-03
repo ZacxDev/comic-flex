@@ -447,8 +447,8 @@ func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
 // the paused flag AFTER the 202 and asserts the flip landed on the late value.
 //
 // 🔴 WHAT THE CALLER IS TOLD, and why it is not the resulting state. This
-// answers 202 {"accepted":true}, exactly like the other seven enqueued
-// mutations. The state the flip lands on is not knowable here without waiting
+// answers 202 {"accepted":true}, exactly like every other enqueued mutation
+// (grep `s.enqueue(` in this file — a number here has drifted twice already). The state the flip lands on is not knowable here without waiting
 // for the closure to run, and waiting is forbidden — the loop drains at up to
 // 30 s per image. Putting a predicted `"paused": !observed` in the body would be
 // the same lie as a 202 for work that was never queued: it is a guess made from
@@ -588,7 +588,8 @@ func (s *Server) handleInterval(w http.ResponseWriter, r *http.Request) {
 // before the shuffled gallery resumes.
 //
 // 🔴 IT IS AN ORDINARY ENQUEUED MUTATION, and that is deliberate rather than
-// incidental. It answers 202 through Server.enqueue like the other nine, which
+// incidental. It answers 202 through Server.enqueue like every other mutation
+// on this API except POST /api/rescan (grep `s.enqueue(`), which
 // means it can also answer 503 + Retry-After when the GTK loop is full, and the
 // cluster-side caller's existing pi.BusyError handling covers it with no second
 // convention to learn. Do NOT give it a bespoke "queued" reply: the queue is not
@@ -717,7 +718,7 @@ func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
 //
 // It takes NO BODY, so there is nothing to validate and no 400 it can produce.
 // The only refusal it has is the GTK queue cap's 503 + Retry-After, through
-// Server.enqueue like the other nine mutations.
+// Server.enqueue like every other mutation except POST /api/rescan.
 //
 // 🔴 It is deliberately NOT subject to the gallery-not-yet-indexed gate that
 // POST /api/queue carries. That gate exists because a queue installed against an

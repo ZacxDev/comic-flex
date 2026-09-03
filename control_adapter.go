@@ -328,14 +328,20 @@ func (g gtkViewer) SetInterval(seconds int) {
 		// nobody left to return an error to, and refusing means GET /api/state does
 		// not change either.
 		//
-		// It matches the two "<noun> refused:" log sites in the program —
-		// enqueueBounded's "mutation refused" and scanImagesAsyncVia's. 🔴 Those
-		// are the only two. An earlier version of this comment said "every other
-		// refusal in this program says so" and listed handleRescan as a third:
-		// FALSE, and falsifiable by grep — internal/control does not import log at
-		// all, and handleRescan refuses over HTTP via refuse(w, …). The refusal a
-		// caller sees from handleRescan IS scanImagesAsyncVia's, so the old list
-		// named one mechanism twice and one that does not exist.
+		// It matches the "<noun> refused:" log convention the rest of the program
+		// uses. 🔴 DO NOT WRITE A COUNT HERE. This comment has now been wrong
+		// about the size of that set TWICE, in opposite directions: it once
+		// claimed handleRescan was a third site (it is not — internal/control
+		// imports no logger and refuses over HTTP via refuse(w, …), so the line a
+		// caller's refusal produces is scanImagesAsyncVia's), and the correction
+		// then pinned "the only two" — which the queue work falsified by adding a
+		// fourth. **`command grep -rn 'refused: ' --include=*.go .`** is the
+		// enumeration; it is one command and it cannot go stale.
+		//
+		// What is durably true, and is the reason to match the convention at all:
+		// every site names the noun that was refused, so an operator grepping
+		// journald for "refused:" gets all of them and can tell which admission
+		// point spoke. That property does not depend on how many there are.
 		//
 		// Uncoalesced, because handleInterval rejects anything outside 1..3600
 		// before enqueueing and no other caller of SetInterval exists, so this

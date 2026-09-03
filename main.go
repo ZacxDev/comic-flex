@@ -16,7 +16,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -365,14 +364,29 @@ type ImageViewer struct {
 	queueReturnIndex int
 	queueReturnKey   string
 	// queueSeq is the play queue's generation: incremented by every setQueue,
-	// never reused, 0 before the first one.
+	// 0 before the first one, and UNIQUE ONLY WITHIN ONE RUN OF THE PROCESS.
 	//
-	// 🔴 It is what makes queueSkipped ATTRIBUTABLE. That count deliberately
+	// 🔴 IT IS REUSED ACROSS BOOTS, so the key a client dedupes on is the PAIR
+	// (boot_id, queue.id) and never queue.id alone. This sentence said "never
+	// reused" for a round, seven lines above the restart behaviour that falsifies
+	// it and with no per-process qualifier at all — the strongest of the three
+	// copies of this rule and the one an implementation maintainer reads. The
+	// cost of believing it is exact: a client dedupes on the id, the Pi reboots,
+	// its third collection reports {id:3, skipped:1}, and the client suppresses a
+	// real notification because it "already handled 3" — the failure boot_id was
+	// added to prevent.
+	//
+	// 🔴 One rule, three places, and they must agree: here, setQueue in state.go,
+	// and control.QueueState.ID (the wire-facing one). Round 2 fixed only the
+	// third. Grep `never reused` and `queueSeq` before editing any of them.
+	//
+	// It is what makes queueSkipped ATTRIBUTABLE. That count deliberately
 	// outlives the queue that produced it, so without an identity beside it a
 	// polling client cannot tell "the collection that just finished skipped 2"
 	// from "some queue an hour ago skipped 2" — and would show a stale toast on
-	// every poll forever. It is reported as `queue.id`. Being per-process, it
-	// also restates decision D2 on the wire: a Pi that restarted is back at 0.
+	// every poll forever. It is reported as `queue.id`; bootID is reported beside
+	// it as `boot_id`, and being per-process it also restates decision D2 on the
+	// wire: a Pi that restarted is back at 0.
 	queueSeq int
 }
 
@@ -425,21 +439,34 @@ var bootID = newBootID()
 
 // newBootID returns an opaque per-run identity.
 //
-// 🔴 Random, not the clock, and the fallback ordering is the reason. A Raspberry
-// Pi has NO BATTERY-BACKED RTC: it comes up at whatever time the filesystem or
-// NTP last left it, so two consecutive boots can genuinely report the same wall
-// clock, and a time-derived identity would then be equal across exactly the event
-// it exists to distinguish. crypto/rand is the primary; the clock is only the
-// last resort for a machine on which reading randomness has failed, where an
-// occasionally-repeated id is still better than an empty field a client cannot
-// branch on.
+// 🔴 Random, not the clock. A Raspberry Pi has NO BATTERY-BACKED RTC: it comes
+// up at whatever time the filesystem or NTP last left it, so two consecutive
+// boots can genuinely report the same wall clock, and a time-derived identity
+// would be equal across exactly the event this one exists to distinguish.
+//
+// 🔴 THERE IS NO FALLBACK, AND THERE CANNOT BE ONE. This function used to test
+// crypto/rand.Read's error and degrade to the clock on failure. That branch was
+// DEAD CODE and the comment above it promised a behaviour the runtime does not
+// offer. Read at the toolchain this repo builds with (go1.25.13,
+// $GOROOT/src/crypto/rand/rand.go): "Read fills b with cryptographically secure
+// random bytes. It never returns an error, and always fills b entirely… and
+// crashes the program irrecoverably if an error is returned." The crash is
+// runtime.fatal via linkname, followed by panic("unreachable") — recover() cannot
+// catch it, and neither tier here nor flake.nix pins an older Go.
+//
+// So the honest statement of the failure mode, rather than a guard that cannot
+// fire: ON A MACHINE WHERE READING RANDOMNESS FAILS, THIS PROCESS DIES AT
+// PACKAGE INITIALISATION — before main(), before the slideshow, before the
+// control API. That is the runtime's decision and this program cannot soften it.
+// It is also a condition the Pi has never been observed in; it is stated so that
+// nobody re-adds an error check believing it buys resilience. A guard that cannot
+// fire is worse than none: it reads as coverage and stops anyone looking (the
+// same rule countdownFrom's comment states, for the same reason).
 func newBootID() string {
 	var b [8]byte
-	if _, err := crand.Read(b[:]); err != nil {
-		log.Printf("boot id: crypto/rand unavailable (%v); falling back to the clock, which on "+
-			"a Pi with no RTC can repeat across a reboot", err)
-		return "t" + strconv.FormatInt(time.Now().UnixNano(), 16)
-	}
+	// The error is discarded because there is no error: see above. It is
+	// discarded EXPLICITLY, with `_`, rather than by a check that always passes.
+	_, _ = crand.Read(b[:])
 	return hex.EncodeToString(b[:])
 }
 

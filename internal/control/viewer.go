@@ -85,10 +85,16 @@ func ParseViewMode(s string) (ViewMode, bool) {
 //
 // TestTheEmptiedGalleryStatesAreReachableAndDistinct pins the two Total == 0
 // states apart, so neither can quietly stop being reachable.
-// 🔴 Keys and SecondsUntilNext are the two fields the companion PWA reads, and
-// each answers a question the client provably CANNOT answer for itself. Both are
-// filled from the SAME lock acquisition as every field above them, so they never
-// describe a state the viewer was not in.
+// 🔴 Keys, SecondsUntilNext and Queue each answer a question the companion PWA
+// provably CANNOT answer for itself, and all three are filled from the SAME lock
+// acquisition as every field above them, so they never describe a state the
+// viewer was not in. This sentence said "the two fields the companion PWA reads"
+// until the play queue made it wrong; do not write a count here — the set is the
+// struct, and the struct is directly below.
+//
+// BootID is the exception to the lock clause and is called out rather than
+// folded in: it is a property of the PROCESS, filled by the adapter and constant
+// for its lifetime, so there is no viewer state for it to be consistent with.
 //
 // Keys — every object key CURRENTLY ON THE DISPLAY, left to right.
 //
@@ -229,7 +235,7 @@ type Snapshot struct {
 // is measured rather than assumed: TestQueueIsAlwaysPresentInTheStateObject
 // drives a zero-valued queue through the real handler and reads the raw bytes.
 type QueueState struct {
-	// ID identifies WHICH queue the other three fields describe. It is a
+	// ID identifies WHICH queue the remaining fields of this struct describe. It is a
 	// per-process generation: 0 before any queue has been installed, and
 	// incremented by every POST /api/queue.
 	//

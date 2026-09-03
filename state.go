@@ -990,9 +990,14 @@ func (iv *ImageViewer) setQueue(keys []string) {
 	// queue reports length 0 with the count still standing, and without an
 	// identity a polling client cannot tell "the collection that just finished
 	// skipped 2" from "some queue an hour ago skipped 2" — so it would either
-	// show a stale toast on every poll or never show one at all. Monotonic per
-	// process, never reused, and it starts from 0 again after a restart, which is
-	// decision D2 being true rather than a wart.
+	// show a stale toast on every poll or never show one at all.
+	//
+	// 🔴 Monotonic and unique WITHIN ONE RUN OF THE PROCESS. It starts from 0
+	// again after a restart, so ids ARE reused across boots and the key a client
+	// dedupes on is the PAIR (boot_id, queue.id). This sentence used to read
+	// "never reused, and it starts from 0 again after a restart" — self-
+	// contradicting in one line. One rule, three places (here, ImageViewer.queueSeq
+	// in main.go, and control.QueueState.ID); they must agree.
 	iv.queueSeq++
 }
 
@@ -1124,6 +1129,19 @@ func (iv *ImageViewer) advanceQueueLocked(delta int) bool {
 		// deleted from the bucket: there is no earlier page of this collection
 		// left to show. It is bounded — one page turn, still inside the
 		// collection — where draining is unbounded (a different comic entirely).
+		//
+		// 🔴 AND A PREV CAN THEREFORE RAISE queue.skipped, WHICH IS
+		// CLIENT-VISIBLE. The fall-forward runs scanQueueForwardLocked, which
+		// counts every entry it passes over that is above the high-water mark — so
+		// a back-press can make the PWA say "2 pages were no longer in the
+		// library". That is intended and correct (those pages really have left the
+		// bucket, and D3 exists to report exactly that), but it is surprising
+		// enough to state: the count is a property of the QUEUE, not of the
+		// direction the operator was travelling, and it is the only path on which
+		// a backward page turn changes it. TestAPrevDrainsOnlyWhenNoQueuedPageIsPlayableAtAll
+		// asserts skipped == 1 through this path. It is written into the W5 §4.2
+		// notes for the same reason: a client that treats a rising skip count as
+		// "the collection is playing forward" would be wrong.
 		if iv.landQueueLocked(iv.queueIndex, step) {
 			return true
 		}

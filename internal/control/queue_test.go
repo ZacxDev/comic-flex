@@ -64,9 +64,11 @@ func TestQueueIsAlwaysPresentInTheStateObject(t *testing.T) {
 	}
 }
 
-// TestQueueStateIsPassedThroughUnchanged drives the three numbers through the
-// real handler. They are pairwise distinct and distinct from every other numeric
-// field in the snapshot, so a mutant crossing two of them cannot pass.
+// TestQueueStateIsPassedThroughUnchanged drives every field of QueueState
+// through the real handler — count the rows of `want` below rather than trusting
+// a number in this sentence, which said "the three numbers" for two rounds after
+// `id` made it four. They are pairwise distinct and distinct from every other
+// numeric field in the snapshot, so a mutant crossing two of them cannot pass.
 func TestQueueStateIsPassedThroughUnchanged(t *testing.T) {
 	f := newFakeViewer()
 	f.snap = Snapshot{
@@ -336,6 +338,38 @@ func TestAQueuePostedWhileIndexingIsRefusedAsBackpressure(t *testing.T) {
 		s := newTestServer(t, f)
 		if w := do(t, s, "POST", "/api/queue", `{"keys":["a/1.jpg"]}`); w.Code != http.StatusServiceUnavailable {
 			t.Fatalf("status %d, want 503", w.Code)
+		}
+	})
+
+	t.Run("cancel is NOT subject to this gate", func(t *testing.T) {
+		// 🔴 handleQueueCancel carries a 🔴 comment saying it is deliberately
+		// ungated, and until this test nothing enforced it: adding the same
+		// `Scanning && Total == 0` check there "for consistency" SURVIVED the full
+		// suite. The consequence is specific — an operator gets 503 on STOP, and
+		// is told to wait to be allowed to stop, during the one state (the first
+		// bucket listing at boot) where the display is least likely to be doing
+		// what they want.
+		//
+		// There is also nothing for a cancel to be consumed against: the reason
+		// the gate exists for POST /api/queue is that a queue installed against an
+		// empty gallery is silently eaten, and a cancel installs nothing.
+		f := newFakeViewer()
+		f.snap = Snapshot{Total: 0, Scanning: true,
+			ViewMode: string(ViewLandscapeSingle), SlideInterval: 30}
+		s := newTestServer(t, f)
+
+		w := do(t, s, "POST", "/api/queue/cancel", "")
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("POST /api/queue/cancel while the gallery is still indexing -> %d, want 202. "+
+				"Cancel is deliberately ungated: there is nothing for it to be consumed against, "+
+				"and refusing it asks the operator to wait to be allowed to STOP. (body %s)",
+				w.Code, w.Body.String())
+		}
+		// And it really did reach the viewer, rather than being accepted by some
+		// path that does nothing.
+		f.drain()
+		if got, want := f.callLog(), []string{"CancelQueue"}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("calls = %v, want %v", got, want)
 		}
 	})
 

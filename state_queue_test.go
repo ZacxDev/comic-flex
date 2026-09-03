@@ -450,17 +450,44 @@ func TestAQueueOnAnEmptyGalleryIsANoOpNotAPanic(t *testing.T) {
 	}
 }
 
-// TestQueueAccessIsRaceFree drives the writer, the page turn and both readers
-// concurrently. It asserts nothing beyond "no data race": -race is the detector.
+// TestQueueAccessIsRaceFree drives BOTH writers, both page-turn directions, a
+// rescan and every reader that touches queue state concurrently. It asserts
+// nothing beyond "no data race": -race is the detector.
+//
+// 🔴 The goroutine set is the claim, so it is enumerated rather than described.
+// This docstring said "the writer, the page turn and both readers" while the body
+// drove four calls — and it stayed that way after a round added a SECOND writer
+// (cancelQueue) and turned currentKey and pairKeys into queue readers via
+// queueLeftLocked. A sentence wider than its body reads as coverage and stops
+// anyone looking, which is the defect class this file exists to guard against.
+//
+// The set below is every function that takes iv.mutex AND touches a queue field:
+//
+//	writers  setQueue, cancelQueue, advance (both directions), setImages
+//	readers  queueState, snapshot, currentKey, pairKeys
+//
+// setImages is in the writer column deliberately: a rescan under a running queue
+// is the case the whole F4/F7 family is about, and it mutates the gallery the
+// queue's per-entry lookups read.
 func TestQueueAccessIsRaceFree(t *testing.T) {
 	iv := newControlTestViewer(30, queueGallery()...)
+	iv.setViewModeState(ViewLandscapeTwo) // so pairKeys' queue branch is live
 	var wg sync.WaitGroup
 	for i := 0; i < 4; i++ {
-		wg.Add(4)
-		go func() { defer wg.Done(); iv.setQueue([]string{"e/5.jpg", "gone/7.jpg", "a/1.jpg"}) }()
-		go func() { defer wg.Done(); iv.advance(1) }()
-		go func() { defer wg.Done(); iv.queueState() }()
-		go func() { defer wg.Done(); iv.snapshot() }()
+		for _, fn := range []func(){
+			func() { iv.setQueue([]string{"e/5.jpg", "gone/7.jpg", "a/1.jpg"}) },
+			func() { iv.cancelQueue() },
+			func() { iv.advance(1) },
+			func() { iv.advance(-1) },
+			func() { iv.setImages(queueGallery()) },
+			func() { iv.queueState() },
+			func() { iv.snapshot() },
+			func() { iv.currentKey() },
+			func() { iv.pairKeys() },
+		} {
+			wg.Add(1)
+			go func() { defer wg.Done(); fn() }()
+		}
 	}
 	wg.Wait()
 }
