@@ -218,6 +218,26 @@ func (g gtkViewer) SetQueue(keys []string) {
 	}
 }
 
+// CancelQueue ends a running play queue and puts the display back on the page the
+// queue interrupted.
+//
+// 🔴 THE RENDER IS CONDITIONAL, and that is the no-op contract rather than an
+// optimisation. cancelQueue reports false when no queue was running, and a cancel
+// that rendered anyway would burn an S3 GET — up to 30 s of held main loop — to
+// put the same frame back on the glass, for a request that arrived after the
+// queue had already drained. That is the ordinary case for a UI whose cancel
+// button cannot see the drain: it must cost nothing.
+//
+// It is an R1 write: it runs inside an Enqueue closure on the GTK main loop, so
+// the updateImage below is legal. The shape is Next/Prev's; 🔴 do NOT follow
+// Rescan, which is the documented exception that runs on the HTTP handler
+// goroutine and must not render.
+func (g gtkViewer) CancelQueue() {
+	if g.iv.cancelQueue() {
+		g.iv.updateImage()
+	}
+}
+
 // SetInterval changes the seconds between slides and makes the change take
 // effect NOW, by retiring the pending GLib timeout and arming a fresh one at the
 // new interval.

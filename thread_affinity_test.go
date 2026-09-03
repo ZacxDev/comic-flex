@@ -234,6 +234,12 @@ func TestNothingOffTheGTKThreadCanReachAWidget(t *testing.T) {
 		// nothing for up to an hour — fails here as well as in
 		// TestAdapterSetQueueTurnsToTheFirstPlayableKeyImmediately.
 		"gtkViewer.SetQueue",
+		// CancelQueue for the same pair of reasons: it restores the interrupted
+		// page and must render to do it, so a CancelQueue that stopped rendering —
+		// leaving the cancelled collection on the glass until the slide timer
+		// fires — fails here as well as in
+		// TestAdapterCancelQueueRendersOnlyWhenSomethingChanged.
+		"gtkViewer.CancelQueue",
 		"gtkViewer.SetViewMode", "ImageViewer.updateImage", "ImageViewer.updateSingleImage",
 	} {
 		if _, ok := g.funcs[must]; !ok {

@@ -108,6 +108,19 @@ func TestEndpointTable(t *testing.T) {
 		{"queue malformed json", "POST", "/api/queue", `{"keys":[`, http.StatusBadRequest, false},
 		{"queue wrong element type", "POST", "/api/queue", `{"keys":[7]}`, http.StatusBadRequest, false},
 
+		// Cancel. It takes no body, so there is no 400 it can produce, and a
+		// cancel with no queue running is a no-op 202 rather than an error — the
+		// fake here has never been given a queue at all, which IS that case.
+		{"queue cancel", "POST", "/api/queue/cancel", "", http.StatusAccepted, false},
+		{"queue cancel with no queue running", "POST", "/api/queue/cancel", "", http.StatusAccepted, false},
+		{"queue cancel via GET", "GET", "/api/queue/cancel", "", http.StatusMethodNotAllowed, true},
+		// 🔴 The two paths must not shadow each other. `POST /api/queue` has no
+		// trailing slash, so net/http's mux treats it as an exact pattern and
+		// /api/queue/cancel is a separate route — but a maintainer who "tidied"
+		// either into a subtree pattern would silently route cancels into
+		// handleQueue, where a bodyless request is a 400.
+		{"queue is not a subtree", "POST", "/api/queue/bogus", "", http.StatusNotFound, true},
+
 		// Method discipline: mutations are POST-only, reads are GET-only.
 		{"next via GET", "GET", "/api/next", "", http.StatusMethodNotAllowed, true},
 		{"toggle via GET", "GET", "/api/toggle", "", http.StatusMethodNotAllowed, true},
@@ -160,6 +173,7 @@ func TestMutationsAccept202WithoutRunningTheWork(t *testing.T) {
 		// which is exactly what the ORDER in a collection is for.
 		{"queue", "/api/queue", `{"keys":["c/3.jpg","a/1.jpg","b/2.jpg"]}`,
 			"SetQueue:c/3.jpg,a/1.jpg,b/2.jpg"},
+		{"queue cancel", "/api/queue/cancel", "", "CancelQueue"},
 		// POST /api/rescan is deliberately NOT here: it is not an enqueued
 		// mutation. TestRescanStartsTheListingWithoutEnqueueingIt covers it, and
 		// TestEveryAcceptedMutationIsCoveredByOneAdmissionTest asserts the two

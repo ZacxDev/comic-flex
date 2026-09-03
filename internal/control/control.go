@@ -210,6 +210,7 @@ func (s *Server) routes() http.Handler {
 	api.HandleFunc("POST /api/goto", s.handleGoto)
 	api.HandleFunc("POST /api/interval", s.handleInterval)
 	api.HandleFunc("POST /api/queue", s.handleQueue)
+	api.HandleFunc("POST /api/queue/cancel", s.handleQueueCancel)
 	api.HandleFunc("POST /api/rescan", s.handleRescan)
 
 	mux := http.NewServeMux()
@@ -587,7 +588,7 @@ func (s *Server) handleInterval(w http.ResponseWriter, r *http.Request) {
 // before the shuffled gallery resumes.
 //
 // 🔴 IT IS AN ORDINARY ENQUEUED MUTATION, and that is deliberate rather than
-// incidental. It answers 202 through Server.enqueue like the other eight, which
+// incidental. It answers 202 through Server.enqueue like the other nine, which
 // means it can also answer 503 + Retry-After when the GTK loop is full, and the
 // cluster-side caller's existing pi.BusyError handling covers it with no second
 // convention to learn. Do NOT give it a bespoke "queued" reply: the queue is not
@@ -686,6 +687,48 @@ func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
 
 	keys := body.Keys
 	s.enqueue(w, func() { s.viewer.SetQueue(keys) })
+}
+
+// handleQueueCancel ends a running play queue and puts the gallery back where
+// the queue interrupted it.
+//
+// 🔴 IT IS A DIFFERENT OPERATION FROM POST /api/goto, WHICH IS WHY IT EXISTS.
+// Goto already ends a queue — but as a SEEK, discarding the D4 interruption
+// point, so "stop this collection" and "go to page N" were the same request and
+// an operator who wanted the first got the second. Before this endpoint there was
+// no way to abort a queue without also moving the display somewhere new: with
+// `{"keys":[]}` a 400 and the Prev-floor holding at the front, a 500-key queue at
+// slide_interval 3600 held the display for 500 hours with no clean exit. That is
+// the gap this closes.
+//
+// 🔴 POST, NOT DELETE, and not a flag on POST /api/queue. Three reasons, in
+// order of weight:
+//
+//   - Every mutation on this API is a POST and every read is a GET;
+//     TestEndpointTable asserts that as "method discipline" and drives GET
+//     against a mutation expecting 405. A DELETE would be the only verb of its
+//     kind on the surface and would falsify that claim — the enumeration hazard
+//     this file has already been bitten by three times.
+//   - `POST /api/queue` with an empty list stays a 400. Overloading "here are
+//     zero keys" with "and also stop what you are doing" is a wire-contract
+//     footgun: a client bug that filters a collection down to nothing would
+//     silently cancel instead of failing loudly. Explicitly rejected.
+//   - A distinct path is greppable. "Which routes cancel things" has an answer.
+//
+// It takes NO BODY, so there is nothing to validate and no 400 it can produce.
+// The only refusal it has is the GTK queue cap's 503 + Retry-After, through
+// Server.enqueue like the other nine mutations.
+//
+// 🔴 It is deliberately NOT subject to the gallery-not-yet-indexed gate that
+// POST /api/queue carries. That gate exists because a queue installed against an
+// empty gallery is consumed and discarded; there is nothing for a CANCEL to be
+// consumed against, and refusing "stop" because the Pi is busy scanning would be
+// asking the operator to wait to be allowed to stop.
+//
+// A cancel with no queue running is a NO-OP 202: see Viewer.CancelQueue for why
+// that is not an error, and why it must not move the display either.
+func (s *Server) handleQueueCancel(w http.ResponseWriter, r *http.Request) {
+	s.enqueue(w, s.viewer.CancelQueue)
 }
 
 // handleRescan starts a bucket listing. It is the ONE mutation endpoint that

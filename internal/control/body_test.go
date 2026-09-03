@@ -146,7 +146,7 @@ func TestTrailingJSONIsRefused(t *testing.T) {
 var (
 	enqueuedMutationPaths = []string{
 		"/api/next", "/api/prev", "/api/pause", "/api/resume", "/api/toggle",
-		"/api/viewmode", "/api/goto", "/api/interval", "/api/queue",
+		"/api/viewmode", "/api/goto", "/api/interval", "/api/queue", "/api/queue/cancel",
 	}
 	scanAdmittedPaths = []string{"/api/rescan"}
 )

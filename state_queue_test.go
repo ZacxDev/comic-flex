@@ -994,6 +994,302 @@ func TestASkippedEntryAtTheEndOfAScreenIsNotCountedAgain(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// POST /api/queue/cancel (finding F5, ruled on by the operator)
+// ---------------------------------------------------------------------------
+
+// TestCancelRestoresTheInterruptedPageNotTheCurrentOne is the whole reason the
+// endpoint exists as something other than a goto.
+//
+// POST /api/goto already ends a queue, but as a SEEK — it discards the D4
+// interruption point and leaves the operator on a page they did not choose.
+// Cancel must UNDO the interruption. The fixture discriminates three ways: the
+// interrupted page is c/3.jpg (index 2), the page on the display when the cancel
+// arrives is a/1.jpg (index 0), and gallery index 0 is a/1.jpg too — so a cancel
+// that did nothing to currentIndex, or that fell back to index 0, lands on
+// a/1.jpg, and only the correct one lands on c/3.jpg.
+func TestCancelRestoresTheInterruptedPageNotTheCurrentOne(t *testing.T) {
+	iv := queueTestViewer(t) // interrupted at c/3.jpg, index 2
+	iv.setQueue([]string{"e/5.jpg", "a/1.jpg"})
+	iv.advance(1)
+	iv.advance(1)
+	if got := keyNow(t, iv); got != "a/1.jpg" {
+		t.Fatalf("setup: the display should be on a/1.jpg, got %q", got)
+	}
+
+	if !iv.cancelQueue() {
+		t.Fatal("cancelQueue reported no queue running while one was")
+	}
+	if got := keyNow(t, iv); got != "c/3.jpg" {
+		t.Fatalf("after a cancel the display shows %q, want c/3.jpg — the page the queue "+
+			"interrupted. a/1.jpg means the cancel left the display on the queued page it "+
+			"happened to be showing, or fell back to gallery index 0; either way the operator "+
+			"who asked to STOP was moved somewhere they did not choose, which is the goto "+
+			"behaviour this endpoint exists to avoid.", got)
+	}
+	wantQueue(t, iv, 0, 0, 0)
+
+	// And the gallery carries on from there, exactly as after a drain.
+	iv.advance(1)
+	if got := keyNow(t, iv); got != "d/4.jpg" {
+		t.Fatalf("the page turn after a cancel showed %q, want d/4.jpg", got)
+	}
+}
+
+// TestCancelWithNoQueueRunningChangesNothing pins the no-op contract.
+//
+// A UI cannot see the queue drain between rendering its cancel button and the
+// operator tapping it, so the request that arrives second describes a state the
+// Pi is already in. It must not be an error AND it must not move the display: a
+// cancel that re-seeked the gallery to a stale interruption point would make the
+// display jump for no reason, which is worse than doing nothing.
+func TestCancelWithNoQueueRunningChangesNothing(t *testing.T) {
+	iv := queueTestViewer(t) // on c/3.jpg, no queue
+
+	if iv.cancelQueue() {
+		t.Fatal("cancelQueue reported that it ended a queue when none was running")
+	}
+	if got := keyNow(t, iv); got != "c/3.jpg" {
+		t.Fatalf("a cancel with no queue running moved the display to %q, want it to stay on "+
+			"c/3.jpg", got)
+	}
+	wantQueue(t, iv, 0, 0, 0)
+
+	// And after a queue has DRAINED — the realistic race — the stale interruption
+	// point must not be re-applied.
+	iv.setQueue([]string{"e/5.jpg"})
+	iv.advance(1)
+	iv.advance(1) // drains: back to c/3 + 1 == d/4
+	if got := keyNow(t, iv); got != "d/4.jpg" {
+		t.Fatalf("setup: after the drain the display should be on d/4.jpg, got %q", got)
+	}
+	if iv.cancelQueue() {
+		t.Fatal("cancelQueue reported that it ended a queue after the queue had drained")
+	}
+	if got := keyNow(t, iv); got != "d/4.jpg" {
+		t.Fatalf("a cancel arriving after the drain moved the display to %q, want it to stay on "+
+			"d/4.jpg. The interruption point belonged to a queue that is already over; "+
+			"re-applying it makes the display jump backwards for a request that asked for "+
+			"nothing to happen.", got)
+	}
+}
+
+// TestCancelAfterARescanRestoresThePageNotTheIndex: the cancel path goes through
+// the same key-preferred resume as the drain, so a reshuffling rescan cannot make
+// it land on an arbitrary comic. Without the shared helper this would be a second
+// copy of that decision, and the second copy is the one that gets it wrong.
+func TestCancelAfterARescanRestoresThePageNotTheIndex(t *testing.T) {
+	iv := queueTestViewer(t) // interrupted at c/3.jpg, index 2
+	iv.setQueue([]string{"e/5.jpg"})
+	iv.advance(1)
+
+	// c/3.jpg moves to index 1; index 2 is now a/1.jpg.
+	iv.setImages([]string{"x/9.jpg", "c/3.jpg", "a/1.jpg"})
+
+	if !iv.cancelQueue() {
+		t.Fatal("cancelQueue reported no queue running")
+	}
+	if got := keyNow(t, iv); got != "c/3.jpg" {
+		t.Fatalf("after a rescan the cancel restored %q, want c/3.jpg — the interrupted PAGE. "+
+			"a/1.jpg means it trusted the recorded index, which names a different comic once "+
+			"the gallery has been reshuffled.", got)
+	}
+}
+
+// TestCancelClampsWhenTheGalleryShrankUnderTheQueue: the resume can fall back to
+// the recorded INDEX, and a rescan may have shortened the gallery since. The drain
+// path is followed by wrapIndex; a cancel has no delta to wrap through, so it
+// clamps explicitly. Without that this is an out-of-range read on the next render.
+func TestCancelClampsWhenTheGalleryShrankUnderTheQueue(t *testing.T) {
+	iv := newControlTestViewer(30, queueGallery()...)
+	iv.gotoIndex(4) // interrupted at e/5.jpg, index 4
+	iv.setQueue([]string{"a/1.jpg"})
+	iv.advance(1)
+
+	// e/5.jpg is gone AND the gallery is shorter than the recorded index 4.
+	iv.setImages([]string{"a/1.jpg", "b/2.jpg"})
+
+	if !iv.cancelQueue() {
+		t.Fatal("cancelQueue reported no queue running")
+	}
+	idx, key, ok := iv.currentKey()
+	if !ok {
+		t.Fatal("currentKey reported an empty gallery")
+	}
+	if idx != 1 || key != "b/2.jpg" {
+		t.Fatalf("after a cancel onto a shrunken gallery the display is at (%d, %q), want "+
+			"(1, b/2.jpg) — index 4 clamped to the last image", idx, key)
+	}
+}
+
+// TestCancelInTheTwoUpViewClearsTheQueuedTail: the right-hand half is
+// queue-authoritative while a queue runs, so a cancel has to take BOTH halves
+// back to the gallery. A cancel that ended the queue without clearing
+// queueTailIndex would leave pairKeys reading a stale tail.
+func TestCancelInTheTwoUpViewClearsTheQueuedTail(t *testing.T) {
+	iv := newControlTestViewer(30, queueGallery()...)
+	iv.setViewModeState(ViewLandscapeTwo)
+	iv.gotoIndex(0) // interrupted at a/1.jpg
+	iv.setQueue([]string{"e/5.jpg", "c/3.jpg"})
+	iv.advance(iv.stepSize())
+	if got, want := screen(t, iv), []string{"e/5.jpg", "c/3.jpg"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("setup: screen = %v, want %v", got, want)
+	}
+
+	if !iv.cancelQueue() {
+		t.Fatal("cancelQueue reported no queue running")
+	}
+	// Back to the interrupted page and ITS gallery neighbour — both halves from
+	// the gallery again.
+	if got, want := screen(t, iv), []string{"a/1.jpg", "b/2.jpg"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("after a cancel the two-up screen shows %v, want %v. A queued key still on "+
+			"screen means the tail survived the cancel and pairKeys is reading it.", got, want)
+	}
+}
+
+// TestASkipCountSurvivesACancelAndIsStillAttributable: the count belongs to the
+// queue that produced it, and a collection the operator STOPPED early is exactly
+// when a client wants to say "3 pages were no longer in the library". Cancelling
+// must not silently discard that, and the generation must still identify it.
+func TestASkipCountSurvivesACancelAndIsStillAttributable(t *testing.T) {
+	iv := queueTestViewer(t)
+	iv.setQueue([]string{"gone/7.jpg", "e/5.jpg", "gone/8.jpg", "a/1.jpg"})
+	iv.advance(1) // skip gone/7, land e/5
+	iv.advance(1) // skip gone/8, land a/1
+	wantQueue(t, iv, 4, 4, 2)
+	wantQueueID(t, iv, 1)
+
+	iv.cancelQueue()
+	wantQueue(t, iv, 0, 0, 2)
+	wantQueueID(t, iv, 1)
+
+	// A new queue right after the cancel is a NEW generation with a clean count,
+	// so a client polling across the two can tell them apart.
+	iv.setQueue([]string{"b/2.jpg"})
+	wantQueueID(t, iv, 2)
+	wantQueue(t, iv, 1, 0, 0)
+	iv.advance(1)
+	if got := keyNow(t, iv); got != "b/2.jpg" {
+		t.Fatalf("the queue installed immediately after a cancel played %q, want b/2.jpg", got)
+	}
+}
+
+// TestAQueueInstalledAfterACancelRecordsTheNewInterruptionPoint closes the seam
+// between the two features: setQueue only records the interruption point when no
+// queue is already running, so a cancel must have genuinely cleared the queue or
+// the NEXT collection would resume the gallery at the previous one's start.
+func TestAQueueInstalledAfterACancelRecordsTheNewInterruptionPoint(t *testing.T) {
+	iv := queueTestViewer(t) // interrupted at c/3.jpg
+	iv.setQueue([]string{"e/5.jpg"})
+	iv.advance(1)
+	iv.cancelQueue() // back on c/3.jpg
+
+	// Move the gallery somewhere else, then queue again.
+	iv.gotoKey("a/1.jpg")
+	iv.setQueue([]string{"e/5.jpg"})
+	iv.advance(1) // e/5
+	iv.advance(1) // drains
+
+	if got := keyNow(t, iv); got != "b/2.jpg" {
+		t.Fatalf("the second queue drained to %q, want b/2.jpg — one on from a/1.jpg, the page "+
+			"the SECOND queue interrupted. c/3.jpg or d/4.jpg means the cancel did not clear "+
+			"the queue, so setQueue kept the first interruption point.", got)
+	}
+}
+
+// TestEndingAQueueLeavesNoCursorResidue is a MECHANISM guard, not a behaviour
+// one, and it is labelled as such because it asserts internal fields.
+//
+// 🔴 It exists because a mutant that replaced endQueueLocked() with a bare
+// `iv.queue = nil` SURVIVED the whole suite. That is genuinely equivalent TODAY —
+// every reader of a queue cursor (advance, pairKeys, queueLeftLocked,
+// queueStateLocked) tests `len(iv.queue)` before touching one, so a nil slice
+// makes the stale cursors unreachable. It survives by an invariant nothing
+// asserts, which is the same thing as surviving by luck: the first reader written
+// without that guard resurrects a dead queue's cursor, and no behavioural test in
+// this file would see it.
+//
+// So the residue is pinned directly, for BOTH exits — a cancel and a forward
+// drain — because they are separate call sites of the same clean-up.
+//
+// queueSkipped and queueSeq are deliberately NOT asserted zero here: they are
+// documented to outlive the queue, and TestASkipCountSurvivesACancelAndIsStillAttributable
+// pins that in the other direction.
+func TestEndingAQueueLeavesNoCursorResidue(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		end  func(*ImageViewer)
+	}{
+		{"cancel", func(iv *ImageViewer) { iv.cancelQueue() }},
+		{"forward drain", func(iv *ImageViewer) { iv.advance(1) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			iv := queueTestViewer(t)
+			iv.setQueue([]string{"e/5.jpg"})
+			iv.advance(1)
+
+			iv.mutex.RLock()
+			mid := []int{len(iv.queue), iv.queueIndex, iv.queueTailIndex}
+			iv.mutex.RUnlock()
+			if mid[0] == 0 || mid[1] < 0 || mid[2] < 0 {
+				t.Fatalf("setup: expected a running queue with both cursors set, got "+
+					"len=%d index=%d tail=%d", mid[0], mid[1], mid[2])
+			}
+
+			tc.end(iv)
+
+			iv.mutex.RLock()
+			defer iv.mutex.RUnlock()
+			if iv.queue != nil {
+				t.Errorf("queue = %v after %s, want nil", iv.queue, tc.name)
+			}
+			if iv.queueIndex != -1 || iv.queueTailIndex != -1 {
+				t.Errorf("cursors after %s are index=%d tail=%d, want -1 and -1. A cursor left "+
+					"pointing into a queue that is over is only harmless while every reader "+
+					"checks the slice first — an invariant nothing else asserts.",
+					tc.name, iv.queueIndex, iv.queueTailIndex)
+			}
+			if iv.queueScanned != 0 {
+				t.Errorf("queueScanned = %d after %s, want 0", iv.queueScanned, tc.name)
+			}
+			if iv.queueReturnKey != "" || iv.queueReturnIndex != 0 {
+				t.Errorf("the interruption point survived %s: key=%q index=%d, want cleared. A "+
+					"stale return point is what makes a LATER queue resume the gallery where a "+
+					"previous one started.", tc.name, iv.queueReturnKey, iv.queueReturnIndex)
+			}
+		})
+	}
+}
+
+// TestAdapterCancelQueueRendersOnlyWhenSomethingChanged pins the conditional
+// render. A cancel that rendered unconditionally would burn an S3 GET — up to
+// 30 s of held main loop — to put the same frame back, for the ordinary case of a
+// UI whose cancel button could not see the queue drain.
+func TestAdapterCancelQueueRendersOnlyWhenSomethingChanged(t *testing.T) {
+	iv := queueTestViewer(t)
+	store := &recordingStore{}
+	iv.store = store
+	g := gtkViewer{iv: iv}
+
+	// No queue running: nothing to do, and nothing to load.
+	g.CancelQueue()
+	if got := store.keys(); len(got) != 0 {
+		t.Fatalf("a cancel with no queue running asked the store for %v, want nothing — it is a "+
+			"no-op, and a render costs an S3 GET the operator gains nothing from", got)
+	}
+
+	// A queue running: the restore has to reach the screen.
+	iv.setQueue([]string{"e/5.jpg"})
+	iv.advance(1)
+	store.loaded = nil
+	g.CancelQueue()
+	if got := store.keys(); len(got) != 1 || got[0] != "c/3.jpg" {
+		t.Fatalf("a cancel mid-queue asked the store for %v, want exactly [c/3.jpg] — the "+
+			"restored page must actually be rendered, or the display keeps showing the "+
+			"cancelled collection until the slide timer fires", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // The queue generation and the boot identity (findings F2 and 🟡-5)
 // ---------------------------------------------------------------------------
 

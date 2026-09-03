@@ -175,6 +175,8 @@ func (f *fakeViewer) SetQueue(keys []string) {
 	f.record("SetQueue:" + strings.Join(keys, ","))
 }
 
+func (f *fakeViewer) CancelQueue() { f.record("CancelQueue") }
+
 // Rescan stands in for the real adapter: it admits a listing or refuses, and it
 // returns SYNCHRONOUSLY without queueing anything. The recorded call goes in
 // calls (not reads) only when it was admitted, so a test can tell "started" from

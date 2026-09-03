@@ -501,10 +501,19 @@ func (iv *ImageViewer) scanCount() int {
 // more than the code delivers and the round-2 version claimed an invariant the
 // code did not enforce. This bounds the closures enqueueBounded schedules — the
 // R1 mutation endpoints that go through Server.enqueue, which is POST
-// /api/{next,prev,pause,resume,toggle,viewmode,goto,interval} today. It does NOT
-// bound every closure on the main loop. Three others exist and are bounded
-// elsewhere — count the bullets rather than trusting this number, which has
-// been wrong once already:
+// /api/{next,prev,pause,resume,toggle,viewmode,goto,interval,queue,queue/cancel}
+// today.
+//
+// 🔴 THAT LIST WAS WRONG FOR TWO ROUNDS AND NOTHING CAUGHT IT: POST /api/queue
+// was added to Server.enqueue and not to this sentence, in the same commit, and
+// two audit rounds read past it. It is the same failure this comment's own
+// preamble describes, committed by the person fixing the preamble. Grep
+// `s.enqueue(` in internal/control/control.go rather than trusting the braces
+// above — the enumeration is a copy, and the copy is what goes stale.
+//
+// It does NOT bound every closure on the main loop. Three others exist and are
+// bounded elsewhere — count the bullets rather than trusting this number, which
+// has been wrong once already:
 //
 //   - scanImagesAsyncVia schedules its completion callback (the one that reaches
 //     updateSingleImage and a 30 s S3 GET) DIRECTLY, outside this accounting. It
@@ -1245,6 +1254,49 @@ func (iv *ImageViewer) indexOfKeyLocked(key string) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+// cancelQueue ends any running queue and returns the display to the page the
+// queue interrupted, reporting whether a queue was actually running.
+//
+// 🔴 IT GOES THROUGH queueResumeIndexLocked — the SAME resume the draining page
+// turn in advance() uses, key-preferred with the recorded index as the fallback.
+// That is decision D4 applied to a cancel: the queue was an interruption, so
+// ending it early has to undo the interruption rather than leave the display on
+// a queued page or seek somewhere new. A cancel that open-coded its own restore
+// would be the second copy of a predicate that is already subtle (a rescan
+// reshuffles the gallery, so the recorded index names a different comic), and the
+// second copy is the one that gets it wrong.
+//
+// 🔴 NO DELTA IS APPLIED, unlike the drain. advance() lands on
+// `resume + delta` because a page turn asked for the NEXT page; a cancel is not a
+// page turn — the operator asked to stop, so the display returns to the page that
+// was interrupted, not to the one after it.
+//
+// false means no queue was running and NOTHING was touched — not even
+// currentIndex. The reason is in Viewer.CancelQueue: a UI cannot see the queue
+// drain between rendering its cancel button and the operator tapping it, so a
+// cancel arriving after the drain must be a no-op rather than a re-seek of the
+// gallery. The return value is what lets the adapter skip the render too.
+//
+// queueSkipped and queueSeq SURVIVE, because endQueueLocked keeps them: the
+// cancelled queue's skip count is still attributable through (boot_id, queue.id),
+// so a client can still report "3 pages were no longer in the library" for a
+// collection the operator stopped early.
+func (iv *ImageViewer) cancelQueue() bool {
+	iv.mutex.Lock()
+	defer iv.mutex.Unlock()
+	if len(iv.queue) == 0 {
+		return false
+	}
+	iv.currentIndex = iv.queueResumeIndexLocked()
+	iv.endQueueLocked()
+	// The resume can be the recorded INDEX rather than a resolved key, and a
+	// rescan may have shortened the gallery since it was recorded. advance()'s
+	// drain path is followed by wrapIndex; this one has no delta to wrap through,
+	// so it clamps explicitly.
+	iv.clampIndexLocked()
+	return true
 }
 
 // queueLeftLocked resolves the LEFT-hand entry the running queue is on, BY KEY,

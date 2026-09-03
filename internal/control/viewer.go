@@ -453,6 +453,29 @@ type Viewer interface {
 	// thread, and it may render.
 	SetQueue(keys []string)
 
+	// CancelQueue ends any running play queue AND returns the gallery to the page
+	// the queue interrupted — the same decision-D4 resume the draining page turn
+	// performs, through the same code.
+	//
+	// 🔴 THE RESTORE IS THE WHOLE POINT, and it is what makes this a different
+	// operation from POST /api/goto. Goto already ends a queue, but as a SEEK: it
+	// puts the display somewhere NEW and discards the interruption point, so an
+	// operator who only wanted to stop the collection ends up on a page they did
+	// not choose with no way back to where the slideshow was. Cancel is the
+	// inverse — it undoes the interruption instead of adding a second one.
+	//
+	// 🔴 CANCEL WITH NO QUEUE RUNNING IS A NO-OP, NOT AN ERROR, and the
+	// implementation must not move the display in that case. The queue can drain
+	// between a UI rendering its cancel button and the operator tapping it, so
+	// the request that arrives second describes a state the Pi is already in. A
+	// client told 4xx for having achieved the desired outcome would show a
+	// spurious failure; a client whose cancel re-seeked the gallery would see the
+	// display jump for no reason. Both are worse than doing nothing.
+	//
+	// It is an R1 write: called ONLY from inside an Enqueue closure, and it may
+	// render.
+	CancelQueue()
+
 	// Rescan starts a bucket listing in the background and reports whether one
 	// was STARTED. It reports false, having started nothing, when the
 	// implementation already has as many scans outstanding as it allows, and
