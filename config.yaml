@@ -15,6 +15,16 @@ storage:
   endpoint: "s3.homelab.lan"
   bucket: "comic-flex"
   prefix: ""
+  # Directories to keep OFF the display, subtracted from whatever `prefix`
+  # selected. Absent or empty means no exclusion at all.
+  # 🔴 Every entry must end with "/" — the program refuses to start otherwise.
+  # Without the separator an entry is a byte prefix rather than a directory, and
+  # "Comics 2022" would also exclude "Comics 2022-2 (jan-aug 2024)/".
+  # 🔴 LIVE, not an example. This file IS the deployed config — `comic-flex.sh
+  # deploy` copies it verbatim onto the Pi — so leaving the block commented out
+  # would ship the feature INERT and every upload would still reach the display.
+  exclude_prefixes:
+    - "u/"     # user uploads written by the companion web app
   use_ssl: true
   skip_verify: true  # Skip TLS verification for self-signed certs
 

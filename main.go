@@ -56,6 +56,26 @@ type StorageConfig struct {
 	Prefix     string `yaml:"prefix"`      // Optional prefix/folder in bucket
 	UseSSL     bool   `yaml:"use_ssl"`     // HTTPS (true for external)
 	SkipVerify bool   `yaml:"skip_verify"` // Skip TLS certificate verification (for self-signed certs)
+
+	// ExcludePrefixes drops objects whose key starts with any of these, AFTER
+	// Prefix has selected what to list. Empty or absent means no exclusion at
+	// all, i.e. exactly the behaviour this program had before the field existed.
+	//
+	// Why a list and not a narrower Prefix: a single Prefix can only express one
+	// contiguous slice of the bucket, and the wall display's owner owns FOUR
+	// top-level directories. The thing that has to be kept OFF the TV — other
+	// people's uploads, which the companion web app writes under `u/<uuid>/` —
+	// is a single directory, so subtracting is one entry where including would
+	// be four and would need editing every time a fifth is added.
+	//
+	// 🔴 Every entry MUST end with "/" and NewS3Store refuses one that does not.
+	// The separator is what makes an entry name a DIRECTORY rather than a byte
+	// prefix, and the difference is not hypothetical in this bucket: "Comics 2022"
+	// is a plain string prefix of "Comics 2022-2 (jan-aug 2024)/...", so a
+	// slashless entry silently swallows a DIFFERENT top-level directory. The
+	// sibling database pins the same invariant as a CHECK constraint
+	// (library_prefixes_ends_with_separator).
+	ExcludePrefixes []string `yaml:"exclude_prefixes"`
 }
 
 type Config struct {
@@ -111,9 +131,71 @@ type S3Store struct {
 	client *minio.Client
 	bucket string
 	prefix string
+	// excludePrefixes is validated by NewS3Store, which is the ONLY constructor:
+	// by the time collectImageKeys reads it every entry is known to end in "/".
+	// excluded() therefore does a plain byte-prefix test and nothing else.
+	excludePrefixes []string
 }
 
-func NewS3Store(endpoint, bucket, prefix string, useSSL, skipVerify bool) (*S3Store, error) {
+// validateExcludePrefixes enforces the one invariant the exclude list has: an
+// entry names a directory, so it ends with the separator.
+//
+// 🔴 It REFUSES rather than dropping the offending entry. A silently-dropped
+// entry is the worst of the three outcomes available: the operator's stated
+// intent ("keep u/ off the TV") would be discarded while the display kept
+// running and looked fine, and the failure would surface as strangers' comics on
+// a wall in a house. A refusal lands at startup, before any image is drawn, with
+// the bad entry named — the display is not yet running, so there is nothing to
+// take down.
+//
+// It lives in NewS3Store rather than loadConfig because NewS3Store is the
+// chokepoint: there is no way to obtain an S3Store whose list was never checked,
+// including from a future caller that does not read a YAML file at all. The
+// filesystem backend does not consume the field, so nothing is lost by not
+// checking it there. Both run at startup, before the GTK main loop.
+func validateExcludePrefixes(prefixes []string) error {
+	for i, p := range prefixes {
+		if p == "" {
+			return fmt.Errorf("storage.exclude_prefixes[%d] is empty; an empty entry would exclude the whole bucket", i)
+		}
+		if !strings.HasSuffix(p, "/") {
+			return fmt.Errorf("storage.exclude_prefixes[%d] = %q must end with %q: "+
+				"without the separator it is a byte prefix, not a directory, and would also "+
+				"exclude sibling directories whose names merely start with it "+
+				"(e.g. %q excludes %q)", i, p, "/", "Comics 2022", "Comics 2022-2 (jan-aug 2024)/")
+		}
+	}
+	return nil
+}
+
+// excluded reports whether an object key falls under one of the configured
+// exclude prefixes.
+//
+// Matching is a plain byte prefix, deliberately: keys in this bucket contain
+// spaces and apostrophes ("Laura's Comics/..."), which are metacharacters to
+// filepath.Match and to every regexp flavour, so any pattern language here would
+// mis-handle real directory names. The directory-boundary semantics come from
+// the trailing "/" that validateExcludePrefixes requires, not from the match.
+//
+// Precondition: prefixes has passed validateExcludePrefixes. This is the only
+// implementation of the rule — collectImageKeys calls it rather than re-deriving it.
+func excluded(key string, prefixes []string) bool {
+	for _, p := range prefixes {
+		if strings.HasPrefix(key, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func NewS3Store(endpoint, bucket, prefix string, excludePrefixes []string, useSSL, skipVerify bool) (*S3Store, error) {
+	// Checked BEFORE the credential lookup on purpose: a malformed exclude list
+	// is a mistake in the file the operator just edited, and reporting it should
+	// not depend on the environment happening to carry keys.
+	if err := validateExcludePrefixes(excludePrefixes); err != nil {
+		return nil, err
+	}
+
 	accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
 	secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
 
@@ -141,9 +223,10 @@ func NewS3Store(endpoint, bucket, prefix string, useSSL, skipVerify bool) (*S3St
 	}
 
 	return &S3Store{
-		client: client,
-		bucket: bucket,
-		prefix: prefix,
+		client:          client,
+		bucket:          bucket,
+		prefix:          prefix,
+		excludePrefixes: excludePrefixes,
 	}, nil
 }
 
@@ -161,16 +244,34 @@ const listTimeout = 2 * time.Minute
 func (s *S3Store) ListImages() ([]string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), listTimeout)
 	defer cancel()
-	var images []string
 
 	objectCh := s.client.ListObjects(ctx, s.bucket, minio.ListObjectsOptions{
 		Prefix:    s.prefix,
 		Recursive: true,
 	})
 
+	return s.collectImageKeys(objectCh)
+}
+
+// collectImageKeys drains a listing and keeps the object keys that should reach
+// the display.
+//
+// It is split out of ListImages because ListImages is bound to a live
+// minio.Client and cannot be exercised in a test, which would leave the one
+// place the exclude list is actually APPLIED as an untested seam: excluded()
+// could be perfect and still never called. A channel of minio.ObjectInfo is
+// something a test can build, so this half of the loop is covered.
+func (s *S3Store) collectImageKeys(objectCh <-chan minio.ObjectInfo) ([]string, error) {
+	var images []string
+
 	for obj := range objectCh {
 		if obj.Err != nil {
 			return nil, obj.Err
+		}
+		// Excluded before the extension test: a key under an excluded directory
+		// is not a candidate whatever it is named.
+		if excluded(obj.Key, s.excludePrefixes) {
+			continue
 		}
 		ext := strings.ToLower(filepath.Ext(obj.Key))
 		switch ext {
@@ -229,6 +330,7 @@ func NewImageStore(config *Config) (ImageStore, error) {
 			config.Storage.Endpoint,
 			config.Storage.Bucket,
 			config.Storage.Prefix,
+			config.Storage.ExcludePrefixes,
 			config.Storage.UseSSL,
 			config.Storage.SkipVerify,
 		)
